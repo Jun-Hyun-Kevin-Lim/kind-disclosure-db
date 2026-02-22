@@ -1,6 +1,8 @@
-feedparser==6.0.11
-requests==2.32.3
-gspread==6.1.2
-google-auth==2.33.0
-pytz==2025.2
-python-dateutil==2.9.0.post0
+feedparser
+pandas
+requests
+gspread
+google-auth
+lxml
+openpyxl
+beautifulsoup4
