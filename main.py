@@ -55,8 +55,13 @@ def save_json(filepath, data):
 # --- 2. Google Sheets 연결 ---
 def connect_gs():
     creds_dict = json.loads(os.environ["GOOGLE_CREDS"])
+    # 아래 scopes 부분에 drive 권한을 추가합니다.
     creds = Credentials.from_service_account_info(
-        creds_dict, scopes=["https://www.googleapis.com/auth/spreadsheets"]
+        creds_dict, 
+        scopes=[
+            "https://www.googleapis.com/auth/spreadsheets",
+            "https://www.googleapis.com/auth/drive"
+        ]
     )
     client = gspread.authorize(creds)
     sh = client.open(SHEET_NAME)
