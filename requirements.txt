@@ -1,8 +1,9 @@
-feedparser
-pandas
 requests
+beautifulsoup4
+pandas
+lxml
+html5lib
+feedparser
 gspread
 google-auth
-lxml
 openpyxl
-beautifulsoup4
