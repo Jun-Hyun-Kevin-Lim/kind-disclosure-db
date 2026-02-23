@@ -14,7 +14,7 @@ from google.oauth2.service_account import Credentials
 # Config
 # =====================
 RSS_URL = "http://kind.krx.co.kr:80/disclosure/rsstodaydistribute.do?method=searchRssTodayDistribute&repIsuSrtCd=&mktTpCd=0&searchCorpName=&currentPageSize=15"
-KEYWORDS = ["유상증자"]  # 필요하면 ["유상증자", "전환사채", ...] 같이 확장
+KEYWORDS = ["유상증자"]  # 필요하면 ["유상증자", "전환사채", ...] 확장
 
 SHEET_NAME = "KIND_대경"
 RAW_TAB = "RAW"
@@ -108,10 +108,13 @@ def get_next_id(ws):
 
 
 # =====================
-# 3) HTTP Fetch
+# 3) HTTP Fetch / QS
 # =====================
-def fetch(session: requests.Session, url: str, timeout=20):
-    r = session.get(url, headers=DEFAULT_HEADERS, timeout=timeout, allow_redirects=True)
+def fetch(session: requests.Session, url: str, timeout=20, headers=None):
+    h = dict(DEFAULT_HEADERS)
+    if headers:
+        h.update(headers)
+    r = session.get(url, headers=h, timeout=timeout, allow_redirects=True)
     # KIND는 euc-kr/혼합 인코딩 케이스가 있어 보정
     if not r.encoding or r.encoding.lower() == "iso-8859-1":
         r.encoding = r.apparent_encoding or "utf-8"
@@ -139,50 +142,50 @@ def extract_qs(url: str):
 
 
 # =====================
-# 4) KIND 본문/엑셀 URL 만들기 (핵심)
+# 4) KIND URL 구성 (viewer/search 먼저 → contents → excel)
 # =====================
-def build_contents_and_excel_urls(original_url: str, session: requests.Session):
+def build_urls(original_url: str, session: requests.Session):
     """
-    RSS link/Kind viewer link에서 acptNo/docNo를 최대한 추출해서
-    searchContents, downloadExcel URL을 생성.
-    acptNo/docNo를 못 구하면 original_url을 그대로 반환(iframe 추적으로 처리).
+    1) original_url에서 acptNo/docNo 최대한 추출
+    2) viewer(search) URL, contents(searchContents) URL, excel(downloadExcel) URL 반환
     """
     q = extract_qs(original_url)
 
-    # 링크에 acptNo/docNo가 없으면 원본 페이지에서 추출 시도
+    # 링크에 acptNo/docNo가 없거나 일부만 있으면 원본 페이지에서 추출 시도
     if not q["acptNo"] or not q["docNo"]:
         try:
             r = fetch(session, original_url, timeout=20)
             txt = r.text
 
             if not q["acptNo"]:
-                m = re.search(r"(acptNo|acptno)=(\d{8,14})", txt)
+                m = re.search(r'acptNo"\s*value="(\d+)"', txt)
                 if m:
-                    q["acptNo"] = m.group(2)
+                    q["acptNo"] = m.group(1)
                 else:
-                    m = re.search(r'acptNo"\s*value="(\d+)"', txt)
+                    m = re.search(r'_TRK_PN\s*=\s*"(\d+)"', txt)
                     if m:
                         q["acptNo"] = m.group(1)
                     else:
-                        m = re.search(r'_TRK_PN\s*=\s*"(\d+)"', txt)
+                        m = re.search(r"(acptNo|acptno)=(\d{8,14})", txt)
                         if m:
-                            q["acptNo"] = m.group(1)
+                            q["acptNo"] = m.group(2)
 
             if not q["docNo"]:
+                # docNo=12345 패턴
                 m = re.search(r"(docNo|docno)=(\d{1,14})", txt)
                 if m:
                     q["docNo"] = m.group(2)
                 else:
-                    # option value="12345|..."
+                    # option value="12345|..." 형태
                     m = re.search(r"option\s+value=['\"](\d+)\|", txt)
                     if m:
                         q["docNo"] = m.group(1)
         except:
             pass
 
-    # 그래도 acptNo/docNo를 못 구하면: 원본 URL로 HTML 파싱(iframe 추적이 처리)
+    # 못 구하면: original_url로만 진행(HTML iframe/링크 추적에 맡김)
     if not q["acptNo"] or not q["docNo"]:
-        return original_url, None
+        return original_url, None, None
 
     # 원래 URL 파라미터 일부 유지(케이스 따라 필요)
     extra = []
@@ -191,17 +194,14 @@ def build_contents_and_excel_urls(original_url: str, session: requests.Session):
             extra.append(f"{k}={q[k]}")
     extra_qs = ("&" + "&".join(extra)) if extra else ""
 
-    contents_url = (
-        f"{BASE}/common/disclsviewer.do?method=searchContents&acptNo={q['acptNo']}&docNo={q['docNo']}{extra_qs}"
-    )
-    excel_url = (
-        f"{BASE}/common/disclsviewer.do?method=downloadExcel&acptNo={q['acptNo']}&docNo={q['docNo']}{extra_qs}"
-    )
-    return contents_url, excel_url
+    viewer_url = f"{BASE}/common/disclsviewer.do?method=search&acptNo={q['acptNo']}&docNo={q['docNo']}{extra_qs}"
+    contents_url = f"{BASE}/common/disclsviewer.do?method=searchContents&acptNo={q['acptNo']}&docNo={q['docNo']}{extra_qs}"
+    excel_url = f"{BASE}/common/disclsviewer.do?method=downloadExcel&acptNo={q['acptNo']}&docNo={q['docNo']}{extra_qs}"
+    return viewer_url, contents_url, excel_url
 
 
 # =====================
-# 5) HTML 파싱 (표 데이터 플래트닝 + iframe 추적)
+# 5) HTML 파싱 (표 flatten + iframe/frame + searchContents 링크 추적)
 # =====================
 def flatten_tables_from_html(html: str):
     bag = {}
@@ -212,15 +212,32 @@ def flatten_tables_from_html(html: str):
             for c in range(len(df.columns) - 1):
                 k = str(df.iloc[r, c]).strip()
                 v = str(df.iloc[r, c + 1]).strip()
-                if k and v and len(k) < 50:
+                if k and v and len(k) < 60:
                     bag[k] = v
     return bag
+
+
+def _find_contents_url(html: str):
+    """
+    HTML 안에서 searchContents 링크를 직접 찾아서 반환 (iframe이 없거나 JS로 로드될 때 대비)
+    """
+    # 1) absolute/relative 링크 모두 가능
+    m = re.search(r"(\/common\/disclsviewer\.do\?method=searchContents[^\"'\s]+)", html)
+    if m:
+        return urljoin(BASE, m.group(1))
+
+    m = re.search(r"(https?:\/\/kind\.krx\.co\.kr\/common\/disclsviewer\.do\?method=searchContents[^\"'\s]+)", html)
+    if m:
+        return m.group(1)
+
+    return None
 
 
 def parse_html_tables(url: str, session: requests.Session, depth: int = 0):
     """
     1) URL 받아서 read_html로 표 찾기
-    2) 표 없으면 iframe src 따라가기 (KIND가 이 구조가 많음)
+    2) 표 없으면 iframe/frame src 따라가기
+    3) 그래도 없으면 HTML 안의 searchContents 링크 추적
     """
     try:
         r = fetch(session, url, timeout=25)
@@ -232,12 +249,24 @@ def parse_html_tables(url: str, session: requests.Session, depth: int = 0):
         except ValueError:
             pass
 
-        # 2) table 없으면 iframe 추적
         soup = BeautifulSoup(html, "lxml")
+
+        # 2) iframe 추적
         iframe = soup.find("iframe")
-        if iframe and iframe.get("src") and depth < 2:
+        if iframe and iframe.get("src") and depth < 3:
             next_url = urljoin(BASE, iframe["src"])
             return parse_html_tables(next_url, session, depth + 1)
+
+        # 2-2) frame 추적(구형 구조)
+        frame = soup.find("frame")
+        if frame and frame.get("src") and depth < 3:
+            next_url = urljoin(BASE, frame["src"])
+            return parse_html_tables(next_url, session, depth + 1)
+
+        # 3) searchContents 링크 추적
+        cu = _find_contents_url(html)
+        if cu and depth < 3:
+            return parse_html_tables(cu, session, depth + 1)
 
         return {}
     except:
@@ -246,41 +275,49 @@ def parse_html_tables(url: str, session: requests.Session, depth: int = 0):
 
 
 # =====================
-# 6) Excel Fallback 파싱 (진짜 엑셀 or HTML-table 엑셀)
+# 6) Excel Fallback (Referer 필수 + HTML 에러페이지 판별)
 # =====================
-def parse_excel_fallback(excel_url: str, session: requests.Session):
+def parse_excel_fallback(excel_url: str, session: requests.Session, referer: str):
     bag = {}
     try:
         print("-> [Fallback] 엑셀 데이터 다운로드 시도...")
-        r = fetch(session, excel_url, timeout=25)
-        ct = (r.headers.get("Content-Type") or "").lower()
 
-        # 디버그(원인 확인용)
-        print(f"   [Excel HTTP] status={r.status_code} ct={ct} bytes={len(r.content)}")
+        headers = dict(DEFAULT_HEADERS)
+        headers["Referer"] = referer  # ✅ 핵심
+
+        r = fetch(session, excel_url, timeout=25, headers=headers)
+        ct = (r.headers.get("Content-Type") or "").lower()
+        cd = (r.headers.get("Content-Disposition") or "").lower()
+
+        print(f"   [Excel HTTP] status={r.status_code} ct={ct} cd={cd} bytes={len(r.content)}")
 
         if r.status_code != 200 or len(r.content) < 200:
             return {}
 
-        head = r.content[:300].lstrip().lower()
+        head = r.content[:400].lstrip().lower()
 
-        # (1) 응답이 HTML이면: read_html로 처리 (KIND 엑셀이 실제로 HTML인 경우 있음)
+        # HTML(에러페이지/안내페이지)면 preview 찍고 종료 (혹시 table 있으면 read_html 시도)
         if ("text/html" in ct) or head.startswith(b"<!doctype html") or head.startswith(b"<html") or (b"<table" in head):
+            preview = (r.text[:350]).replace("\n", " ")
+            print(f"   [Excel HTML Preview] {preview}")
             try:
                 return flatten_tables_from_html(r.text)
             except:
                 return {}
 
-        # (2) 진짜 xls/xlsx면: read_excel로 처리 (xls는 xlrd 필요)
+        # 진짜 xls/xlsx면 read_excel (xls는 xlrd 필요)
         df = pd.read_excel(io.BytesIO(r.content))
         df = df.fillna("").astype(str)
         for rr in range(len(df)):
             for cc in range(len(df.columns) - 1):
                 k = df.iloc[rr, cc].strip()
                 v = df.iloc[rr, cc + 1].strip()
-                if k and v and len(k) < 50:
+                if k and v and len(k) < 60:
                     bag[k] = v
+
     except Exception as e:
         print(f"-> [Excel Parse Error] {e}")
+
     return bag
 
 
@@ -293,14 +330,12 @@ def _norm(s: str):
 
 def map_to_target(bag):
     out = {}
-    # bag key들을 normalize해서 빠르게 찾기
     norm_map = {_norm(k): k for k in bag.keys()}
 
     for target, aliases in TARGET_KEYS.items():
         val = ""
         for a in aliases:
             na = _norm(a)
-            # bag 키 중 alias 포함(부분매칭)
             matched = None
             for nk, orig_k in norm_map.items():
                 if na and na in nk:
@@ -334,7 +369,7 @@ def main():
     feed = feedparser.parse(RSS_URL)
     items_to_process = []
 
-    # (A) RSS 신규 수집
+    # (A) RSS 신규
     for entry in feed.entries:
         title = entry.get("title", "") or ""
         link = entry.get("link", "") or ""
@@ -353,7 +388,7 @@ def main():
     # (B) Retry 합치기
     items_to_process.extend(retry_queue)
 
-    # ✅ 같은 guid 중복 제거(네 로그처럼 같은 항목이 2~3번 도는 문제 방지)
+    # ✅ guid 기준 중복 제거
     uniq = {}
     for it in items_to_process:
         uniq[it["guid"]] = it
@@ -370,20 +405,30 @@ def main():
         print(f"Processing: {title}")
         is_correction = 1 if "[정정]" in title else 0
 
-        # 1) 본문/엑셀 URL 구성
-        real_url, excel_url = build_contents_and_excel_urls(link, session)
+        # 1) URL 구성
+        viewer_url, contents_url, excel_url = build_urls(link, session)
 
-        # 2) HTML 파싱 시도(iframe 포함)
-        bag = parse_html_tables(real_url, session)
+        # 2) ✅ viewer 먼저 열어서 세션/쿠키/흐름 확보
+        try:
+            fetch(session, viewer_url, timeout=20)
+        except:
+            pass
+
+        # 3) HTML 파싱 (가능하면 contents부터)
+        bag = {}
+        if contents_url:
+            bag = parse_html_tables(contents_url, session)
+        if not bag:
+            bag = parse_html_tables(viewer_url, session)
+
         mapped = map_to_target(bag)
         is_complete = check_completeness(mapped)
 
-        # 3) 부족하면 엑셀 fallback (진짜 엑셀 or HTML-table)
+        # 4) Excel fallback (Referer=viewer_url)
         if not is_complete and excel_url:
-            fallback_bag = parse_excel_fallback(excel_url, session)
+            fallback_bag = parse_excel_fallback(excel_url, session, referer=viewer_url)
             fallback_mapped = map_to_target(fallback_bag)
 
-            # 빈 값만 보강
             for k, v in fallback_mapped.items():
                 if (not mapped.get(k)) and v:
                     mapped[k] = v
@@ -391,18 +436,16 @@ def main():
 
         now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
-        # ✅ 완전하지 않아도 회사명이라도 있으면 저장(너 기존 정책 유지)
+        # ✅ 완전하지 않아도 회사명이라도 있으면 저장
         if is_complete or mapped.get("회사명"):
             try:
                 raw_id = get_next_id(raw_ws)
 
-                # RAW 저장
                 raw_ws.append_row(
                     [raw_id, now, pub, title, link, guid, "SUCCESS"],
                     value_input_option="USER_ENTERED",
                 )
 
-                # ISSUE 저장
                 issue_row = [raw_id, now, pub, title, link, guid, is_correction] + [
                     mapped[k] for k in TARGET_KEYS.keys()
                 ]
