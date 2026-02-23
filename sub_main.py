@@ -1,4 +1,4 @@
-# ====== KIND Disclosure Bot (Sub-Main: Excel Download Method) ======
+# ====== KIND Disclosure Bot (Sub-Main: Today Only & Column Fix) ======
 import os, json, time, io
 from datetime import datetime, timedelta
 import pandas as pd
@@ -7,12 +7,10 @@ import gspread
 from google.oauth2.service_account import Credentials
 
 # 설정
-# 상세검색 엑셀 다운로드 엔드포인트
 EXCEL_URL = "https://kind.krx.co.kr/disclosure/details.do?method=downloadDisclosureListExcel"
 KEYWORDS = ["유상증자", "전환사채", "교환사채"]
 SHEET_NAME = "KIND_대경"
 RAW_TAB = "RAW"
-ISSUE_TAB = "ISSUE"
 
 def connect_gs():
     creds_dict = json.loads(os.environ["GOOGLE_CREDS"])
@@ -22,24 +20,21 @@ def connect_gs():
     ])
     client = gspread.authorize(creds)
     sh = client.open(SHEET_NAME)
-    return sh.worksheet(RAW_TAB), sh.worksheet(ISSUE_TAB)
+    return sh.worksheet(RAW_TAB)
 
-def get_disclosure_df():
-    # 한국 시간 기준 오늘/한달 전 날짜 설정
+def get_today_disclosure_df():
+    # 한국 시간 기준 오늘 날짜 설정 (GitHub Actions의 UTC 무관하게 작동)
     kst_now = datetime.utcnow() + timedelta(hours=9)
     today = kst_now.strftime("%Y-%m-%d")
-    from_date = (kst_now - timedelta(days=7)).strftime("%Y-%m-%d") # 최근 7일치
     
-    # 엑셀 다운로드를 위한 상세 파라미터 (브라우저 엑셀 버튼 동작 복제)
+    # 엑셀 다운로드 파라미터 (당일만 조회)
     payload = {
         "forward": "details_com",
-        "mktTpCd": "0",        # 전체시장
-        "searchCodeType": "",
-        "searchCorpName": "",
-        "fromDate": from_date,
-        "toDate": today,
-        "reportNm": "",        # 보고서명 필터 (비워두면 전체)
-        "isMainIsu": "1",      # 주요공시 여부
+        "mktTpCd": "0",        # 전체 시장
+        "fromDate": today,     # 시작일: 오늘
+        "toDate": today,       # 종료일: 오늘
+        "reportNm": "",
+        "isMainIsu": "",
         "sortIndex": "2",      # 시간순 정렬
         "orderMode": "0",
         "currentPageSize": "100"
@@ -51,52 +46,67 @@ def get_disclosure_df():
     }
     
     try:
-        print(f"📥 {from_date} ~ {today} 기간 엑셀 데이터 요청 중...")
+        print(f"📡 {today} 당일 엑셀 데이터 요청 중...")
         res = requests.post(EXCEL_URL, data=payload, headers=headers)
         
-        # KIND의 엑셀은 사실 HTML table 형태이므로 read_html로 읽습니다.
+        # KIND의 엑셀(HTML 형식)을 읽어옵니다.
         dfs = pd.read_html(io.BytesIO(res.content))
         if not dfs: return None
         
         df = dfs[0]
-        # 컬럼명 정리 (KIND 엑셀 특유의 공백 제거)
-        df.columns = [c.replace(" ", "") for c in df.columns]
+        
+        # [에러 해결 핵심] 컬럼명에 숫자가 섞여있어도 안전하게 문자열로 변환
+        # 'int' object has no attribute 'replace' 에러 방지
+        df.columns = [str(c).replace(" ", "") for c in df.columns]
+        
         return df
     except Exception as e:
-        print(f"❌ 엑셀 다운로드 실패: {e}")
+        print(f"❌ 데이터 처리 중 에러 발생: {e}")
         return None
 
 def main():
-    raw_ws, issue_ws = connect_gs()
-    df = get_disclosure_df()
+    raw_ws = connect_gs()
+    df = get_today_disclosure_df()
     
     if df is None or df.empty:
-        print("📭 가져온 데이터가 없습니다.")
+        print("📭 오늘 조건에 맞는 공시가 없습니다.")
         return
 
-    # 키워드 필터링 (공시제목 컬럼 기준)
-    # 엑셀에서는 '보고서명'이나 '공시제목' 등으로 나옵니다.
-    target_col = "공시제목" if "공시제목" in df.columns else df.columns[3]
-    filtered_df = df[df[target_col].str.contains("|".join(KEYWORDS), na=False)]
+    # 공시제목(또는 보고서명) 컬럼 확인
+    col_name = "공시제목" if "공시제목" in df.columns else (df.columns[3] if len(df.columns) > 3 else "")
     
-    print(f"🎯 키워드 일치 공시: {len(filtered_df)}건 발견")
+    if not col_name:
+        print("⚠️ 공시 정보를 찾을 수 없는 표 형식입니다.")
+        return
+
+    # 키워드 필터링
+    filtered_df = df[df[col_name].str.contains("|".join(KEYWORDS), na=False)]
+    print(f"🎯 검색된 오늘 키워드 공시: {len(filtered_df)}건")
     
     for _, row in filtered_df.iterrows():
-        corp = row['회사명'] if '회사명' in row else "알수없음"
-        title = row[target_col]
-        print(f"✅ 처리 중: [{corp}] {title}")
+        corp = row.get('회사명', '알수없음')
+        title = row.get(col_name, '제목없음')
+        pub_time = row.get('시간', '00:00')
         
-        # 엑셀 데이터에는 상세 내용 수치가 없으므로, 
-        # 일단 리스트 정보를 시트에 기록하는 것으로 테스트합니다.
+        print(f"✅ 수집 성공: [{corp}] {title}")
+        
+        # 구글 시트에 기록
         now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         try:
-            # 시트에 데이터 추가 (엑셀에서 제공하는 기본 정보만 우선 저장)
-            raw_ws.append_row([len(raw_ws.get_col_values(1))+1, now, row.get('시간', ''), title, "EXCEL_LINK", "ID", "EXCEL_SUCCESS"])
-            time.sleep(1)
+            raw_ws.append_row([
+                len(raw_ws.get_col_values(1)) + 1, 
+                now, 
+                pub_time, 
+                title, 
+                "EXCEL_MODE", 
+                corp, 
+                "TODAY_SUCCESS"
+            ])
+            time.sleep(1) # 시트 과부하 방지
         except Exception as e:
             print(f"❌ 시트 저장 에러: {e}")
 
-    print("🏁 [EXCEL 방식] 테스트 종료")
+    print("🏁 [SUB-MAIN] 오늘자 데이터 수집 완료")
 
 if __name__ == "__main__":
     main()
