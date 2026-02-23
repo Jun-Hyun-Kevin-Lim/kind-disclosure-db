@@ -30,10 +30,15 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements.txt
 
+      - name: Install Playwright browsers
+        run: python -m playwright install --with-deps chromium
+
       - name: Run Main Script
         env:
           GOOGLE_CREDS: ${{ secrets.GOOGLE_CREDS }}
           DEBUG_HTML: "1"
+          # 필요하면 켜서 원인 덤프
+          # DUMP_FAIL_HTML: "1"
         run: python main.py
 
       - name: Commit and Push Changes
