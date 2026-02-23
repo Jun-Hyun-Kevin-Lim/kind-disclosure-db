@@ -1,8 +1,7 @@
-# ====== KIND Disclosure Bot (Root-cause fix: resolve real HTML with tables + VERSION) ======
-import os, json, time, re
+# ====== KIND Disclosure Bot (v2: get docNo from "본문선택" then fetch real searchContents tables) ======
+import os, json, time, re, html
 from datetime import datetime
-from urllib.parse import urlparse, parse_qs, urljoin, urlencode, unquote
-import html as htmllib
+from urllib.parse import urlparse, parse_qs, urlencode, urljoin
 
 import feedparser
 import requests
@@ -10,7 +9,7 @@ import gspread
 from bs4 import BeautifulSoup
 from google.oauth2.service_account import Credentials
 
-BOT_VERSION = "2026-02-23-resolver-v1"
+BOT_VERSION = "kind-bot-v1"
 DEBUG_HTML = os.getenv("DEBUG_HTML", "0") == "1"
 
 RSS_URL = "https://kind.krx.co.kr/disclosure/rsstodaydistribute.do?method=searchRssTodayDistribute&repIsuSrtCd=&mktTpCd=0&searchCorpName=&currentPageSize=200"
@@ -19,7 +18,6 @@ KEYWORDS = ["유상증자"]
 SHEET_NAME = "KIND_대경"
 RAW_TAB = "RAW"
 ISSUE_TAB = "ISSUE"
-
 SEEN_FILE = "seen.json"
 RETRY_FILE = "retry_queue.json"
 
@@ -31,11 +29,11 @@ DEFAULT_HEADERS = {
     "Connection": "keep-alive",
 }
 
-# 네가 원하는 필드 + VERSION
+# 네가 원하는 16개 + VERSION
 TARGET_KEYS = {
     "최초 이사회결의일": ["이사회결의일", "결의일", "결정일", "이사회 결의일"],
     "증자방식": ["증자방식", "발행방식", "배정방법", "배정방식"],
-    "발행상품": ["신주의 종류", "주식의 종류", "증권종류"],
+    "발행상품": ["신주의 종류", "주식의 종류", "증권종류", "발행상품"],
     "신규발행주식수": ["신규발행주식수", "발행주식수", "발행할 주식의 수", "신주수", "증자할 주식수"],
     "확정발행가(원)": ["확정발행가", "신주발행가액", "발행가", "발행가액", "1주당 발행가액"],
     "기준주가": ["기준주가", "기준주가액"],
@@ -54,9 +52,7 @@ TARGET_KEYS = {
 SLEEP_SECONDS = 1
 
 
-# -----------------
-# helpers
-# -----------------
+# ---------------- utils ----------------
 def norm(s: str) -> str:
     return re.sub(r"\s+", "", str(s or "")).lower()
 
@@ -117,175 +113,126 @@ def fetch_rss(session):
     return feed
 
 def extract_company_from_title(title: str):
-    # "[코]유티아이 ..." -> 유티아이
     m = re.match(r"^\[([^\]]+)\]\s*([^\s]+)", (title or "").strip())
     return m.group(2) if m else ""
 
 def extract_market_code_from_title(title: str):
-    # 시장은 매핑하지 않고 코드 그대로 저장 (요구 반영)
     m = re.match(r"^\[([^\]]+)\]", (title or "").strip())
     return m.group(1).strip() if m else ""
 
-def extract_acptno(link: str, html: str):
+def clean_report_title(title: str):
+    """
+    RSS 제목에서 회사/시장 prefix 제거하고 보고서명만 남김
+    예: "[코]유티아이 유상증자결정(종속회사의 주요경영사항)" -> "유상증자결정(종속회사의 주요경영사항)"
+    """
+    t = (title or "").strip()
+    t = re.sub(r"^\[[^\]]+\]\s*", "", t)        # [코] 제거
+    t = re.sub(r"^[^\s]+\s+", "", t, count=1)   # 회사명 1단어 제거
+    t = t.replace("[정정]", "").strip()
+    return t
+
+def extract_acptno_from_link(link: str, html_text: str):
     qs = parse_qs(urlparse(link).query)
     acpt = (qs.get("acptno") or qs.get("acptNo") or [None])[0]
     if acpt:
         return acpt
-    m = re.search(r'acptNo"\s*value="(\d+)"', html)
+    m = re.search(r'acptNo"\s*value="(\d+)"', html_text)
     if m:
         return m.group(1)
-    m = re.search(r'_TRK_PN\s*=\s*"(\d+)"', html)
+    m = re.search(r'_TRK_PN\s*=\s*"(\d+)"', html_text)
     if m:
         return m.group(1)
-    m = re.search(r"(acptno|acptNo)=(\d{8,14})", html)
+    m = re.search(r"(acptno|acptNo)=(\d{8,14})", html_text)
     if m:
         return m.group(2)
     return None
 
-def extract_docno_candidates(html: str):
-    soup = BeautifulSoup(html, "lxml")
-    vals = []
-    for opt in soup.find_all("option"):
-        v = (opt.get("value") or "").strip()
-        m = re.match(r"^(\d{6,14})\|", v)
-        if m:
-            vals.append(m.group(1))
-    # fallback regex
-    vals += re.findall(r"option\s+value=['\"](\d{6,14})\|", html)
-    uniq, seen = [], set()
-    for x in vals:
-        if x.isdigit() and x not in seen:
-            uniq.append(x)
-            seen.add(x)
-    return uniq[:30]
-
-def build_urls(acptno: str, docno: str):
-    # ✅ 케이스를 브라우저와 동일하게(acptNo/docNo/orgId/rcpNo) 맞춤
+def build_viewer_shell_url(acptno: str):
+    """
+    ✅ 핵심: docNo를 넣지 말고 공시뷰어 '껍데기'를 먼저 연다.
+    (브라우저도 이렇게 열고, 본문선택에서 docNo를 고름)
+    """
     base = f"{BASE}/common/disclsviewer.do"
     params = {
-        "acptNo": acptno,
-        "docNo": docno,
-        "langTpCd": "0",
-        "orgId": "K",
-        "tran": "Y",
-        "rcpNo": acptno,
+        "method": "search",
+        "acptno": acptno,
+        "docno": "",
+        "viewerhost": "",   # 실제 페이지들도 viewerhost= 형태가 많음
     }
-    viewer = base + "?" + urlencode({"method": "search", **params})
-    contents = base + "?" + urlencode({"method": "searchContents", **params})
-    excel = base + "?" + urlencode({"method": "downloadExcel", **params})
-    pdf = base + "?" + urlencode({"method": "downloadPdf", **params})  # 있으면 쓰고, 없으면 HTML로 올 수 있음
-    return viewer, contents, excel, pdf
+    return base + "?" + urlencode(params, doseq=True)
+
+def parse_body_docno_from_viewer(viewer_html: str, report_hint: str):
+    """
+    viewer 페이지에서 '본문선택' 드롭다운의 option value에서 docNo를 찾는다.
+    report_hint(보고서명)과 option 텍스트 매칭으로 가장 맞는 docNo를 선택.
+    """
+    soup = BeautifulSoup(viewer_html, "lxml")
+
+    # 후보 option들 수집: value="12345|..." 형태
+    options = []
+    for opt in soup.find_all("option"):
+        v = (opt.get("value") or "").strip()
+        txt = opt.get_text(" ", strip=True)
+        m = re.match(r"^(\d{6,14})\|", v)
+        if m:
+            docno = m.group(1)
+            options.append((docno, txt))
+
+    if not options:
+        return None
+
+    # 보고서명 힌트로 best match
+    hint_n = norm(report_hint)
+    best = None
+    best_score = -1
+    for docno, txt in options:
+        tn = norm(txt)
+        score = 0
+        # 힌트가 옵션에 포함되면 큰 가점
+        if hint_n and hint_n in tn:
+            score += 100
+        # "유상증자결정" 같은 핵심 단어 가점
+        if "유상증자" in tn:
+            score += 10
+        if "결정" in tn:
+            score += 5
+        # 텍스트 길이도 너무 짧으면 감점
+        if len(txt) < 5:
+            score -= 5
+
+        if score > best_score:
+            best_score = score
+            best = docno
+
+    return best
+
+def build_search_contents_url(acptno: str, docno: str):
+    base = f"{BASE}/common/disclsviewer.do"
+    params = {
+        "method": "searchContents",
+        "acptno": acptno,
+        "docno": docno,
+    }
+    return base + "?" + urlencode(params)
 
 def extract_embedded_html(raw: str) -> str:
-    """
-    table이 HTML 문자열로 인코딩되어 있을 때(escape/unescape/textarea 등) 복원
-    """
+    # table이 escape되어 있는 케이스 복원
     if "<table" in raw.lower():
         return raw
-
-    # &lt;table 형태
     if "&lt;table" in raw.lower():
-        decoded = htmllib.unescape(raw)
+        decoded = html.unescape(raw)
         if "<table" in decoded.lower():
             return decoded
-
-    # %3Ctable 형태
-    if "%3ctable" in raw.lower():
-        decoded = unquote(raw)
-        if "<table" in decoded.lower():
-            return decoded
-
-    # unescape('...') 패턴
-    m = re.search(r"unescape\(['\"]([^'\"]+)['\"]\)", raw, re.I)
-    if m:
-        decoded = unquote(m.group(1))
-        decoded = htmllib.unescape(decoded)
-        if "<table" in decoded.lower():
-            return decoded
-
-    # textarea에 HTML이 들어있는 케이스
-    soup = BeautifulSoup(raw, "lxml")
-    ta = soup.find("textarea")
-    if ta:
-        decoded = ta.get_text()
-        decoded = htmllib.unescape(decoded)
-        decoded = unquote(decoded)
-        if "<table" in decoded.lower():
-            return decoded
-
     return raw
 
-def find_next_urls(html: str):
-    soup = BeautifulSoup(html, "lxml")
-    urls = []
 
-    for tag in soup.find_all(["iframe", "frame"]):
-        src = tag.get("src")
-        if src:
-            urls.append(urljoin(BASE, src))
-
-    # searchContents 링크가 스크립트/문자열로 박혀 있는 경우
-    for m in re.findall(r"(\/common\/disclsviewer\.do\?method=searchContents[^\"'\s]+)", html):
-        urls.append(urljoin(BASE, m))
-
-    # downloadExcel/Pdf 링크도 혹시 박혀 있으면 저장
-    for m in re.findall(r"(\/common\/disclsviewer\.do\?method=download(?:Excel|Pdf)[^\"'\s]+)", html, flags=re.I):
-        urls.append(urljoin(BASE, m))
-
-    # uniq
-    out, seen = [], set()
-    for u in urls:
-        if u not in seen:
-            out.append(u)
-            seen.add(u)
-    return out
-
-def resolve_real_table_html(session, start_url: str, referer: str | None):
-    """
-    ✅ 핵심: viewer/search → iframe/frame → 실제 table이 있는 HTML까지 BFS로 따라감
-    """
-    queue = [(start_url, referer, 0)]
-    visited = set()
-
-    while queue:
-        url, ref, depth = queue.pop(0)
-        if depth > 6:
-            continue
-        if url in visited:
-            continue
-        visited.add(url)
-
-        r = fetch(session, url, referer=ref)
-        raw = r.text
-        raw = extract_embedded_html(raw)
-
-        soup = BeautifulSoup(raw, "lxml")
-        tables = soup.find_all("table")
-
-        if DEBUG_HTML:
-            ct = (r.headers.get("Content-Type") or "").lower()
-            print(f"   [RESOLVE] depth={depth} status={r.status_code} ct={ct} bytes={len(r.content)} tables={len(tables)} url={url}")
-
-        # ✅ table을 찾으면 종료
-        if tables:
-            return raw, url
-
-        # 다음 URL 후보 추가
-        nxts = find_next_urls(r.text)  # 원문 기준으로 링크 탐색
-        for n in nxts:
-            queue.append((n, url, depth + 1))
-
-    # 끝까지 못 찾으면 마지막으로 start 응답 반환
-    return extract_embedded_html(fetch(session, start_url, referer=referer).text), start_url
-
-# ----- table -> matrix (rowspan/colspan)
+# ---------------- table parsing (rowspan/colspan -> matrix) ----------------
 def table_to_matrix(table):
     matrix = []
     span_map = {}
     for tr in table.find_all("tr"):
         row = []
         col = 0
-
         while col in span_map:
             txt, remain = span_map[col]
             row.append(txt)
@@ -335,7 +282,6 @@ def extract_from_matrix(matrix, aliases):
             c = (cell or "").strip()
             if not c:
                 continue
-            # "5. 증자방식" 번호 제거
             cn = norm(re.sub(r"^\d+\.\s*", "", c))
             if any(a and a in cn for a in als):
                 v = pick_value_from_row(r, i)
@@ -343,11 +289,12 @@ def extract_from_matrix(matrix, aliases):
                     return v
     return ""
 
-def parse_html_to_fields(html: str):
-    soup = BeautifulSoup(html, "lxml")
-    matrices = [table_to_matrix(t) for t in soup.find_all("table")]
-    out = {k: "" for k in TARGET_KEYS.keys()}
+def parse_html_to_fields(html_text: str):
+    soup = BeautifulSoup(html_text, "lxml")
+    tables = soup.find_all("table")
+    matrices = [table_to_matrix(t) for t in tables]
 
+    out = {k: "" for k in TARGET_KEYS.keys()}
     for target, aliases in TARGET_KEYS.items():
         for mtx in matrices:
             v = extract_from_matrix(mtx, aliases)
@@ -355,16 +302,14 @@ def parse_html_to_fields(html: str):
                 out[target] = v
                 break
 
-    return out
+    return out, len(tables)
 
 def decide_status(fields: dict):
-    # 값이 3개 이상 채워지면 성공
-    filled = [k for k, v in fields.items() if str(v).strip()]
-    return "SUCCESS" if len(filled) >= 3 else "INCOMPLETE"
+    filled = sum(1 for v in fields.values() if str(v).strip())
+    return "SUCCESS" if filled >= 3 else "INCOMPLETE"
 
-# -----------------
-# main
-# -----------------
+
+# ---------------- main ----------------
 def main():
     raw_ws, issue_ws = connect_gs()
     seen_list = load_json(SEEN_FILE, [])
@@ -386,10 +331,12 @@ def main():
             continue
         if guid in seen_list:
             continue
-
         items.append({"title": title, "link": link, "guid": guid, "pub": pub})
 
+    # retry 합치기
     items.extend(retry_queue)
+
+    # dedupe
     uniq = {}
     for it in items:
         uniq[it["guid"]] = it
@@ -410,61 +357,48 @@ def main():
 
         print(f"\nProcessing: {title}")
 
-        title_company = extract_company_from_title(title)
-        title_market_code = extract_market_code_from_title(title)
+        company = extract_company_from_title(title)
+        market_code = extract_market_code_from_title(title)
+        report_hint = clean_report_title(title)
 
+        # 1) RSS 링크 페이지에서 acptNo 확보
         link_res = fetch(session, link)
-        acptno = extract_acptno(link, link_res.text)
-        docnos = extract_docno_candidates(link_res.text)
+        acptno = extract_acptno_from_link(link, link_res.text)
 
-        print(f"   [FOUND] acptNo={acptno} docNo_candidates={len(docnos)}")
+        if not acptno:
+            print("   [FAIL] acptNo 추출 실패")
+            new_retry.append(item)
+            continue
 
-        best = None  # (filled_count, version, fields)
+        # 2) viewer shell(본문선택 있는 페이지) 열기 — docno 비움
+        viewer_shell_url = build_viewer_shell_url(acptno)
+        vr = fetch(session, viewer_shell_url, referer=link)
 
-        if acptno and docnos:
-            for idx, docno in enumerate(docnos, 1):
-                viewer, contents, excel, pdf = build_urls(acptno, docno)
+        if DEBUG_HTML:
+            print(f"   [VIEWER] status={vr.status_code} bytes={len(vr.content)} url={viewer_shell_url}")
+            print(f"   [VIEWER preview] {vr.text[:200].replace(chr(10),' ')}")
 
-                # viewer 먼저 열어서 세션 체인 생성
-                fetch(session, viewer, referer=link)
+        # 3) viewer에서 본문선택 docNo 추출 (보고서명 힌트로 매칭)
+        docno = parse_body_docno_from_viewer(vr.text, report_hint)
+        if not docno:
+            print("   [FAIL] 본문선택 docNo 추출 실패 (viewer에 option 없음)")
+            new_retry.append(item)
+            continue
 
-                # ✅ 본문(표) HTML resolve
-                real_html, real_url = resolve_real_table_html(session, viewer, referer=link)
-                soup = BeautifulSoup(real_html, "lxml")
-                if not soup.find_all("table"):
-                    # viewer에서 못 찾으면 contents도 시도
-                    real_html, real_url = resolve_real_table_html(session, contents, referer=viewer)
+        # 4) searchContents로 '진짜 본문 표' 가져오기
+        contents_url = build_search_contents_url(acptno, docno)
+        cr = fetch(session, contents_url, referer=viewer_shell_url)
+        real_html = extract_embedded_html(cr.text)
 
-                tables_cnt = len(BeautifulSoup(real_html, "lxml").find_all("table"))
-                if DEBUG_HTML:
-                    print(f"   [TRY {idx}] docNo={docno} tables={tables_cnt} real_url={real_url}")
+        fields, tables_cnt = parse_html_to_fields(real_html)
+        filled = sum(1 for v in fields.values() if str(v).strip())
 
-                fields = parse_html_to_fields(real_html)
+        if DEBUG_HTML:
+            print(f"   [CONTENTS] status={cr.status_code} bytes={len(cr.content)} tables={tables_cnt} filled={filled}")
+            if tables_cnt == 0:
+                print(f"   [CONTENTS preview] {real_html[:220].replace(chr(10),' ')}")
 
-                # VERSION: 가장 안전하게 acptNo-docNo
-                version = f"{acptno}-{docno}"
-
-                filled = sum(1 for v in fields.values() if str(v).strip())
-                print(f"   [TRY {idx}] docNo={docno} filled={filled} tables={tables_cnt}")
-
-                if best is None or filled > best[0]:
-                    best = (filled, version, fields)
-
-                if filled >= 8:
-                    break
-        else:
-            # fallback: 링크 자체 resolve
-            real_html, _ = resolve_real_table_html(session, link, referer=None)
-            fields = parse_html_to_fields(real_html)
-            best = (sum(1 for v in fields.values() if str(v).strip()), "N/A", fields)
-
-        filled, version, fields = best
-
-        # 회사명/상장시장(코드)은 본문에서 못 나오면 제목 fallback
-        # (너가 말한 “정해놓지 말라” 반영: 코드 그대로 저장)
-        company = title_company
-        market = title_market_code
-
+        version = f"{acptno}-{docno}"
         status = decide_status(fields)
         now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
@@ -474,11 +408,10 @@ def main():
             # RAW
             raw_ws.append_row([raw_id, now, pub, title, link, guid, status], value_input_option="USER_ENTERED")
 
-            # ISSUE: 네 컬럼 순서에 맞춰서 쓴다
-            # (ID, 수집시간, 공시일시, 공시제목, 공시링크, GUID, 회사명, 상장시장, <타겟필드들>, VERSION)
+            # ISSUE (회사명/상장시장 + 16필드 + VERSION)
             issue_row = [
                 raw_id, now, pub, title, link, guid,
-                company, market,
+                company, market_code,
             ] + [fields.get(k, "") for k in TARGET_KEYS.keys()] + [version]
 
             issue_ws.append_row(issue_row, value_input_option="USER_ENTERED")
@@ -487,7 +420,8 @@ def main():
             if status != "SUCCESS":
                 new_retry.append(item)
 
-            print(f"-> Saved ({status}) filled={filled} VERSION={version}")
+            print(f"-> Saved ({status}) tables={tables_cnt} filled={filled} VERSION={version}")
+
         except Exception as e:
             print(f"-> [Google Sheets Error] {e}")
             new_retry.append(item)
