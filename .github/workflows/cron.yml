@@ -33,6 +33,7 @@ jobs:
       - name: Run Main Script
         env:
           GOOGLE_CREDS: ${{ secrets.GOOGLE_CREDS }}
+          DEBUG_HTML: "1"
         run: python main.py
 
       - name: Commit and Push Changes
