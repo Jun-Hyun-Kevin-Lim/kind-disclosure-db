@@ -20,7 +20,7 @@ DUMP_FAIL_HTML = os.getenv("DUMP_FAIL_HTML", "0") == "1"
 SUCCESS_FILLED_MIN = int(os.getenv("SUCCESS_FILLED_MIN", "10"))
 
 RSS_URL = "https://kind.krx.co.kr/disclosure/rsstodaydistribute.do?method=searchRssTodayDistribute&repIsuSrtCd=&mktTpCd=0&searchCorpName=&currentPageSize=200"
-KEYWORDS = ["유상증자"]
+KEYWORDS = ["전환사채"]
 
 SHEET_NAME = "KIND_대경"
 RAW_TAB = "RAW"
