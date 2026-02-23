@@ -9,7 +9,7 @@ from bs4 import BeautifulSoup
 from google.oauth2.service_account import Credentials
 
 RSS_URL = "http://kind.krx.co.kr:80/disclosure/rsstodaydistribute.do?method=searchRssTodayDistribute&repIsuSrtCd=&mktTpCd=0&searchCorpName=&currentPageSize=15"
-KEYWORDS = ["유상증자", "전환사채", "교환사채"]
+KEYWORDS = ["유상증자"]
 
 SHEET_NAME = "KIND_대경"
 RAW_TAB = "RAW"
