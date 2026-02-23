@@ -75,17 +75,22 @@ def get_real_content_info(url):
     excel_url = None
     try:
         res = requests.get(url, headers=headers, timeout=10)
-        # 1. 문서 접수번호(acptNo)를 정규식으로 직접 추출 (가장 확실한 방법)
-        match = re.search(r'acptNo"\s*value="(\d+)"', res.text)
-        if not match:
-            match = re.search(r'_TRK_PN\s*=\s*"(\d+)"', res.text)
+        
+        # 1. 문서 접수번호(acptNo) 추출
+        acpt_match = re.search(r'acptNo"\s*value="(\d+)"', res.text)
+        if not acpt_match:
+            acpt_match = re.search(r'_TRK_PN\s*=\s*"(\d+)"', res.text)
             
-        if match:
-            acpt_no = match.group(1)
-            # KIND의 실제 데이터가 담긴 표준 서식 전용 URL로 강제 생성
-            real_html_url = f"https://kind.krx.co.kr/common/disclsviewer.do?method=searchContents&acptNo={acpt_no}&docNo=&p_pageIndex=1"
-            # 2. 엑셀 다운로드 링크도 접수번호 기반으로 생성
-            excel_url = f"https://kind.krx.co.kr/common/disclsviewer.do?method=downloadExcel&acptNo={acpt_no}"
+        # 2. 문서 고유번호(docNo) 추출 (★이게 없으면 빈 화면이 나옴!)
+        doc_match = re.search(r"option value='(\d+)\|", res.text)
+            
+        if acpt_match and doc_match:
+            acpt_no = acpt_match.group(1)
+            doc_no = doc_match.group(1)
+            
+            # 본문 및 엑셀 URL에 acptNo와 docNo를 완벽하게 결합
+            real_html_url = f"https://kind.krx.co.kr/common/disclsviewer.do?method=searchContents&acptNo={acpt_no}&docNo={doc_no}"
+            excel_url = f"https://kind.krx.co.kr/common/disclsviewer.do?method=downloadExcel&acptNo={acpt_no}&docNo={doc_no}"
     except Exception as e:
         print(f"-> https://repairit.wondershare.com/file-repair/fix-windows-cannot-complete-the-extraction.html {e}")
         
