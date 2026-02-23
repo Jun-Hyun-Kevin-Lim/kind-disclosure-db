@@ -1,7 +1,7 @@
-# ====== KIND Disclosure Bot (Debug + Stable RSS + Save Even If Incomplete) ======
+# ====== KIND Disclosure Bot (Stable Contents URL + Excel Wrapper Handling) ======
 import os, json, time, re, io
 from datetime import datetime
-from urllib.parse import urlparse, parse_qs, urljoin
+from urllib.parse import urlparse, parse_qs, urlencode, urlunparse, urljoin
 
 import feedparser
 import pandas as pd
@@ -13,11 +13,8 @@ from google.oauth2.service_account import Credentials
 # =====================
 # Config
 # =====================
-# ✅ currentPageSize=200 (15개만 받아서 키워드 매칭 0개 되는 문제 방지)
-RSS_URL = "https://kind.krx.co.kr/disclosure/rsstodaydistribute.do?method=searchRssTodayDistribute&repIsuSrtCd=&mktTpCd=0&searchCorpName=&currentPageSize=100"
-
-# ✅ 키워드 없으면 전체 저장(테스트할 때 유용)
-KEYWORDS = ["유상증자"]
+RSS_URL = "https://kind.krx.co.kr/disclosure/rsstodaydistribute.do?method=searchRssTodayDistribute&repIsuSrtCd=&mktTpCd=0&searchCorpName=&currentPageSize=200"
+KEYWORDS = ["유상증자"]  # 테스트할 땐 [] 로 두면 전체 저장됨
 
 SHEET_NAME = "KIND_대경"
 RAW_TAB = "RAW"
@@ -26,7 +23,6 @@ ISSUE_TAB = "ISSUE"
 SEEN_FILE = "seen.json"
 RETRY_FILE = "retry_queue.json"
 
-# 완성도 체크 기준(원하면 조정)
 REQUIRED_FIELDS = ["회사명", "확정발행가(원)", "증자금액"]
 
 TARGET_KEYS = {
@@ -113,11 +109,16 @@ def get_next_id(ws):
 # =====================
 # HTTP / RSS
 # =====================
-def fetch(session: requests.Session, url: str, timeout=25, headers=None):
+def fetch(session: requests.Session, url: str, timeout=25, headers=None, method="GET", data=None):
     h = dict(DEFAULT_HEADERS)
     if headers:
         h.update(headers)
-    r = session.get(url, headers=h, timeout=timeout, allow_redirects=True)
+
+    if method == "POST":
+        r = session.post(url, headers=h, timeout=timeout, allow_redirects=True, data=data)
+    else:
+        r = session.get(url, headers=h, timeout=timeout, allow_redirects=True)
+
     if not r.encoding or r.encoding.lower() == "iso-8859-1":
         r.encoding = r.apparent_encoding or "utf-8"
     return r
@@ -128,122 +129,240 @@ def fetch_rss_feed(session: requests.Session):
     ct = (r.headers.get("Content-Type") or "").lower()
     print(f"[RSS] status={r.status_code} ct={ct} bytes={len(r.content)} final_url={r.url}")
     feed = feedparser.parse(r.content)
-    bozo = getattr(feed, "bozo", 0)
-    print(f"[RSS] entries={len(feed.entries)} bozo={bozo}")
-    if bozo:
-        print(f"[RSS] bozo_exception={getattr(feed,'bozo_exception',None)}")
-    # title sample
+    print(f"[RSS] entries={len(feed.entries)} bozo={getattr(feed,'bozo',0)}")
     for i, e in enumerate(feed.entries[:5]):
         print(f"[RSS sample {i+1}] {e.get('title','')}")
     return feed
 
 
 # =====================
-# KIND URL building
+# URL helpers
 # =====================
-def extract_qs(url: str):
-    qs = parse_qs(urlparse(url).query)
+def _qs_get(qs: dict, *keys):
+    for k in keys:
+        if k in qs and qs[k]:
+            return qs[k][0]
+    return None
 
-    def pick(*keys):
+
+def extract_params(url: str):
+    qs = parse_qs(urlparse(url).query)
+    acptno = _qs_get(qs, "acptno", "acptNo")
+    docno = _qs_get(qs, "docno", "docNo")
+    rcpno = _qs_get(qs, "rcpno", "rcpNo")
+    orgid = _qs_get(qs, "orgid", "orgId")
+    lang = _qs_get(qs, "langTpCd")
+    tran = _qs_get(qs, "tran")
+    viewerhost = _qs_get(qs, "viewerhost")
+    return {
+        "acptno": acptno,
+        "docno": docno,
+        "rcpno": rcpno,
+        "orgid": orgid,
+        "langTpCd": lang,
+        "tran": tran,
+        "viewerhost": viewerhost,
+    }
+
+
+def ensure_kind_defaults(url: str):
+    """
+    KIND 뷰어에서 종종 필요한 기본 파라미터를 강제로 보강:
+    - langTpCd=0
+    - orgid=K
+    - rcpno=acptno
+    - tran=Y
+    """
+    u = urlparse(url)
+    qs = parse_qs(u.query)
+
+    # 키를 lower로 통일하면서 값 유지
+    def get_any(*keys):
         for k in keys:
             if k in qs and qs[k]:
                 return qs[k][0]
         return None
 
-    return {
-        "acptNo": pick("acptNo", "acptno"),
-        "docNo": pick("docNo", "docno"),
-        "rcpNo": pick("rcpNo", "rcpno"),
-        "orgId": pick("orgId", "orgid"),
-        "langTpCd": pick("langTpCd"),
-        "viewerhost": pick("viewerhost"),
-        "tran": pick("tran"),
-    }
+    acptno = get_any("acptno", "acptNo")
+    docno = get_any("docno", "docNo")
+
+    # 기존 값 있으면 유지, 없으면 기본값
+    if "langTpCd" not in qs:
+        qs["langTpCd"] = ["0"]
+    if "orgid" not in qs and "orgId" not in qs:
+        qs["orgid"] = ["K"]
+    if ("rcpno" not in qs and "rcpNo" not in qs) and acptno:
+        qs["rcpno"] = [acptno]
+    if "tran" not in qs:
+        qs["tran"] = ["Y"]
+
+    # acptno/docno는 있으면 그대로 두고, 없으면 건드리지 않음
+    new_query = urlencode({k: v[0] for k, v in qs.items()}, doseq=False)
+    return urlunparse((u.scheme, u.netloc, u.path, u.params, new_query, u.fragment))
 
 
-def build_urls(original_url: str, session: requests.Session):
-    q = extract_qs(original_url)
+def replace_method(url: str, new_method: str):
+    u = urlparse(url)
+    qs = parse_qs(u.query)
+    qs["method"] = [new_method]
+    new_query = urlencode({k: v[0] for k, v in qs.items()}, doseq=False)
+    return urlunparse((u.scheme, u.netloc, u.path, u.params, new_query, u.fragment))
 
-    # 없으면 원본 페이지에서 최대한 추출
-    if not q["acptNo"] or not q["docNo"]:
-        try:
-            r = fetch(session, original_url, timeout=20)
-            txt = r.text
 
-            if not q["acptNo"]:
-                m = re.search(r'acptNo"\s*value="(\d+)"', txt)
+# =====================
+# Find real contents URL from HTML
+# =====================
+def find_search_contents_url(html: str):
+    # 1) 직접 링크 형태
+    m = re.search(r"(\/common\/disclsviewer\.do\?method=searchContents[^\"'\s]+)", html)
+    if m:
+        return urljoin(BASE, m.group(1))
+
+    m = re.search(r"(https?:\/\/kind\.krx\.co\.kr\/common\/disclsviewer\.do\?method=searchContents[^\"'\s]+)", html)
+    if m:
+        return m.group(1)
+
+    # 2) iframe src 안에 있을 수도
+    soup = BeautifulSoup(html, "lxml")
+    iframe = soup.find("iframe")
+    if iframe and iframe.get("src") and "searchContents" in iframe["src"]:
+        return urljoin(BASE, iframe["src"])
+
+    return None
+
+
+def build_urls_from_original(link: str, session: requests.Session):
+    """
+    ✅ 가장 강력한 방식:
+    - RSS link 페이지를 먼저 열고
+    - 그 HTML 안에서 '진짜 searchContents URL'을 찾아서 사용
+    """
+    # 1) 원본 링크 먼저 열기
+    r = fetch(session, link, timeout=25)
+    html = r.text
+
+    # 2) HTML에서 contents url 추출
+    contents_url = find_search_contents_url(html)
+
+    # 3) 못 찾으면: 파라미터 기반으로 구성
+    if not contents_url:
+        p = extract_params(link)
+        if not p["acptno"] or not p["docno"]:
+            # link HTML에서 숫자도 최대한 추출
+            # (docno 패턴 다양해서 여러 개 시도)
+            m = re.search(r"(acptno|acptNo)=(\d{8,14})", html)
+            if m and not p["acptno"]:
+                p["acptno"] = m.group(2)
+
+            m = re.search(r"(docno|docNo)=(\d{1,14})", html)
+            if m and not p["docno"]:
+                p["docno"] = m.group(2)
+
+            if not p["docno"]:
+                m = re.search(r"option\s+value=['\"](\d+)\|", html)
                 if m:
-                    q["acptNo"] = m.group(1)
-                else:
-                    m = re.search(r'_TRK_PN\s*=\s*"(\d+)"', txt)
-                    if m:
-                        q["acptNo"] = m.group(1)
+                    p["docno"] = m.group(1)
 
-            if not q["docNo"]:
-                m = re.search(r"(docNo|docno)=(\d{1,14})", txt)
-                if m:
-                    q["docNo"] = m.group(2)
-                else:
-                    m = re.search(r"option\s+value=['\"](\d+)\|", txt)
-                    if m:
-                        q["docNo"] = m.group(1)
-        except:
-            pass
+        if p["acptno"] and p["docno"]:
+            base = f"{BASE}/common/disclsviewer.do"
+            qs = {
+                "method": "searchContents",
+                "acptno": p["acptno"],
+                "docno": p["docno"],
+            }
+            contents_url = base + "?" + urlencode(qs)
+        else:
+            # 최악: link 자체로 파싱
+            contents_url = link
 
-    if not q["acptNo"] or not q["docNo"]:
-        return original_url, None, None
+    # 4) 기본 파라미터 보강
+    contents_url = ensure_kind_defaults(contents_url)
+    viewer_url = ensure_kind_defaults(replace_method(contents_url, "search"))
+    excel_url = ensure_kind_defaults(replace_method(contents_url, "downloadExcel"))
 
-    extra = []
-    for k in ["rcpNo", "orgId", "langTpCd", "viewerhost", "tran"]:
-        if q.get(k):
-            extra.append(f"{k}={q[k]}")
-    extra_qs = ("&" + "&".join(extra)) if extra else ""
-
-    viewer_url = f"{BASE}/common/disclsviewer.do?method=search&acptNo={q['acptNo']}&docNo={q['docNo']}{extra_qs}"
-    contents_url = f"{BASE}/common/disclsviewer.do?method=searchContents&acptNo={q['acptNo']}&docNo={q['docNo']}{extra_qs}"
-    excel_url = f"{BASE}/common/disclsviewer.do?method=downloadExcel&acptNo={q['acptNo']}&docNo={q['docNo']}{extra_qs}"
     return viewer_url, contents_url, excel_url
 
 
 # =====================
-# HTML parsing
+# Table flatten helpers (HTML / Soup)
 # =====================
-def flatten_tables_from_html(html: str):
+def flatten_df(df: pd.DataFrame):
     bag = {}
-    tables = pd.read_html(io.StringIO(html))
-    for df in tables:
-        df = df.fillna("").astype(str)
-        for r in range(len(df)):
-            for c in range(len(df.columns) - 1):
-                k = str(df.iloc[r, c]).strip()
-                v = str(df.iloc[r, c + 1]).strip()
-                if k and v and len(k) < 60:
-                    bag[k] = v
+    df = df.fillna("").astype(str)
+    for r in range(len(df)):
+        row = [str(x).strip() for x in df.iloc[r].tolist()]
+        row = [x for x in row if x != ""]
+        if len(row) < 2:
+            continue
+
+        # (1) 2칸씩 페어로 (0,1), (2,3)...
+        for i in range(0, len(row) - 1, 2):
+            k = row[i].strip()
+            v = row[i + 1].strip() if i + 1 < len(row) else ""
+            if k and v and len(k) < 60:
+                bag[k] = v
+
+        # (2) 첫 칸이 key, 나머지가 value인 형태도 커버
+        k0 = row[0].strip()
+        v0 = " ".join(row[1:]).strip()
+        if k0 and v0 and len(k0) < 60:
+            bag.setdefault(k0, v0)
+
     return bag
 
 
-def _find_contents_url(html: str):
-    m = re.search(r"(\/common\/disclsviewer\.do\?method=searchContents[^\"'\s]+)", html)
-    if m:
-        return urljoin(BASE, m.group(1))
-    m = re.search(r"(https?:\/\/kind\.krx\.co\.kr\/common\/disclsviewer\.do\?method=searchContents[^\"'\s]+)", html)
-    if m:
-        return m.group(1)
-    return None
+def flatten_tables_from_html(html: str):
+    bag = {}
+    # pandas read_html 우선
+    try:
+        tables = pd.read_html(io.StringIO(html))
+        for df in tables:
+            bag.update(flatten_df(df))
+        if bag:
+            return bag
+    except:
+        pass
+
+    # soup table fallback
+    soup = BeautifulSoup(html, "lxml")
+    for table in soup.find_all("table"):
+        for tr in table.find_all("tr"):
+            cells = []
+            for cell in tr.find_all(["th", "td"]):
+                txt = cell.get_text(" ", strip=True)
+                if txt:
+                    cells.append(txt)
+            if len(cells) < 2:
+                continue
+            # 2칸 페어
+            for i in range(0, len(cells) - 1, 2):
+                k = cells[i].strip()
+                v = cells[i + 1].strip()
+                if k and v and len(k) < 60:
+                    bag[k] = v
+            # 첫칸 key + 나머지 value
+            k0 = cells[0].strip()
+            v0 = " ".join(cells[1:]).strip()
+            if k0 and v0 and len(k0) < 60:
+                bag.setdefault(k0, v0)
+
+    return bag
 
 
+# =====================
+# Parse HTML (iframe/frame follow)
+# =====================
 def parse_html_tables(url: str, session: requests.Session, depth: int = 0):
     try:
         r = fetch(session, url, timeout=25)
         html = r.text
 
-        try:
-            return flatten_tables_from_html(html)
-        except ValueError:
-            pass
+        bag = flatten_tables_from_html(html)
+        if bag:
+            return bag
 
+        # iframe/frame 추적
         soup = BeautifulSoup(html, "lxml")
-
         iframe = soup.find("iframe")
         if iframe and iframe.get("src") and depth < 3:
             return parse_html_tables(urljoin(BASE, iframe["src"]), session, depth + 1)
@@ -252,8 +371,10 @@ def parse_html_tables(url: str, session: requests.Session, depth: int = 0):
         if frame and frame.get("src") and depth < 3:
             return parse_html_tables(urljoin(BASE, frame["src"]), session, depth + 1)
 
-        cu = _find_contents_url(html)
+        # searchContents 링크 재추적
+        cu = find_search_contents_url(html)
         if cu and depth < 3:
+            cu = ensure_kind_defaults(cu)
             return parse_html_tables(cu, session, depth + 1)
 
         return {}
@@ -262,44 +383,108 @@ def parse_html_tables(url: str, session: requests.Session, depth: int = 0):
 
 
 # =====================
-# Excel fallback (Referer)
+# Excel fallback: handle HTML wrapper (form/redirect)
 # =====================
+def _extract_redirect_or_form(html: str):
+    """
+    downloadExcel이 HTML로 내려올 때,
+    - meta refresh
+    - location.href
+    - form(action + hidden inputs)
+    를 찾아서 반환
+    """
+    soup = BeautifulSoup(html, "lxml")
+
+    # meta refresh
+    meta = soup.find("meta", attrs={"http-equiv": re.compile("refresh", re.I)})
+    if meta and meta.get("content"):
+        m = re.search(r"url=(.+)$", meta["content"], re.I)
+        if m:
+            return ("GET", m.group(1).strip(), None)
+
+    # location.href / document.location
+    m = re.search(r"(location\.href|document\.location)\s*=\s*['\"]([^'\"]+)['\"]", html)
+    if m:
+        return ("GET", m.group(2).strip(), None)
+
+    # form submit
+    form = soup.find("form")
+    if form and form.get("action"):
+        action = form["action"]
+        data = {}
+        for inp in form.find_all("input"):
+            name = inp.get("name")
+            if not name:
+                continue
+            data[name] = inp.get("value", "")
+        return ("POST", action, data)
+
+    return (None, None, None)
+
+
 def parse_excel_fallback(excel_url: str, session: requests.Session, referer: str):
-    bag = {}
-    try:
-        headers = {"Referer": referer}
-        r = fetch(session, excel_url, timeout=25, headers=headers)
+    """
+    1) downloadExcel 요청
+    2) 만약 HTML이면 -> redirect/form 따라가서 1번 더 시도
+    3) 진짜 엑셀이면 read_excel
+    """
+    headers = {"Referer": referer}
+    r = fetch(session, excel_url, timeout=25, headers=headers)
+    ct = (r.headers.get("Content-Type") or "").lower()
+    cd = (r.headers.get("Content-Disposition") or "").lower()
+    print(f"   [Excel HTTP] status={r.status_code} ct={ct} cd={cd} bytes={len(r.content)}")
 
-        ct = (r.headers.get("Content-Type") or "").lower()
-        cd = (r.headers.get("Content-Disposition") or "").lower()
-        print(f"   [Excel HTTP] status={r.status_code} ct={ct} cd={cd} bytes={len(r.content)}")
+    if r.status_code != 200 or len(r.content) < 200:
+        return {}
 
-        if r.status_code != 200 or len(r.content) < 200:
+    head = r.content[:400].lstrip().lower()
+
+    # HTML이면 wrapper 가능성 → redirect/form 따라가기
+    if ("text/html" in ct) or head.startswith(b"<!doctype html") or head.startswith(b"<html") or (b"<table" in head):
+        preview = (r.text[:350]).replace("\n", " ")
+        print(f"   [Excel HTML Preview] {preview}")
+
+        method, nxt, data = _extract_redirect_or_form(r.text)
+        if method and nxt:
+            nxt_url = urljoin(BASE, nxt)
+            nxt_url = ensure_kind_defaults(nxt_url)
+            print(f"   [Excel Wrapper] follow {method} -> {nxt_url}")
+
+            if method == "POST":
+                rr = fetch(session, nxt_url, timeout=25, headers={"Referer": referer}, method="POST", data=data)
+            else:
+                rr = fetch(session, nxt_url, timeout=25, headers={"Referer": referer})
+
+            ct2 = (rr.headers.get("Content-Type") or "").lower()
+            print(f"   [Excel Follow] status={rr.status_code} ct={ct2} bytes={len(rr.content)}")
+            if rr.status_code == 200 and len(rr.content) > 200:
+                # follow 결과가 또 HTML이면 table만이라도 시도
+                head2 = rr.content[:200].lstrip().lower()
+                if ("text/html" in ct2) or head2.startswith(b"<html") or b"<table" in head2:
+                    try:
+                        return flatten_tables_from_html(rr.text)
+                    except:
+                        return {}
+                # 엑셀이면 파싱
+                try:
+                    df = pd.read_excel(io.BytesIO(rr.content))
+                    return flatten_df(df)
+                except:
+                    return {}
+
+        # wrapper에서 table 있으면 그걸로라도
+        try:
+            return flatten_tables_from_html(r.text)
+        except:
             return {}
 
-        head = r.content[:400].lstrip().lower()
-
-        # HTML(안내/에러)면 preview 출력
-        if ("text/html" in ct) or head.startswith(b"<!doctype html") or head.startswith(b"<html") or (b"<table" in head):
-            preview = (r.text[:350]).replace("\n", " ")
-            print(f"   [Excel HTML Preview] {preview}")
-            try:
-                return flatten_tables_from_html(r.text)
-            except:
-                return {}
-
-        # 진짜 엑셀이면
+    # 진짜 엑셀이면
+    try:
         df = pd.read_excel(io.BytesIO(r.content))
-        df = df.fillna("").astype(str)
-        for rr in range(len(df)):
-            for cc in range(len(df.columns) - 1):
-                k = df.iloc[rr, cc].strip()
-                v = df.iloc[rr, cc + 1].strip()
-                if k and v and len(k) < 60:
-                    bag[k] = v
+        return flatten_df(df)
     except Exception as e:
         print(f"   [Excel Parse Error] {e}")
-    return bag
+        return {}
 
 
 # =====================
@@ -309,7 +494,7 @@ def _norm(s: str):
     return re.sub(r"\s+", "", str(s or "")).lower()
 
 
-def map_to_target(bag):
+def map_to_target(bag: dict):
     out = {}
     norm_map = {_norm(k): k for k in bag.keys()}
     for target, aliases in TARGET_KEYS.items():
@@ -328,7 +513,7 @@ def map_to_target(bag):
     return out
 
 
-def check_completeness(mapped_data):
+def check_completeness(mapped_data: dict):
     return all(mapped_data.get(f) for f in REQUIRED_FIELDS)
 
 
@@ -343,11 +528,8 @@ def main():
     print(f"[STATE] seen={len(seen_list)} retry_queue={len(retry_queue)} keywords={KEYWORDS}")
 
     session = requests.Session()
-
-    # ✅ RSS를 requests로 가져와서 파싱(상태/entries 디버그)
     feed = fetch_rss_feed(session)
 
-    # --- Collect items ---
     total_entries = len(feed.entries)
     kw_match = 0
     new_items = []
@@ -361,7 +543,6 @@ def main():
         if not guid:
             continue
 
-        # 키워드 필터(키워드 비어있으면 전체)
         if KEYWORDS:
             if not any(k in title for k in KEYWORDS):
                 continue
@@ -374,24 +555,15 @@ def main():
 
     print(f"[FILTER] total_entries={total_entries} keyword_matched={kw_match} new_items={len(new_items)}")
 
-    # Retry 합치기
     items_to_process = new_items + retry_queue
-
-    # guid 기준 dedupe
     uniq = {}
     for it in items_to_process:
         uniq[it["guid"]] = it
     items_to_process = list(uniq.values())
-
-    print(f"[QUEUE] to_process={len(items_to_process)} (new + retry - dedupe)")
+    print(f"[QUEUE] to_process={len(items_to_process)}")
 
     if not items_to_process:
-        # ✅ 여기서 끝나면 "시트에 아무것도 안 써지는" 게 정상
         print("[INFO] 처리할 항목이 0개라서 시트에 기록되지 않았습니다.")
-        print("      - (1) RSS entries=0 이거나")
-        print("      - (2) 최근 200개 안에 키워드가 없거나")
-        print("      - (3) 전부 seen에 들어가 있거나 / retry도 비어있음")
-        print("      위 로그([RSS]/[FILTER]/[STATE])로 원인 확인 가능")
         print("✅ 모든 작업 완료!")
         return
 
@@ -406,50 +578,45 @@ def main():
         print(f"\nProcessing: {title}")
         is_correction = 1 if "[정정]" in title else 0
 
-        viewer_url, contents_url, excel_url = build_urls(link, session)
+        viewer_url, contents_url, excel_url = build_urls_from_original(link, session)
+        print(f"   [URLs] viewer={viewer_url}")
+        print(f"   [URLs] contents={contents_url}")
+        print(f"   [URLs] excel={excel_url}")
 
-        # viewer 먼저 열기(세션/쿠키)
+        # viewer 먼저 열어 세션/쿠키 확보
         try:
             fetch(session, viewer_url, timeout=20)
         except:
             pass
 
-        # HTML 파싱
-        bag = {}
-        if contents_url:
-            bag = parse_html_tables(contents_url, session)
-        if not bag:
-            bag = parse_html_tables(viewer_url, session)
-
+        # 본문 HTML 파싱
+        bag = parse_html_tables(contents_url, session)
+        print(f"   [HTML bag] keys={len(bag)}")
         mapped = map_to_target(bag)
         is_complete = check_completeness(mapped)
 
         # Excel fallback
-        if not is_complete and excel_url:
+        if (not is_complete) and excel_url:
             print("-> [Fallback] 엑셀 데이터 다운로드 시도...")
-            fallback_bag = parse_excel_fallback(excel_url, session, referer=viewer_url)
-            fallback_mapped = map_to_target(fallback_bag)
+            fb_bag = parse_excel_fallback(excel_url, session, referer=viewer_url)
+            print(f"   [Excel bag] keys={len(fb_bag)}")
+            fb_mapped = map_to_target(fb_bag)
 
-            for k, v in fallback_mapped.items():
+            for k, v in fb_mapped.items():
                 if (not mapped.get(k)) and v:
                     mapped[k] = v
+
             is_complete = check_completeness(mapped)
 
         now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         status = "SUCCESS" if is_complete else "INCOMPLETE"
 
-        # ✅ 여기 핵심: 실패해도 RAW/ISSUE에 "한 줄은" 남긴다
+        # 실패해도 한 줄은 남김
         try:
             raw_id = get_next_id(raw_ws)
+            raw_ws.append_row([raw_id, now, pub, title, link, guid, status], value_input_option="USER_ENTERED")
 
-            raw_ws.append_row(
-                [raw_id, now, pub, title, link, guid, status],
-                value_input_option="USER_ENTERED",
-            )
-
-            issue_row = [raw_id, now, pub, title, link, guid, is_correction] + [
-                mapped[k] for k in TARGET_KEYS.keys()
-            ]
+            issue_row = [raw_id, now, pub, title, link, guid, is_correction] + [mapped[k] for k in TARGET_KEYS.keys()]
             issue_ws.append_row(issue_row, value_input_option="USER_ENTERED")
 
             if guid not in seen_list:
