@@ -8,8 +8,15 @@ import gspread
 from bs4 import BeautifulSoup
 from google.oauth2.service_account import Credentials
 
+# =========================
+# Config
+# =========================
 BOT_VERSION = os.getenv("BOT_VERSION", "kind-bot-v1")
 DEBUG_HTML = os.getenv("DEBUG_HTML", "0") == "1"
+DUMP_FAIL_HTML = os.getenv("DUMP_FAIL_HTML", "0") == "1"
+
+# ✅ 성공 기준(기본 10개 이상 채워지면 SUCCESS) - 필요시 env로 조정
+SUCCESS_FILLED_MIN = int(os.getenv("SUCCESS_FILLED_MIN", "10"))
 
 RSS_URL = "https://kind.krx.co.kr/disclosure/rsstodaydistribute.do?method=searchRssTodayDistribute&repIsuSrtCd=&mktTpCd=0&searchCorpName=&currentPageSize=200"
 KEYWORDS = ["유상증자"]
@@ -21,6 +28,7 @@ SEEN_FILE = "seen.json"
 RETRY_FILE = "retry_queue.json"
 
 BASE = "https://kind.krx.co.kr"
+
 DEFAULT_HEADERS = {
     "User-Agent": "Mozilla/5.0",
     "Accept-Language": "ko-KR,ko;q=0.9,en;q=0.8",
@@ -28,11 +36,17 @@ DEFAULT_HEADERS = {
     "Connection": "keep-alive",
 }
 
+# KIND viewer context defaults (없으면 fallback)
+VIEWERHOST_DEFAULT = os.getenv("VIEWERHOST_DEFAULT", "kind.krx.co.kr")
+VIEWERPORT_DEFAULT = os.getenv("VIEWERPORT_DEFAULT", "443")
+SCRNMODE_DEFAULT = os.getenv("SCRNMODE_DEFAULT", "1")
+
 # 네가 원하는 16개 + VERSION
 TARGET_KEYS = [
     "최초 이사회결의일","증자방식","발행상품","신규발행주식수","확정발행가(원)","기준주가","확정발행금액(억원)",
     "할인(할증률)","증자전 주식수","증자비율","청약일","납입일","주관사","자금용도","투자자","증자금액"
 ]
+
 ALIASES = {
     "최초 이사회결의일": ["이사회결의일","결의일","결정일","이사회 결의일"],
     "증자방식": ["증자방식","발행방식","배정방법","배정방식"],
@@ -52,10 +66,12 @@ ALIASES = {
     "증자금액": ["증자금액","발행규모","조달금액","모집금액","총 조달금액"],
 }
 
-SLEEP_SECONDS = 1
+SLEEP_SECONDS = float(os.getenv("SLEEP_SECONDS", "1"))
 
 
-# -------- utils --------
+# =========================
+# Utils
+# =========================
 def norm(s: str) -> str:
     return re.sub(r"\s+", "", str(s or "")).lower()
 
@@ -81,11 +97,25 @@ def fetch(session: requests.Session, url: str, referer: str | None = None, timeo
         r.encoding = r.apparent_encoding or "utf-8"
     return r
 
+def warmup_kind(session: requests.Session):
+    """
+    ✅ KIND는 종종 쿠키(예: WMONID/JSESSIONID)가 선행 세팅되어야 iframe/contents가 열림
+    """
+    try:
+        r = fetch(session, f"{BASE}/main.do?method=loadInitPage&scrnmode=1", referer=None)
+        if DEBUG_HTML:
+            print(f"[WARMUP] {r.status_code} cookies={session.cookies.get_dict()}")
+    except Exception as e:
+        print(f"[WARMUP] failed: {e}")
+
 def connect_gs():
     creds_dict = json.loads(os.environ["GOOGLE_CREDS"])
     creds = Credentials.from_service_account_info(
         creds_dict,
-        scopes=["https://www.googleapis.com/auth/spreadsheets", "https://www.googleapis.com/auth/drive"],
+        scopes=[
+            "https://www.googleapis.com/auth/spreadsheets",
+            "https://www.googleapis.com/auth/drive",
+        ],
     )
     client = gspread.authorize(creds)
     sh = client.open(SHEET_NAME)
@@ -110,7 +140,7 @@ def get_next_id(ws):
     return mx + 1
 
 def fetch_rss(session):
-    r = fetch(session, RSS_URL)
+    r = fetch(session, RSS_URL, referer=f"{BASE}/")
     feed = feedparser.parse(r.content)
     print(f"[RSS] status={r.status_code} bytes={len(r.content)} entries={len(feed.entries)}")
     return feed
@@ -165,7 +195,15 @@ def parse_docno_options(viewer_html: str):
         m = re.match(r"^(\d{6,14})\|", v)
         if m:
             options.append((m.group(1), txt))
-    return options
+    # fallback: option이 없으면 docno 형태만이라도 긁기
+    if not options:
+        for m in re.finditer(r'(\d{10,14})\|', viewer_html or ""):
+            options.append((m.group(1), ""))
+    # uniq
+    uniq = {}
+    for d, t in options:
+        uniq[d] = t
+    return [(d, uniq[d]) for d in uniq.keys()]
 
 def choose_best_docno(options, report_hint: str):
     hint = norm(report_hint)
@@ -173,40 +211,107 @@ def choose_best_docno(options, report_hint: str):
     for docno, txt in options:
         tn = norm(txt)
         score = 0
-        if hint and hint in tn:
+        if hint and tn and hint in tn:
             score += 100
         if "유상증자" in tn:
             score += 10
         if "결정" in tn:
             score += 5
-        if len(txt) < 5:
+        if txt and len(txt) < 5:
             score -= 3
+        # option text가 빈 경우라도 docno는 선택 가능하게
+        if not txt:
+            score += 1
         if score > best_score:
             best_score = score
             best_doc = docno
     return best_doc
 
-def find_contents_url_from_viewer(viewer_html: str):
-    """
-    ✅ viewer HTML 안에는 보통 iframe src로 searchContents URL이 들어있음.
-    그걸 그대로 쓰는게 가장 안전 (파라미터 누락 방지)
-    """
-    soup = BeautifulSoup(viewer_html, "lxml")
+# =========================
+# Viewer -> Contents URL finders
+# =========================
+def parse_hidden_context(viewer_html: str) -> dict:
+    t = html.unescape(viewer_html or "")
+    soup = BeautifulSoup(t, "lxml")
+    ctx = {}
+    for inp in soup.find_all("input"):
+        name = (inp.get("name") or inp.get("id") or "").strip().lower()
+        if not name:
+            continue
+        val = (inp.get("value") or "").strip()
+        if val:
+            ctx[name] = val
+    return ctx
 
-    # 1) iframe/frame src에 searchContents가 있으면 그걸 사용
+def find_external_htm_url(viewer_html: str) -> str | None:
+    """
+    ✅ KIND는 본문이 /external/.../*.htm 으로 분리되어 iframe으로 붙는 경우가 많음.
+    이걸 찾으면 searchContents 우회 가능.
+    """
+    t = html.unescape(viewer_html or "")
+    soup = BeautifulSoup(t, "lxml")
+
     for tag in soup.find_all(["iframe", "frame"]):
-        src = tag.get("src") or ""
-        if "method=searchContents" in src:
+        src = (tag.get("src") or "").strip()
+        if not src:
+            continue
+        if "/external/" in src and (".htm" in src or ".html" in src):
             return urljoin(BASE, src)
 
-    # 2) 혹시 스크립트/문자열에 박혀 있으면 regex
-    m = re.search(r"(\/common\/disclsviewer\.do\?method=searchContents[^\"'\s]+)", viewer_html)
+    # regex fallback
+    m = re.search(r'(["\'])(/external/[^"\']+\.(?:htm|html)[^"\']*)\1', t)
+    if m:
+        return urljoin(BASE, m.group(2))
+    m = re.search(r'(/external/[^\s<>"\']+\.(?:htm|html)[^\s<>"\']*)', t)
     if m:
         return urljoin(BASE, m.group(1))
 
     return None
 
-# ----- table parse (rowspan/colspan -> matrix) -----
+def find_contents_url_strict(viewer_html: str) -> str | None:
+    """
+    ✅ iframe/src 뿐 아니라 JS 문자열 안의 searchContents URL도 최대한 찾아냄
+    """
+    t = html.unescape(viewer_html or "")
+
+    # 1) iframe/frame src
+    soup = BeautifulSoup(t, "lxml")
+    for tag in soup.find_all(["iframe", "frame"]):
+        src = (tag.get("src") or "").strip()
+        if "disclsviewer.do" in src and "method=searchContents" in src:
+            return urljoin(BASE, src)
+
+    # 2) JS/HTML 안 따옴표 포함
+    m = re.search(r'(["\'])(/common/disclsviewer\.do\?method=searchContents[^"\']+)\1', t)
+    if m:
+        return urljoin(BASE, m.group(2))
+
+    # 3) 따옴표 없이
+    m = re.search(r'(/common/disclsviewer\.do\?method=searchContents[^\s<>"\']+)', t)
+    if m:
+        return urljoin(BASE, m.group(1))
+
+    return None
+
+def build_contents_url_with_context(acptno: str, docno: str, viewer_html: str) -> str:
+    ctx = parse_hidden_context(viewer_html)
+    viewerhost = ctx.get("viewerhost") or VIEWERHOST_DEFAULT
+    viewerport = ctx.get("viewerport") or VIEWERPORT_DEFAULT
+    scrnmode = ctx.get("scrnmode") or SCRNMODE_DEFAULT
+
+    params = {
+        "method": "searchContents",
+        "acptno": acptno,
+        "docno": docno,
+        "viewerhost": viewerhost,
+        "viewerport": viewerport,
+        "scrnmode": scrnmode,
+    }
+    return f"{BASE}/common/disclsviewer.do?" + urlencode(params, doseq=True)
+
+# =========================
+# Table parse (rowspan/colspan -> matrix)
+# =========================
 def table_to_matrix(table):
     matrix = []
     span_map = {}
@@ -271,10 +376,10 @@ def extract_from_matrix(matrix, aliases):
 
 def parse_contents_html(html_text: str):
     # table이 escape 되어있으면 복원
-    if "&lt;table" in html_text.lower():
+    if "&lt;table" in (html_text or "").lower():
         html_text = html.unescape(html_text)
 
-    soup = BeautifulSoup(html_text, "lxml")
+    soup = BeautifulSoup(html_text or "", "lxml")
     tables = soup.find_all("table")
     matrices = [table_to_matrix(t) for t in tables]
 
@@ -289,16 +394,19 @@ def parse_contents_html(html_text: str):
 
 def decide_status(fields: dict):
     filled = sum(1 for v in fields.values() if str(v).strip())
-    return "SUCCESS" if filled >= 3 else "INCOMPLETE"
+    return "SUCCESS" if filled >= SUCCESS_FILLED_MIN else "INCOMPLETE"
 
-
-# -------- main --------
+# =========================
+# Main
+# =========================
 def main():
     raw_ws, issue_ws = connect_gs()
     seen_list = load_json(SEEN_FILE, [])
     retry_queue = load_json(RETRY_FILE, [])
 
     session = requests.Session()
+    warmup_kind(session)
+
     feed = fetch_rss(session)
 
     items = []
@@ -315,7 +423,10 @@ def main():
             continue
         items.append({"title": title, "link": link, "guid": guid, "pub": pub})
 
+    # retry 합치기
     items.extend(retry_queue)
+
+    # uniq by guid
     uniq = {}
     for it in items:
         uniq[it["guid"]] = it
@@ -341,7 +452,7 @@ def main():
         print(f"\nProcessing: {title}")
 
         # 1) RSS 링크 → acptno
-        link_res = fetch(session, link)
+        link_res = fetch(session, link, referer=f"{BASE}/")
         acptno = extract_acptno_from_link(link, link_res.text)
         if not acptno:
             print("   [FAIL] acptNo not found")
@@ -352,11 +463,15 @@ def main():
         viewer_shell = build_viewer_url(acptno, None)
         vr_shell = fetch(session, viewer_shell, referer=link)
         options = parse_docno_options(vr_shell.text)
+
         if DEBUG_HTML:
             print(f"   [VIEWER SHELL] bytes={len(vr_shell.content)} options={len(options)}")
 
         if not options:
             print("   [FAIL] docNo options not found in viewer shell")
+            if DUMP_FAIL_HTML:
+                print("   [DUMP] viewer_shell (first 2000 chars)")
+                print(vr_shell.text[:2000])
             new_retry.append(item)
             continue
 
@@ -366,59 +481,106 @@ def main():
             new_retry.append(item)
             continue
 
-        # ✅ 3) viewer를 docno 포함해서 '다시' 열기 (이게 핵심)
+        # 3) viewer를 docno 포함해서 다시 열기
         viewer_doc = build_viewer_url(acptno, docno)
         vr_doc = fetch(session, viewer_doc, referer=viewer_shell)
 
         if DEBUG_HTML:
             print(f"   [VIEWER DOC] docno={docno} bytes={len(vr_doc.content)}")
-            print(f"   [VIEWER DOC preview] {vr_doc.text[:180].replace(chr(10),' ')}")
+            print(f"   [VIEWER DOC preview] {vr_doc.text[:200].replace(chr(10),' ')}")
 
-        # ✅ 4) viewer_doc HTML에서 실제 contents iframe src 추출
-        contents_url = find_contents_url_from_viewer(vr_doc.text)
-        if not contents_url:
-            # fallback: direct build (최후수단)
-            contents_url = f"{BASE}/common/disclsviewer.do?method=searchContents&" + urlencode({"acptno": acptno, "docno": docno})
+        # =========================
+        # ✅ 핵심: 본문 획득 우선순위
+        #  A) /external/...htm iframe을 찾으면 그걸 먼저 fetch (가장 안정적)
+        #  B) searchContents iframe/src 찾기
+        #  C) 컨텍스트 포함해서 searchContents URL 조립
+        # =========================
+        fields = {k: "" for k in TARGET_KEYS}
+        tables_cnt = 0
+        content_path = "NONE"
+        contents_html = ""
 
-        # 5) contents 호출 (referer=viewer_doc)
-        cr = fetch(session, contents_url, referer=viewer_doc)
-        contents_html = cr.text
+        # A) external htm 우선
+        external_url = find_external_htm_url(vr_doc.text)
+        if external_url:
+            exr = fetch(session, external_url, referer=viewer_doc)
+            contents_html = exr.text
+            # external도 "창 닫기"를 줄 수 있어서 체크
+            if "<title>창 닫기</title>" not in contents_html:
+                fields, tables_cnt = parse_contents_html(contents_html)
+                content_path = "EXTERNAL"
+            else:
+                if DEBUG_HTML:
+                    print(f"   [EXTERNAL] CLOSE-WINDOW url={external_url} bytes={len(exr.content)}")
 
-        # “창 닫기”면 여전히 컨텍스트가 안 맞음 → 로그로 확정
-        if "<title>창 닫기</title>" in contents_html:
+        # B/C) external 실패 시 searchContents
+        if content_path == "NONE":
+            contents_url = find_contents_url_strict(vr_doc.text)
+            if not contents_url:
+                contents_url = build_contents_url_with_context(acptno, docno, vr_doc.text)
+
+            cr = fetch(session, contents_url, referer=viewer_doc)
+            contents_html = cr.text
+
+            if "<title>창 닫기</title>" in contents_html:
+                content_path = "CLOSE_WINDOW"
+                if DEBUG_HTML:
+                    print(f"   [CONTENTS] CLOSE-WINDOW returned. url={contents_url}")
+                    print(f"   [COOKIES] {session.cookies.get_dict()}")
+                # fallback: viewer_doc 자체 파싱 시도(가끔 표가 들어있음)
+                fields, tables_cnt = parse_contents_html(vr_doc.text)
+                if sum(1 for v in fields.values() if str(v).strip()) > 0:
+                    content_path = "VIEWER_FALLBACK"
+            else:
+                fields, tables_cnt = parse_contents_html(contents_html)
+                content_path = "SEARCHCONTENTS"
+
             if DEBUG_HTML:
-                print(f"   [CONTENTS] CLOSE-WINDOW returned. bytes={len(cr.content)} url={contents_url}")
-                print(f"   [CONTENTS preview] {contents_html[:220].replace(chr(10),' ')}")
-            fields = {k: "" for k in TARGET_KEYS}
-            tables_cnt = 0
-        else:
-            fields, tables_cnt = parse_contents_html(contents_html)
+                print(f"   [CONTENTS] status={cr.status_code} bytes={len(cr.content)} path={content_path}")
+                print(f"   [CONTENTS URL] {contents_url}")
+
+        # 덤프(분석용)
+        if content_path in ("CLOSE_WINDOW", "NONE") and DUMP_FAIL_HTML:
+            print("   [DUMP] viewer_doc (first 2000 chars)")
+            print(vr_doc.text[:2000])
+            print("   [DUMP] contents_html (first 2000 chars)")
+            print((contents_html or "")[:2000])
 
         filled = sum(1 for v in fields.values() if str(v).strip())
         status = decide_status(fields)
         version = f"{acptno}-{docno}"
 
         if DEBUG_HTML:
-            print(f"   [CONTENTS] status={cr.status_code} bytes={len(cr.content)} tables={tables_cnt} filled={filled} VERSION={version}")
-            print(f"   [CONTENTS URL] {contents_url}")
+            print(f"   [PARSE] tables={tables_cnt} filled={filled}/{len(TARGET_KEYS)} status={status} VERSION={version} via={content_path}")
 
         now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
         try:
             raw_id = get_next_id(raw_ws)
-            raw_ws.append_row([raw_id, now, pub, title, link, guid, status], value_input_option="USER_ENTERED")
 
-            # ISSUE: (회사명/상장시장) + 16필드 + VERSION
-            issue_row = [raw_id, now, pub, title, link, guid, company, market_code] \
-                        + [fields.get(k, "") for k in TARGET_KEYS] + [version]
+            # RAW: ID | 수집시간 | 공시일(published) | 제목 | 링크 | GUID | 처리상태
+            raw_ws.append_row(
+                [raw_id, now, pub, title, link, guid, status],
+                value_input_option="USER_ENTERED"
+            )
+
+            # ISSUE: ID | 수집시간 | 공시일 | 제목 | 링크 | GUID | 회사명 | 상장시장 | 16필드 | VERSION
+            issue_row = (
+                [raw_id, now, pub, title, link, guid, company, market_code]
+                + [fields.get(k, "") for k in TARGET_KEYS]
+                + [version]
+            )
 
             issue_ws.append_row(issue_row, value_input_option="USER_ENTERED")
 
-            seen_list.append(guid)
+            # 성공/실패 기록
+            if guid not in seen_list:
+                seen_list.append(guid)
+
             if status != "SUCCESS":
                 new_retry.append(item)
 
-            print(f"-> Saved ({status}) tables={tables_cnt} filled={filled} VERSION={version}")
+            print(f"-> Saved ({status}) via={content_path} tables={tables_cnt} filled={filled} VERSION={version}")
 
         except Exception as e:
             print(f"-> [Google Sheets Error] {e}")
