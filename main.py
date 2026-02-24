@@ -216,90 +216,66 @@ def choose_best_docno(options, report_hint: str):
     return best_doc
 
 # =========================
-# Table parse (rowspan/colspan -> matrix)
+# Table parse (수정된 추출 로직: 정정 후 데이터 및 다중 행 구조 대응)
 # =========================
-def table_to_matrix(table):
-    matrix = []
-    span_map = {}
-    for tr in table.find_all("tr"):
-        row = []
-        col = 0
-        while col in span_map:
-            txt, remain = span_map[col]
-            row.append(txt)
-            remain -= 1
-            if remain <= 0:
-                del span_map[col]
-            else:
-                span_map[col] = (txt, remain)
-            col += 1
-
-        for cell in tr.find_all(["th", "td"]):
-            while col in span_map:
-                txt, remain = span_map[col]
-                row.append(txt)
-                remain -= 1
-                if remain <= 0:
-                    del span_map[col]
-                else:
-                    span_map[col] = (txt, remain)
-                col += 1
-
-            text = cell.get_text(" ", strip=True)
-            rowspan = int(cell.get("rowspan", "1") or "1")
-            colspan = int(cell.get("colspan", "1") or "1")
-
-            for _ in range(colspan):
-                row.append(text)
-                if rowspan > 1:
-                    span_map[col] = (text, rowspan - 1)
-                col += 1
-
-        matrix.append(row)
-    return matrix
-
 def pick_value_from_row(row, key_idx):
+    """
+    변경: '정정 후' 값은 항상 표의 가장 오른쪽(마지막)에 위치하므로, 
+          뒤에서부터(reversed) 우선적으로 탐색합니다.
+    """
+    # 1. 뒤에서부터 탐색 (정정 후 수치 우선 확보)
+    for j in range(len(row) - 1, key_idx, -1):
+        v = (row[j] or "").strip()
+        
+        # 비어있거나 무의미한 하이픈, 0 등은 건너뜀
+        if not v or v in ("-", "—", ".", "0", "0원"):
+            continue
+            
+        # 200자가 넘는 너무 긴 텍스트(법적 조항 등)는 실제 데이터가 아닐 확률이 높으므로 패스
+        if len(v) > 200:
+            continue
+            
+        return v
+    
+    # 2. 뒤에서 찾았는데 없으면(긴 조항만 있었던 경우 등), 앞에서부터 다시 탐색 (최후의 보루)
     for j in range(key_idx + 1, len(row)):
         v = (row[j] or "").strip()
         if not v or v in ("-", "—"):
             continue
         return v
+        
     return ""
+
 
 def extract_from_matrix(matrix, aliases):
     als = [norm(a) for a in aliases]
-    for r in matrix:
+    for r_idx, r in enumerate(matrix):
         for i, cell in enumerate(r):
             c = (cell or "").strip()
             if not c:
                 continue
             cn = norm(re.sub(r"^\d+\.\s*", "", c))
+            
+            # 매칭되는 키워드(Alias)를 찾았을 때
             if any(a and a in cn for a in als):
+                
+                # [특수 케이스 방어] '자금조달의 목적' 표는 제목 바로 아랫줄에 실제 금액이 기재됨
+                if "자금" in cn or "목적" in cn:
+                    if r_idx + 1 < len(matrix):
+                        next_row = matrix[r_idx + 1]
+                        # 아랫줄을 우측부터 역순 탐색하여 진짜 기재된 금액 찾기
+                        for j in range(len(next_row) - 1, -1, -1):
+                            nv = (next_row[j] or "").strip()
+                            if nv and nv not in ("-", "—", ".", "0", "0원") and len(nv) < 50:
+                                # 금액과 해당 열의 헤더(예: 운영자금)를 합쳐서 반환 ("운영자금 6,000,000,000" 형태)
+                                header = (r[j] or "").strip() if j < len(r) else ""
+                                return f"{header} {nv}".strip()
+
+                # 일반적인 표 구조인 경우 (역순 추출 함수 호출)
                 v = pick_value_from_row(r, i)
                 if v:
                     return v
     return ""
-
-def parse_contents_html(html_text: str):
-    if "&lt;table" in (html_text or "").lower():
-        html_text = html.unescape(html_text)
-
-    soup = BeautifulSoup(html_text or "", "lxml")
-    tables = soup.find_all("table")
-    matrices = [table_to_matrix(t) for t in tables]
-
-    out = {k: "" for k in TARGET_KEYS}
-    for key in TARGET_KEYS:
-        for mtx in matrices:
-            v = extract_from_matrix(mtx, ALIASES[key])
-            if v:
-                out[key] = v
-                break
-    return out, len(tables)
-
-def decide_status(fields: dict):
-    filled = sum(1 for v in fields.values() if str(v).strip())
-    return "SUCCESS" if filled >= SUCCESS_FILLED_MIN else "INCOMPLETE"
 
 # =========================
 # Playwright: fetch viewer contents HTML
