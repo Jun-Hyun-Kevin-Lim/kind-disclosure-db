@@ -12,80 +12,91 @@ from google.oauth2.service_account import Credentials
 from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
 
 # ==========================================
-# 1. Config (환경 설정)
+# 1. 정밀 추출용 정규식 엔진 (Strict Regex)
 # ==========================================
-BOT_VERSION = "kind-bot-v7-pandas"
+class Extractor:
+    @staticmethod
+    def date(text):
+        text = str(text).strip()
+        if len(text) > 50: return ""
+        # 2026.02.24, 2026-02-24, 2026년 2월 24일 모두 대응
+        m = re.search(r"(20[2-3]\d)\s*[\-\.\/년]\s*(\d{1,2})\s*[\-\.\/월]\s*(\d{1,2})", text)
+        return f"{m.group(1)}-{m.group(2).zfill(2)}-{m.group(3).zfill(2)}" if m else ""
 
-RSS_URL = "http://kind.krx.co.kr:80/disclosure/rsstodaydistribute.do?method=searchRssTodayDistribute&repIsuSrtCd=&mktTpCd=0&searchCorpName=&currentPageSize=200"
-BASE = "https://kind.krx.co.kr"
-KEYWORDS = ["유상증자", "전환사채", "교환사채"]
+    @staticmethod
+    def money_to_eok(text):
+        text = str(text).replace(",", "").strip()
+        if "해당사항" in text or len(text) > 100: return ""
+        # 숫자만 추출 (소수점 포함)
+        m = re.search(r"(\d+(?:\.\d+)?)", text)
+        if m:
+            val = float(m.group(1))
+            if "백만원" in text: val /= 100.0
+            elif "억원" in text or "억" in text: pass
+            elif val >= 10000000: val /= 100000000.0 # 단위가 원일 때
+            return str(round(val, 2))
+        return ""
 
-SHEET_NAME = os.getenv("SHEET_NAME", "KIND_대경")
-RAW_TAB = "RAW"
-TAB_YUSANG = "유상증자"
-TAB_JEONHWAN = "전환사채"
-TAB_GYOHWAN = "교환사채"
+    @staticmethod
+    def number(text):
+        text = str(text).replace(",", "").strip()
+        m = re.search(r"(\d+)", text)
+        return m.group(1) if m else ""
 
-SEEN_FILE = "seen.json"
-RETRY_FILE = "retry_queue.json"
-
-SUCCESS_FILLED_MIN = 8
-SLEEP_SECONDS = 1.0
-
-PW_NAV_TIMEOUT_MS = 25000
-PW_WAIT_MS = 3000
-
-ISSUE_FIELDS = [
-    "회사명","상장시장","최초 이사회결의일","증자방식","발행상품","신규발행주식수","확정발행가(원)","기준주가","확정발행금액(억원)","할인(할증률)",
-    "증자전 주식수","증자비율","청약일","납입일","주관사","자금용도","투자자","증자금액"
-]
+    @staticmethod
+    def ratio(text):
+        m = re.search(r"(\d+(?:\.\d+)?)\s*%", text)
+        return m.group(1) if m else ""
 
 # ==========================================
-# 2. Google Sheets & Utils
+# 2. 메인 파싱 엔진 (Pandas + Anchor Search)
 # ==========================================
-def load_json(filepath, default_val):
-    if os.path.exists(filepath):
-        try:
-            with open(filepath, "r", encoding="utf-8") as f: return json.load(f)
-        except Exception: pass
-    return default_val
-
-def save_json(filepath, data):
-    with open(filepath, "w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False, indent=2)
-
-def fetch(session, url, referer=None):
-    headers = {"User-Agent": "Mozilla/5.0"}
-    if referer: headers["Referer"] = referer
-    r = session.get(url, headers=headers, timeout=25)
-    r.encoding = "utf-8" if not r.encoding else r.apparent_encoding
-    return r
-
-def connect_gs():
-    creds = Credentials.from_service_account_info(
-        json.loads(os.environ["GOOGLE_CREDS"]),
-        scopes=["https://www.googleapis.com/auth/spreadsheets", "https://www.googleapis.com/auth/drive"]
-    )
-    client = gspread.authorize(creds)
-    sh = client.open(SHEET_NAME)
+def parse_kind_report(html_content):
+    fields = {k: "" for k in [
+        "최초 이사회결의일", "증자방식", "발행상품", "신규발행주식수", 
+        "확정발행가(원)", "확정발행금액(억원)", "납입일", "투자자", "자금용도"
+    ]}
     
-    def get_ws(title):
-        try: return sh.worksheet(title)
-        except gspread.exceptions.WorksheetNotFound: return sh.add_worksheet(title=title, rows="1000", cols="30")
-        
-    return get_ws(RAW_TAB), get_ws(TAB_YUSANG), get_ws(TAB_JEONHWAN), get_ws(TAB_GYOHWAN)
-
-def ensure_headers(raw_ws, issue_sheets):
-    raw_h = ["ID","수집시간","공시일시","공시제목","공시링크","GUID","처리상태","ACPTNO","DOCNO","FILLED","TABLES","VERSION"]
-    if raw_ws.row_values(1)[:len(raw_h)] != raw_h: raw_ws.update("A1", [raw_h])
+    if not html_content: return fields
     
-    iss_h = ["ID","수집시간","공시일시","회사명","상장시장","공시제목","공시링크","GUID"] + ISSUE_FIELDS + ["VERSION","처리상태","FILLED","TABLES","ACPTNO","DOCNO"]
-    for ws in issue_sheets:
-        if ws.row_values(1)[:len(iss_h)] != iss_h: ws.update("A1", [iss_h])
+    # 1. HTML 전처리 (표 안의 줄바꿈 해결)
+    html_content = html_content.replace("<br>", " ").replace("<br/>", " ")
+    try:
+        dfs = pd.read_html(StringIO(html_content))
+    except:
+        return fields
 
-def get_next_id(ws):
-    col = ws.col_values(1)[1:]
-    return max([int(v) for v in col if str(v).strip().isdigit()] + [0]) + 1
+    # 2. 항목별 타겟 매칭 (목차 번호 포함하여 정밀 검색)
+    def find_val(keywords, func, is_money=False):
+        regex = "|".join(keywords)
+        for df in dfs:
+            df = df.astype(str).replace('nan', '')
+            for r in range(len(df)):
+                for c in range(len(df.columns)):
+                    cell = df.iloc[r, c].replace(" ", "")
+                    if re.search(regex, cell):
+                        # 1순위: 우측 칸 탐색
+                        for next_c in range(c + 1, len(df.columns)):
+                            cand = df.iloc[r, next_c]
+                            res = func(cand, to_eok=True) if is_money else func(cand)
+                            if res: return res
+                        # 2순위: 아래 칸 탐색 (병합 대비)
+                        if r + 1 < len(df):
+                            cand = df.iloc[r+1, c]
+                            res = func(cand, to_eok=True) if is_money else func(cand)
+                            if res: return res
+        return ""
+
+    # 3. 핀셋 추출 시작
+    fields["최초 이사회결의일"] = find_val(["이사회결의일", "결정일"], Extractor.date)
+    fields["납입일"] = find_val(["납입일", "대금납입일"], Extractor.date)
+    fields["신규발행주식수"] = find_val(["신주의종류와수", "신규발행주식수", "발행할주식의수"], Extractor.number)
+    fields["확정발행가(원)"] = find_val(["발행가액", "전환가액", "교환가격"], Extractor.number)
+    fields["확정발행금액(억원)"] = find_val(["확정발행금액", "모집총액", "사채의권면총액"], Extractor.money_to_eok, is_money=True)
+    fields["증자방식"] = find_val(["증자방식", "발행방식", "사채발행방법"], lambda x: str(x)[:50])
+    fields["투자자"] = find_val(["제3자배정대상자", "배정대상자", "대상자"], lambda x: str(x)[:100])
+    
+    return fields
 
 # ==========================================
 # 3. 데이터 추출기 (정밀 필터링)
