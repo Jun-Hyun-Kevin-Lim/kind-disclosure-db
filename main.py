@@ -200,19 +200,33 @@ def choose_best_docno(options, report_hint: str):
     for docno, txt in options:
         tn = norm(txt)
         score = 0
+        
+        # 1. 리포트 제목 힌트가 문서명에 포함되면 강력 가점
         if hint and tn and hint in tn:
             score += 100
-        if "유상증자" in tn:
-            score += 10
+            
+        # 2. KEYWORDS(전환사채, 유상증자 등)가 힌트와 문서명 모두에 있으면 가점
+        # 이 부분이 추가되었습니다.
+        for keyword in KEYWORDS:
+            if keyword in hint and keyword in tn:
+                score += 10
+                
+        # 3. '결정' 키워드 포함 시 가점
         if "결정" in tn:
             score += 5
+            
+        # 4. 너무 짧은 텍스트는 우선순위 낮춤
         if txt and len(txt) < 5:
             score -= 3
+            
+        # 5. 아예 텍스트가 없는 경우 기본 점수
         if not txt:
             score += 1
+            
         if score > best_score:
             best_score = score
             best_doc = docno
+            
     return best_doc
 
 # =========================
