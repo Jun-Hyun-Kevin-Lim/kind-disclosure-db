@@ -204,7 +204,7 @@ def choose_best_docno(options, report_hint: str):
     return best_doc
 
 # =========================
-# Table parse (rowspan/colspan -> matrix)
+# Table parse
 # =========================
 def table_to_matrix(table):
     matrix = []
@@ -278,7 +278,7 @@ def decide_status(fields: dict):
     return "SUCCESS" if filled >= SUCCESS_FILLED_MIN else "INCOMPLETE"
 
 # =========================
-# Playwright: fetch viewer contents HTML
+# Playwright
 # =========================
 def get_kind_contents_html_by_playwright(viewer_url: str) -> tuple[str, str]:
     with sync_playwright() as p:
