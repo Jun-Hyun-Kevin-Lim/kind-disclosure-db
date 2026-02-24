@@ -17,7 +17,7 @@ BOT_VERSION = os.getenv("BOT_VERSION", "kind-bot-v2")
 RSS_URL = os.getenv(
     "RSS_URL",
     "http://kind.krx.co.kr:80/disclosure/rsstodaydistribute.do"
-    "?method=searchRssTodayDistribute&repIsuSrtCd=&mktTpCd=0&searchCorpName=&currentPageSize=100"
+    "?method=searchRssTodayDistribute&repIsuSrtCd=&mktTpCd=0&searchCorpName=&currentPageSize=200"
 )
 BASE = "https://kind.krx.co.kr"
 
