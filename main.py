@@ -98,8 +98,18 @@ def connect_gs():
     )
     client = gspread.authorize(creds)
     sh = client.open(SHEET_NAME)
-    raw_ws = sh.worksheet(RAW_TAB)
-    issue_ws = sh.worksheet(ISSUE_TAB)
+
+    # 탭이 없을 경우 자동 생성하는 로직 추가
+    def get_or_create_ws(title, rows=1000, cols=20):
+        try:
+            return sh.worksheet(title)
+        except gspread.exceptions.WorksheetNotFound:
+            print(f"[GS] Worksheet '{title}' not found. Creating new one.")
+            return sh.add_worksheet(title=title, rows=str(rows), cols=str(cols))
+
+    raw_ws = get_or_create_ws(RAW_TAB)
+    issue_ws = get_or_create_ws(ISSUE_TAB)
+
     print(f"[BOT] {BOT_VERSION}")
     print(f"[GS] Opened spreadsheet='{sh.title}' RAW='{raw_ws.title}' ISSUE='{issue_ws.title}'")
     return raw_ws, issue_ws
@@ -203,9 +213,6 @@ def choose_best_docno(options, report_hint: str):
             best_doc = docno
     return best_doc
 
-# =========================
-# Table parse
-# =========================
 def table_to_matrix(table):
     matrix = []
     span_map = {}
@@ -277,9 +284,6 @@ def decide_status(fields: dict):
     filled = sum(1 for v in fields.values() if str(v).strip())
     return "SUCCESS" if filled >= SUCCESS_FILLED_MIN else "INCOMPLETE"
 
-# =========================
-# Playwright
-# =========================
 def get_kind_contents_html_by_playwright(viewer_url: str) -> tuple[str, str]:
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=True)
@@ -308,9 +312,6 @@ def get_kind_contents_html_by_playwright(viewer_url: str) -> tuple[str, str]:
         browser.close()
         return best_html, best_label
 
-# =========================
-# Main
-# =========================
 def main():
     raw_ws, issue_ws = connect_gs()
     seen_list = load_json(SEEN_FILE, [])
