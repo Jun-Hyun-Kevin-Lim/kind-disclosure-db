@@ -306,9 +306,8 @@ def decide_status(fields: dict):
 # =========================
 def get_kind_contents_html_by_playwright(viewer_url: str) -> tuple[str, str]:
     """
-    viewer_url(=disclsviewer.do?method=search&acptno=...&docno=...)을 실제 브라우저로 열고,
-    iframe(검색 본문 또는 external 본문)의 HTML을 가져온다.
-    반환: (contents_html, path_label)
+    모든 프레임을 탐색하여 <table> 태그가 가장 많은 프레임의 HTML을 반환합니다.
+    URL 이름 기반의 부정확한 매칭을 피하고 실제 데이터가 로드될 때까지 대기합니다.
     """
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=True)
@@ -317,54 +316,37 @@ def get_kind_contents_html_by_playwright(viewer_url: str) -> tuple[str, str]:
         page.set_default_navigation_timeout(PW_NAV_TIMEOUT_MS)
 
         try:
-            page.goto(viewer_url, wait_until="domcontentloaded")
+            # domcontentloaded 대신 networkidle을 사용하여 내부 iframe의 네트워크 요청까지 대기
+            page.goto(viewer_url, wait_until="networkidle")
         except PWTimeout:
-            # navigation timeout이어도 iframe 로딩은 될 수 있어 계속 진행
             pass
 
-        # iframe/frame 중 본문일 가능성이 높은 frame 찾기
-        # 우선순위: /external/*.htm → method=searchContents → 그 외
-        best_frame = None
+        # 자바스크립트로 동적 생성되는 테이블이 렌더링될 수 있도록 3초간 명시적 대기
+        page.wait_for_timeout(3000)
+
+        best_html = ""
         best_label = "NONE"
+        max_tables = -1
 
-        t0 = time.time()
-        while (time.time() - t0) * 1000 < PW_FRAME_TIMEOUT_MS:
-            frames = page.frames
-            # main frame 제외, child frame 위주로 탐색
-            cand = []
-            for fr in frames:
-                if fr == page.main_frame:
-                    continue
-                u = fr.url or ""
-                if "/external/" in u and (u.endswith(".htm") or ".htm?" in u or u.endswith(".html") or ".html?" in u):
-                    cand.append((3, "EXTERNAL", fr))
-                elif "disclsviewer.do" in u and "method=searchContents" in u:
-                    cand.append((2, "SEARCHCONTENTS", fr))
-                elif u.startswith("https://kind.krx.co.kr/"):
-                    cand.append((1, "OTHER_KIND_FRAME", fr))
+        # 현재 로드된 모든 프레임을 순회하며 진짜 본문(테이블이 많은 곳)을 찾음
+        for fr in page.frames:
+            try:
+                html_content = fr.content()
+                lower_html = html_content.lower()
+                
+                # 정규 HTML 테이블과 이스케이프된(&lt;table) 테이블 모두 카운트
+                table_count = lower_html.count("<table") + lower_html.count("&lt;table")
+                
+                # 테이블 개수가 가장 많은 프레임을 본문으로 낙점
+                if table_count > max_tables:
+                    max_tables = table_count
+                    best_html = html_content
+                    best_label = f"FRAME_WITH_{table_count}_TABLES"
+            except Exception:
+                continue
 
-            if cand:
-                cand.sort(key=lambda x: x[0], reverse=True)
-                best_frame = cand[0][2]
-                best_label = cand[0][1]
-                break
-
-            # 아직 frame이 안 잡히면 조금 대기
-            page.wait_for_timeout(300)
-
-        if not best_frame:
-            # 마지막 fallback: 페이지 HTML 자체라도 반환
-            html_main = page.content()
-            browser.close()
-            return html_main, "PAGE_FALLBACK"
-
-        # frame content 가져오기
-        try:
-            contents_html = best_frame.content()
-        except Exception:
-            contents_html = ""
         browser.close()
-        return contents_html, best_label
+        return best_html, best_label
 
 # =========================
 # Main
