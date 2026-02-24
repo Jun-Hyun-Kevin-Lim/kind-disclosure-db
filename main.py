@@ -149,8 +149,13 @@ def get_full_html_via_playwright(viewer_url):
 def setup_sheets():
     creds_dict = json.loads(os.environ["GOOGLE_CREDS"])
     creds = Credentials.from_service_account_info(
-        creds_dict, scopes=["https://www.googleapis.com/auth/spreadsheets"]
+        creds_dict, 
+        scopes=[
+            "https://www.googleapis.com/auth/spreadsheets",
+            "https://www.googleapis.com/auth/drive"  # 이 줄을 추가해주세요!
+        ]
     )
+    # ...
     client = gspread.authorize(creds)
     sh = client.open(SHEET_NAME)
     
