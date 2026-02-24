@@ -53,7 +53,7 @@ ALIASES = {
     "확정발행금액(억원)": ["확정발행금액","모집총액","발행총액","발행금액","모집금액","조달금액", "사채의 권면총액", "권면(전자등록)총액"],
     "할인(할증률)": ["할인율","할증률","할인율(%)"],
     "증자전 주식수": ["증자전 주식수","증자전 발행주식총수","발행주식총수","기발행주식총수"],
-    "증자비율": ["증자비율","증자비율(%)"],
+    "증자비율": ["증자비율","증자비율(%)", "주식총수 대비 비율", "발행주식총수 대비"],
     "청약일": ["청약일","청약기간","청약시작일"],
     "납입일": ["납입일","대금납입일"],
     "주관사": ["주관사","대표주관회사","공동주관회사","인수회사","인수단"],
@@ -230,67 +230,117 @@ def choose_best_docno(options, report_hint: str):
     return best_doc
 
 # =========================
-# Table parse (수정된 추출 로직: 정정 후 데이터 및 다중 행 구조 대응)
+# Table parse & HTML 파싱 (완전 개편)
 # =========================
-def pick_value_from_row(row, key_idx):
-    """
-    변경: '정정 후' 값은 항상 표의 가장 오른쪽(마지막)에 위치하므로, 
-          뒤에서부터(reversed) 우선적으로 탐색합니다.
-    """
+def is_date_like(text: str) -> bool:
+    # 2026년 02월 23일, 2026-02-23, 2026.02.23 등의 형태 확인
+    return bool(re.search(r'\d{4}[\-\.\/년]\s*\d{1,2}[\-\.\/월]\s*\d{1,2}', text))
+
+def is_number_like(text: str) -> bool:
+    # 최소한 숫자 하나는 포함되어 있는지 확인
+    return bool(re.search(r'\d', text))
+
+def pick_value_from_row(row, key_idx, key_name):
+    needs_date = "일" in key_name or "기간" in key_name
+    needs_num = any(x in key_name for x in ["수", "가", "금액", "비율", "할인율"])
+
     # 1. 뒤에서부터 탐색 (정정 후 수치 우선 확보)
     for j in range(len(row) - 1, key_idx, -1):
         v = (row[j] or "").strip()
         
-        # 비어있거나 무의미한 하이픈, 0 등은 건너뜀
-        if not v or v in ("-", "—", ".", "0", "0원"):
-            continue
-            
-        # 200자가 넘는 너무 긴 텍스트(법적 조항 등)는 실제 데이터가 아닐 확률이 높으므로 패스
-        if len(v) > 200:
-            continue
-            
+        # 무의미한 값 패스
+        if not v or v in ("-", "—", ".", "0", "0원"): continue
+        # 너무 긴 텍스트(법적 조항 등) 패스
+        if len(v) > 150: continue
+        
+        # 🚨 타입 강제 체크 (여기가 핵심!)
+        if needs_date and not is_date_like(v): continue
+        if needs_num and not is_number_like(v): continue
+        
         return v
     
-    # 2. 뒤에서 찾았는데 없으면(긴 조항만 있었던 경우 등), 앞에서부터 다시 탐색 (최후의 보루)
+    # 2. 앞에서부터 다시 탐색 (최후의 보루)
     for j in range(key_idx + 1, len(row)):
         v = (row[j] or "").strip()
-        if not v or v in ("-", "—"):
-            continue
-        if len(v) > 200:
-            continue
+        if not v or v in ("-", "—"): continue
+        if len(v) > 150: continue
+        
+        if needs_date and not is_date_like(v): continue
+        if needs_num and not is_number_like(v): continue
+        
         return v
         
     return ""
 
-def extract_from_matrix(matrix, aliases):
+def extract_from_matrix(matrix, aliases, key_name):
     als = [norm(a) for a in aliases]
     for r_idx, r in enumerate(matrix):
         for i, cell in enumerate(r):
             c = (cell or "").strip()
-            if not c:
-                continue
+            if not c: continue
             cn = norm(re.sub(r"^\d+\.\s*", "", c))
             
-            # 매칭되는 키워드(Alias)를 찾았을 때
+            # 매칭되는 키워드를 찾았을 때
             if any(a and a in cn for a in als):
                 
-                # [특수 케이스 방어] '자금조달의 목적' 표는 제목 바로 아랫줄에 실제 금액이 기재됨
+                # 자금조달 목적 특수 처리 (아랫줄 탐색)
                 if "자금" in cn or "목적" in cn:
                     if r_idx + 1 < len(matrix):
                         next_row = matrix[r_idx + 1]
-                        # 아랫줄을 우측부터 역순 탐색하여 진짜 기재된 금액 찾기
                         for j in range(len(next_row) - 1, -1, -1):
                             nv = (next_row[j] or "").strip()
-                            if nv and nv not in ("-", "—", ".", "0", "0원") and len(nv) < 50:
-                                # 금액과 해당 열의 헤더(예: 운영자금)를 합쳐서 반환 ("운영자금 6,000,000,000" 형태)
+                            # 법적 조항이 안 들어가게 길이 제한 타이트하게(60자)
+                            if nv and nv not in ("-", "—", ".", "0", "0원") and len(nv) < 60:
                                 header = (r[j] or "").strip() if j < len(r) else ""
                                 return f"{header} {nv}".strip()
 
-                # 일반적인 표 구조인 경우 (역순 추출 함수 호출)
-                v = pick_value_from_row(r, i)
-                if v:
-                    return v
+                # 일반적인 표 구조인 경우
+                v = pick_value_from_row(r, i, key_name)
+                if v: return v
     return ""
+
+def parse_contents_html(html_text: str):
+    fields = {k: "" for k in TARGET_KEYS}
+    if not html_text:
+        return fields, 0
+
+    soup = BeautifulSoup(html_text, "lxml")
+    tables = soup.find_all("table")
+
+    for table in tables:
+        matrix = []
+        for tr in table.find_all("tr"):
+            row = []
+            for td in tr.find_all(["td", "th"]):
+                row.append(td.get_text(" ", strip=True))
+            if row: matrix.append(row)
+
+        # 🚨 핵심 변경: 테이블을 돌면서 값을 계속 '덮어쓰기' 합니다.
+        # 정정 문서 특성상 가장 정확한 '정정 후' 표는 문서 맨 아래에 위치하므로,
+        # 마지막으로 찾은 값이 최신/정확한 값일 확률이 99%입니다.
+        for key in TARGET_KEYS:
+            val = extract_from_matrix(matrix, ALIASES.get(key, []), key)
+            if val:
+                fields[key] = val
+
+    # 🚨 확정발행금액(억원) 단위 자동 변환 로직
+    amt_key = "확정발행금액(억원)"
+    if fields.get(amt_key):
+        raw_amt = fields[amt_key]
+        num_str = re.sub(r'[^\d]', '', raw_amt)  # 숫자만 추출
+        if num_str:
+            num = int(num_str)
+            # 숫자가 천만(10,000,000) 이상이면 단위가 '원'이라고 간주하고 1억으로 나눔
+            if num >= 10000000:
+                fields[amt_key] = str(num // 100000000)
+
+    return fields, len(tables)
+
+def decide_status(fields):
+    filled = sum(1 for v in fields.values() if str(v).strip())
+    if filled >= SUCCESS_FILLED_MIN:
+        return "SUCCESS"
+    return "INCOMPLETE"
 
 # =========================
 # HTML 파싱 및 상태 판별 함수 (복구된 부분!)
