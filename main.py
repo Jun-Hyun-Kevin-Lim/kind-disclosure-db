@@ -453,16 +453,14 @@ def main():
 
             # --- 여기서부터 수정 ---
             if status == "SUCCESS":
-                # 데이터가 완벽할 때만 '다시는 안 봐도 되는 목록(seen)'에 추가
                 if guid not in seen_list:
                     seen_list.append(guid)
-                print(f"-> [SUCCESS] 데이터 확보 완료.")
+                print(f"-> [SUCCESS] 데이터 확보 완료. seen에 추가됨.")
             else:
-                # 데이터가 부족하면 '다음에 다시 시도할 목록(new_retry)'에 추가
-                # seen_list에 넣지 않으므로 다음 실행 때 다시 긁습니다.
+                # 데이터가 부족하면 retry_queue에 넣어 다음 턴에 다시 시도
                 if item not in new_retry:
                     new_retry.append(item)
-                print(f"-> [INCOMPLETE] 데이터 부족 ({filled}개 추출). 다음 실행 시 재시도합니다.")
+                print(f"-> [INCOMPLETE] 데이터 부족 ({filled}/{len(TARGET_KEYS)}). 다음 실행 시 재시도합니다.")
             # --- 여기까지 수정 ---
 
             print(f"-> Saved ({status}) path={path} tables={tables_cnt} VERSION={version}")
