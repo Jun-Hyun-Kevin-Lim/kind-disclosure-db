@@ -2,8 +2,8 @@ name: KIND Disclosure Bot
 
 on:
   schedule:
-    # UTC 기준: 22:30(KST 07:30), 00:30(KST 09:30) ... 10:30(KST 19:30)
-    - cron: "30 22,0,2,4,6,8,10 * * *"
+    # 매 15분마다 실행 (0분, 15분, 30분, 45분)
+    - cron: "*/15 * * * *"
   workflow_dispatch: {}
 
 concurrency:
@@ -36,11 +36,9 @@ jobs:
         env:
           GOOGLE_CREDS: ${{ secrets.GOOGLE_CREDS }}
           DEBUG_HTML: "1"
-          # 필요시 조정
           SUCCESS_FILLED_MIN: "10"
           SHEET_NAME: "KIND_대경"
           RAW_TAB: "RAW"
-          ISSUE_TAB: "ISSUE"
           # DUMP_FAIL_HTML: "1"
         run: python main.py
 
