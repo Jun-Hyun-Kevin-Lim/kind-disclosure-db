@@ -12,7 +12,7 @@ from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
 # =========================
 # Config
 # =========================
-BOT_VERSION = os.getenv("BOT_VERSION", "kind-bot-v2")
+BOT_VERSION = os.getenv("BOT_VERSION", "kind-bot-v3")
 
 RSS_URL = os.getenv(
     "RSS_URL",
@@ -21,11 +21,14 @@ RSS_URL = os.getenv(
 )
 BASE = "https://kind.krx.co.kr"
 
-KEYWORDS = [k.strip() for k in os.getenv("KEYWORDS", "전환사채,유상증자,교환사채").split(",") if k.strip()]
+# 3가지 주요 키워드 설정
+KEYWORDS = ["유상증자", "전환사채", "교환사채"]
 
 SHEET_NAME = os.getenv("SHEET_NAME", "KIND_대경")
-RAW_TAB = os.getenv("RAW_TAB", "RAW")
-ISSUE_TAB = os.getenv("ISSUE_TAB", "ISSUE")
+RAW_TAB = "RAW"
+TAB_YUSANG = "유상증자"
+TAB_JEONHWAN = "전환사채"
+TAB_GYOHWAN = "교환사채"
 
 SEEN_FILE = os.getenv("SEEN_FILE", "seen.json")
 RETRY_FILE = os.getenv("RETRY_FILE", "retry_queue.json")
@@ -46,7 +49,7 @@ DEFAULT_HEADERS = {
     "Connection": "keep-alive",
 }
 
-# (PPT 기준) 최종 추출 필드
+# (PPT 기준) 최종 추출 필드 - 3개 시트 동일 적용
 ISSUE_FIELDS = [
     "회사명","상장시장","최초 이사회결의일","증자방식","발행상품","신규발행주식수","확정발행가(원)","기준주가","확정발행금액(억원)","할인(할증률)",
     "증자전 주식수","증자비율","청약일","납입일","주관사","자금용도","투자자","증자금액",
@@ -72,7 +75,7 @@ ALIASES = {
 }
 
 # =========================
-# Utils
+# Utils & Sheets
 # =========================
 def norm(s: str) -> str:
     return re.sub(r"\s+", "", str(s or "")).lower()
@@ -99,33 +102,45 @@ def fetch(session: requests.Session, url: str, referer: str | None = None, timeo
         r.encoding = r.apparent_encoding or "utf-8"
     return r
 
+def get_or_create_worksheet(sh, title, rows="1000", cols="30"):
+    """시트가 없으면 생성하여 반환합니다."""
+    try:
+        return sh.worksheet(title)
+    except gspread.exceptions.WorksheetNotFound:
+        print(f"[GS] Creating new worksheet: {title}")
+        return sh.add_worksheet(title=title, rows=rows, cols=cols)
+
 def connect_gs():
     creds_dict = json.loads(os.environ["GOOGLE_CREDS"])
     creds = Credentials.from_service_account_info(
         creds_dict,
-        scopes=[
-            "https://www.googleapis.com/auth/spreadsheets",
-            "https://www.googleapis.com/auth/drive",
-        ],
+        scopes=["https://www.googleapis.com/auth/spreadsheets", "https://www.googleapis.com/auth/drive"],
     )
     client = gspread.authorize(creds)
     sh = client.open(SHEET_NAME)
-    raw_ws = sh.worksheet(RAW_TAB)
-    issue_ws = sh.worksheet(ISSUE_TAB)
+    
+    # 각 시트 가져오거나 생성하기
+    raw_ws = get_or_create_worksheet(sh, RAW_TAB)
+    ws_yusang = get_or_create_worksheet(sh, TAB_YUSANG)
+    ws_jeonhwan = get_or_create_worksheet(sh, TAB_JEONHWAN)
+    ws_gyohwan = get_or_create_worksheet(sh, TAB_GYOHWAN)
+    
     print(f"[BOT] {BOT_VERSION}")
-    print(f"[GS] Opened spreadsheet='{sh.title}' RAW='{raw_ws.title}' ISSUE='{issue_ws.title}'")
-    return raw_ws, issue_ws
+    print(f"[GS] Opened spreadsheet '{sh.title}' with tabs: RAW, 유상증자, 전환사채, 교환사채")
+    return raw_ws, ws_yusang, ws_jeonhwan, ws_gyohwan
 
-def ensure_headers(raw_ws, issue_ws):
+def ensure_headers(raw_ws, issue_sheets: list):
     raw_header = ["ID","수집시간","공시일시","공시제목","공시링크","GUID","처리상태","ACPTNO","DOCNO","FILLED","TABLES","VERSION"]
     if (raw_ws.row_values(1) or [])[:len(raw_header)] != raw_header:
         raw_ws.resize(rows=max(raw_ws.row_count, 1), cols=max(raw_ws.col_count, len(raw_header)))
         raw_ws.update("A1", [raw_header])
 
     issue_header = ["ID","수집시간","공시일시","회사명","상장시장","공시제목","공시링크","GUID"] + ISSUE_FIELDS + ["VERSION","처리상태","FILLED","TABLES","ACPTNO","DOCNO"]
-    if (issue_ws.row_values(1) or [])[:len(issue_header)] != issue_header:
-        issue_ws.resize(rows=max(issue_ws.row_count, 1), cols=max(issue_ws.col_count, len(issue_header)))
-        issue_ws.update("A1", [issue_header])
+    
+    for ws in issue_sheets:
+        if (ws.row_values(1) or [])[:len(issue_header)] != issue_header:
+            ws.resize(rows=max(ws.row_count, 1), cols=max(ws.col_count, len(issue_header)))
+            ws.update("A1", [issue_header])
 
 def get_next_id(ws):
     col = ws.col_values(1)
@@ -136,165 +151,104 @@ def get_next_id(ws):
             mx = max(mx, int(v))
     return mx + 1
 
-def fetch_rss(session):
-    r = fetch(session, RSS_URL, referer=f"{BASE}/")
-    feed = feedparser.parse(r.content)
-    print(f"[RSS] status={r.status_code} bytes={len(r.content)} entries={len(feed.entries)}")
-    return feed
-
-def extract_company_from_title(title: str):
-    m = re.match(r"^\[([^\]]+)\]\s*([^\s]+)", (title or "").strip())
-    return m.group(2) if m else ""
-
-def extract_market_code_from_title(title: str):
-    m = re.match(r"^\[([^\]]+)\]", (title or "").strip())
-    return m.group(1).strip() if m else ""
-
-def clean_report_title(title: str):
-    t = (title or "").strip()
-    t = re.sub(r"^\[[^\]]+\]\s*", "", t)        # [코] 제거
-    t = re.sub(r"^[^\s]+\s+", "", t, count=1)   # 회사명 제거
-    t = t.replace("[정정]", "").strip()
-    return t
-
-def extract_acptno(link: str, html_text: str):
-    qs = parse_qs(urlparse(link).query)
-    acpt = (qs.get("acptno") or qs.get("acptNo") or [None])[0]
-    if acpt:
-        return acpt
-    m = re.search(r'acptNo"\s*value="(\d+)"', html_text or "")
-    if m:
-        return m.group(1)
-    m = re.search(r"(acptno|acptNo)=(\d{8,14})", html_text or "")
-    if m:
-        return m.group(2)
-    return None
-
-def build_viewer_url(acptno: str, docno: str | None):
-    base = f"{BASE}/common/disclsviewer.do"
-    params = {"method": "search", "acptno": acptno, "docno": docno or "", "viewerhost": ""}
-    return base + "?" + urlencode(params, doseq=True)
-
-def parse_docno_options(viewer_html: str):
-    soup = BeautifulSoup(viewer_html or "", "lxml")
-    options = []
-    for opt in soup.find_all("option"):
-        v = (opt.get("value") or "").strip()
-        txt = opt.get_text(" ", strip=True)
-        m = re.match(r"^(\d{10,14})\|", v)
-        if m:
-            options.append((m.group(1), txt))
-    seen = set()
-    out = []
-    for d, t in options:
-        if d not in seen:
-            out.append((d, t))
-            seen.add(d)
-    return out
-
-def heuristic_docno_rank(options, report_hint: str):
-    hint = norm(report_hint)
-    ranked = []
-    for docno, txt in options:
-        tn = norm(txt)
-        score = 0
-        if hint and tn and hint in tn:
-            score += 100
-        for kw in KEYWORDS:
-            if kw and (kw in report_hint) and (kw in txt):
-                score += 20
-            if kw and (kw in txt):
-                score += 5
-        if "정정" in txt:
-            score += 8
-        if "결정" in txt:
-            score += 5
-        if txt and len(txt) < 4:
-            score -= 3
-        ranked.append((score, docno, txt))
-    ranked.sort(reverse=True, key=lambda x: x[0])
-    return ranked
-
 # =========================
-# Parsing
+# Parsing Logic (Upgraded)
 # =========================
-def is_date_like(text: str) -> bool:
-    return bool(re.search(r"\d{4}\s*[\-\.\/년]\s*\d{1,2}\s*[\-\.\/월]\s*\d{1,2}", text or ""))
-
-def is_number_like(text: str) -> bool:
-    return bool(re.search(r"\d", text or ""))
-
-def pick_best_value(values: list[str], key_name: str) -> str:
-    needs_date = ("일" in key_name) or ("기간" in key_name)
-    needs_num = any(x in key_name for x in ["수", "가", "금액", "비율", "할인", "할증"])
-    for v in values:
-        v = (v or "").strip()
-        if not v or v in ("-", "—", ".", "0", "0원"):
-            continue
-        if len(v) > 200:
-            continue
-        if needs_date and not is_date_like(v):
-            continue
-        if needs_num and not is_number_like(v):
-            continue
-        return v
-    return ""
-
 def normalize_amount_to_eok(raw: str) -> str:
-    if not raw:
-        return ""
+    if not raw: return ""
     s = raw.replace(",", "").strip()
     m = re.search(r"(\d+(?:\.\d+)?)", s)
-    if not m:
-        return raw.strip()
+    if not m: return raw.strip()
     num = float(m.group(1))
     if "백만원" in s:
         num = num / 100.0
-        return str(int(num) if abs(num - int(num)) < 1e-9 else round(num, 2))
-    if "억원" in s or ("억" in s and "원" not in s):
-        return str(int(num) if abs(num - int(num)) < 1e-9 else round(num, 2))
-    if "원" in s or num >= 1e7:
-        num = num / 1e8
-        return str(int(num) if abs(num - int(num)) < 1e-9 else round(num, 2))
+    elif "원" in s or num >= 1e7:
+        if "억원" not in s and "억" not in s:
+            num = num / 1e8
     return str(int(num) if abs(num - int(num)) < 1e-9 else round(num, 2))
 
+def is_valid_format(text: str, key_name: str) -> bool:
+    """데이터 항목별 정밀 타입 검사"""
+    val = (text or "").strip()
+    if not val or val in ("-", "—", ".", "0", "0원", "해당사항 없음", "해당사항없음"):
+        return False
+        
+    if any(x in key_name for x in ["일", "기간"]):
+        return bool(re.search(r"20[1-3]\d\s*[\-\.\/년]\s*\d{1,2}\s*[\-\.\/월]\s*\d{1,2}", val))
+        
+    if "비율" in key_name or "율" in key_name:
+        return bool(re.search(r"\d+(\.\d+)?\s*%", val)) or bool(re.search(r"0\.\d+", val))
+        
+    if any(x in key_name for x in ["가", "금액", "수"]):
+        if re.search(r"20[1-3]\d\s*[\-\.\/년]", val):
+            return False
+        return bool(re.search(r"\d", val))
+        
+    return True
+
 def table_to_matrix(table_tag) -> list[list[str]]:
-    matrix = []
-    for tr in table_tag.find_all("tr"):
-        row = []
+    """HTML 테이블을 파싱하여 rowspan/colspan 병합을 풀어 2차원 배열로 반환합니다."""
+    rows = table_tag.find_all("tr")
+    grid = {}
+    max_r, max_c = 0, 0
+    
+    for r_idx, tr in enumerate(rows):
+        c_idx = 0
         for td in tr.find_all(["th", "td"]):
-            row.append(td.get_text(" ", strip=True))
-        if row:
-            matrix.append(row)
+            while grid.get((r_idx, c_idx)) is not None:
+                c_idx += 1
+            
+            rowspan = int(td.get("rowspan", 1))
+            colspan = int(td.get("colspan", 1))
+            text = td.get_text(" ", strip=True)
+            
+            for i in range(rowspan):
+                for j in range(colspan):
+                    grid[(r_idx + i, c_idx + j)] = text
+            c_idx += colspan
+        max_r = max(max_r, r_idx)
+        
+    matrix = []
+    for r in range(max_r + 1):
+        c_max = max([c for (row, c) in grid.keys() if row == r] + [-1])
+        row_data = [grid.get((r, c), "") for c in range(c_max + 1)]
+        if any(cell.strip() for cell in row_data):
+            matrix.append(row_data)
+            
     return matrix
 
 def extract_from_matrix(matrix: list[list[str]], key_name: str) -> str:
+    """표에서 항목명(Key)을 찾아 우측 또는 바로 아래의 값(Value)을 정확히 추출"""
     aliases = [norm(a) for a in ALIASES.get(key_name, []) if a]
-    if not aliases:
-        return ""
+    if not aliases: return ""
+        
     for r_idx, row in enumerate(matrix):
         for c_idx, cell in enumerate(row):
             cell_txt = (cell or "").strip()
-            if not cell_txt:
-                continue
-            cn = norm(re.sub(r"^\d+\.\s*", "", cell_txt))
-            if not any(a in cn for a in aliases):
+            if not cell_txt: continue
+            
+            cn = norm(re.sub(r"^[\d\.\-]+\s*", "", cell_txt))
+            if not any(a == cn or a in cn for a in aliases):
                 continue
 
-            right = [row[j] for j in range(len(row)-1, c_idx, -1)]
-            v = pick_best_value(right, key_name)
-            if v:
-                return v
+            # 1. 우측 셀들 탐색
+            right_cells = [row[j] for j in range(c_idx + 1, len(row))]
+            for val in right_cells:
+                if is_valid_format(val, key_name):
+                    return val.strip()
 
+            # 2. 아래 행 셀들 탐색 (병합으로 인해 밀린 경우)
             if r_idx + 1 < len(matrix):
                 next_row = matrix[r_idx + 1]
-                candidates = []
                 if c_idx < len(next_row):
-                    candidates.append(next_row[c_idx])
-                candidates += next_row[max(0, c_idx-1):min(len(next_row), c_idx+3)]
-                v2 = pick_best_value(candidates, key_name)
-                if v2:
-                    return v2
+                    val = next_row[c_idx]
+                    if is_valid_format(val, key_name):
+                        return val.strip()
+                        
+                if c_idx + 1 < len(next_row):
+                    val = next_row[c_idx + 1]
+                    if is_valid_format(val, key_name):
+                        return val.strip()
     return ""
 
 def parse_contents_html(contents_html: str):
@@ -311,7 +265,8 @@ def parse_contents_html(contents_html: str):
             for key in ISSUE_FIELDS:
                 val = extract_from_matrix(matrix, key)
                 if val:
-                    fields[key] = val  # 아래쪽 테이블이 최신일 때 덮어쓰기
+                    fields[key] = val
+            
             joined = norm(" ".join([" ".join(r) for r in matrix]))
             for key in ISSUE_FIELDS:
                 for a in ALIASES.get(key, []):
@@ -321,7 +276,6 @@ def parse_contents_html(contents_html: str):
         return len(tables), hit
 
     t_cnt, hit1 = _parse_one(contents_html)
-
     if "&lt;table" in contents_html.lower():
         unesc = ihtml.unescape(contents_html)
         t2, hit2 = _parse_one(unesc)
@@ -335,26 +289,89 @@ def parse_contents_html(contents_html: str):
     filled = sum(1 for v in fields.values() if str(v).strip())
     return fields, t_cnt, filled
 
+# =========================
+# Sub Utils (RSS, Titles, Extractors)
+# =========================
+def fetch_rss(session):
+    r = fetch(session, RSS_URL, referer=f"{BASE}/")
+    feed = feedparser.parse(r.content)
+    return feed
+
+def extract_company_from_title(title: str):
+    m = re.match(r"^\[([^\]]+)\]\s*([^\s]+)", (title or "").strip())
+    return m.group(2) if m else ""
+
+def extract_market_code_from_title(title: str):
+    m = re.match(r"^\[([^\]]+)\]", (title or "").strip())
+    return m.group(1).strip() if m else ""
+
+def clean_report_title(title: str):
+    t = (title or "").strip()
+    t = re.sub(r"^\[[^\]]+\]\s*", "", t)
+    t = re.sub(r"^[^\s]+\s+", "", t, count=1)
+    t = t.replace("[정정]", "").strip()
+    return t
+
+def extract_acptno(link: str, html_text: str):
+    qs = parse_qs(urlparse(link).query)
+    acpt = (qs.get("acptno") or qs.get("acptNo") or [None])[0]
+    if acpt: return acpt
+    m = re.search(r'acptNo"\s*value="(\d+)"', html_text or "")
+    if m: return m.group(1)
+    m = re.search(r"(acptno|acptNo)=(\d{8,14})", html_text or "")
+    if m: return m.group(2)
+    return None
+
+def build_viewer_url(acptno: str, docno: str | None):
+    base = f"{BASE}/common/disclsviewer.do"
+    params = {"method": "search", "acptno": acptno, "docno": docno or "", "viewerhost": ""}
+    return base + "?" + urlencode(params, doseq=True)
+
+def parse_docno_options(viewer_html: str):
+    soup = BeautifulSoup(viewer_html or "", "lxml")
+    options = []
+    for opt in soup.find_all("option"):
+        v = (opt.get("value") or "").strip()
+        txt = opt.get_text(" ", strip=True)
+        m = re.match(r"^(\d{10,14})\|", v)
+        if m: options.append((m.group(1), txt))
+    seen = set()
+    out = []
+    for d, t in options:
+        if d not in seen:
+            out.append((d, t))
+            seen.add(d)
+    return out
+
+def heuristic_docno_rank(options, report_hint: str):
+    hint = norm(report_hint)
+    ranked = []
+    for docno, txt in options:
+        tn = norm(txt)
+        score = 0
+        if hint and tn and hint in tn: score += 100
+        for kw in KEYWORDS:
+            if kw and (kw in report_hint) and (kw in txt): score += 20
+            if kw and (kw in txt): score += 5
+        if "정정" in txt: score += 8
+        if "결정" in txt: score += 5
+        if txt and len(txt) < 4: score -= 3
+        ranked.append((score, docno, txt))
+    ranked.sort(reverse=True, key=lambda x: x[0])
+    return ranked
+
 def decide_status(filled: int) -> str:
     return "SUCCESS" if filled >= SUCCESS_FILLED_MIN else "INCOMPLETE"
 
-# =========================
-# Playwright: best frame 선택
-# =========================
 def score_frame(html_content: str) -> tuple[int,int,int]:
     lower = (html_content or "").lower()
     table_count = lower.count("<table") + lower.count("&lt;table")
     text_norm = norm(BeautifulSoup(html_content or "", "lxml").get_text(" ", strip=True))
-    key_hits = 0
-    for key in ISSUE_FIELDS:
-        for a in ALIASES.get(key, []):
-            if a and norm(a) in text_norm:
-                key_hits += 1
-                break
+    key_hits = sum(1 for key in ISSUE_FIELDS for a in ALIASES.get(key, []) if a and norm(a) in text_norm)
     total = table_count * 2 + key_hits * 8
     return total, key_hits, table_count
 
-def get_kind_contents_html_by_playwright(viewer_url: str) -> tuple[str, str, int, int]:
+def get_kind_contents_html_by_playwright(viewer_url: str):
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=True)
         context = browser.new_context(locale="ko-KR")
@@ -368,21 +385,15 @@ def get_kind_contents_html_by_playwright(viewer_url: str) -> tuple[str, str, int
 
         page.wait_for_timeout(PW_WAIT_MS)
 
-        best_html = ""
-        best_label = "NONE"
-        best_score = -1
-        best_keyhits = 0
-        best_tables = 0
+        best_html, best_label, best_score = "", "NONE", -1
+        best_keyhits, best_tables = 0, 0
 
         for idx, fr in enumerate(page.frames):
             try:
                 html_content = fr.content()
                 total, key_hits, table_count = score_frame(html_content)
                 if total > best_score:
-                    best_score = total
-                    best_html = html_content
-                    best_keyhits = key_hits
-                    best_tables = table_count
+                    best_score, best_html, best_keyhits, best_tables = total, html_content, key_hits, table_count
                     best_label = f"frame#{idx} key_hits={key_hits} tables={table_count}"
             except Exception:
                 continue
@@ -394,8 +405,8 @@ def get_kind_contents_html_by_playwright(viewer_url: str) -> tuple[str, str, int
 # Main
 # =========================
 def main():
-    raw_ws, issue_ws = connect_gs()
-    ensure_headers(raw_ws, issue_ws)
+    raw_ws, ws_yusang, ws_jeonhwan, ws_gyohwan = connect_gs()
+    ensure_headers(raw_ws, [ws_yusang, ws_jeonhwan, ws_gyohwan])
 
     seen_list = load_json(SEEN_FILE, [])
     retry_queue = load_json(RETRY_FILE, [])
@@ -409,18 +420,15 @@ def main():
         link = entry.get("link", "") or ""
         guid = entry.get("id") or link
         pub = entry.get("published", "") or ""
-        if not guid:
-            continue
-        if KEYWORDS and not any(k in title for k in KEYWORDS):
-            continue
-        if guid in seen_list:
-            continue
+        
+        if not guid: continue
+        if KEYWORDS and not any(k in title for k in KEYWORDS): continue
+        if guid in seen_list: continue
+            
         items.append({"title": title, "link": link, "guid": guid, "pub": pub})
 
     items.extend(retry_queue)
-    uniq = {}
-    for it in items:
-        uniq[it["guid"]] = it
+    uniq = {it["guid"]: it for it in items}
     items = list(uniq.values())
 
     print(f"[QUEUE] to_process={len(items)} seen={len(seen_list)} retry={len(retry_queue)}")
@@ -455,36 +463,21 @@ def main():
 
         if not options:
             print("   [FAIL] docNo options not found")
-            if DUMP_FAIL_HTML:
-                print(vr_shell.text[:2000])
             new_retry.append(item)
             continue
 
         ranked = heuristic_docno_rank(options, report_hint)
-
-        # ✅ 핵심: 후보 docno 여러개를 직접 파싱해보고 "가장 많이 채워지는 docno" 채택
-        best = None  # (filled, tables, docno, label, fields)
+        best = None
         candidates = ranked[: min(6, len(ranked))]
-
-        if DEBUG_HTML:
-            print("   [DOCNO CANDIDATES]")
-            for sc, dn, tx in candidates:
-                print(f"     - score={sc} docno={dn} txt={tx}")
 
         for _, docno, txt in candidates:
             viewer_doc = build_viewer_url(acptno, docno)
             contents_html, frame_label, key_hits, table_cnt_raw = get_kind_contents_html_by_playwright(viewer_doc)
 
             if "<title>창 닫기</title>" in (contents_html or ""):
-                if DEBUG_HTML:
-                    print(f"   [CAND] docno={docno} CLOSE-WINDOW label={frame_label}")
                 continue
 
             fields, tables_cnt, filled = parse_contents_html(contents_html)
-
-            if DEBUG_HTML:
-                print(f"   [CAND] docno={docno} filled={filled} tables={tables_cnt} keyHits={key_hits} label={frame_label} txt={txt}")
-
             cand = (filled, tables_cnt, docno, frame_label, fields)
             if best is None or cand[:2] > best[:2]:
                 best = cand
@@ -505,26 +498,40 @@ def main():
         try:
             rid = get_next_id(raw_ws)
 
+            # RAW 시트에 무조건 추가
             raw_ws.append_row(
                 [rid, now, pub, title, link, guid, status, acptno, docno, filled, tables_cnt, version],
                 value_input_option="USER_ENTERED"
             )
+
+            # 분류에 맞는 시트 결정
+            target_ws = None
+            if "유상증자" in title:
+                target_ws = ws_yusang
+            elif "전환사채" in title:
+                target_ws = ws_jeonhwan
+            elif "교환사채" in title:
+                target_ws = ws_gyohwan
+            else:
+                target_ws = ws_yusang # 예외 시 기본값
 
             issue_row = (
                 [rid, now, pub, company, market_code, title, link, guid]
                 + [fields.get(k, "") for k in ISSUE_FIELDS]
                 + [version, status, filled, tables_cnt, acptno, docno]
             )
-            issue_ws.append_row(issue_row, value_input_option="USER_ENTERED")
+            
+            # 선택된 시트에 데이터 기록
+            target_ws.append_row(issue_row, value_input_option="USER_ENTERED")
 
             if status == "SUCCESS":
                 if guid not in seen_list:
                     seen_list.append(guid)
-                print(f"   -> [SUCCESS] filled={filled} version={version} frame={frame_label}")
+                print(f"   -> [SUCCESS] target_sheet={target_ws.title} filled={filled} version={version}")
             else:
                 if item not in new_retry:
                     new_retry.append(item)
-                print(f"   -> [INCOMPLETE] filled={filled} version={version} frame={frame_label} (retry)")
+                print(f"   -> [INCOMPLETE] target_sheet={target_ws.title} filled={filled} (retry)")
 
         except Exception as e:
             print(f"   -> [Google Sheets Error] {e}")
