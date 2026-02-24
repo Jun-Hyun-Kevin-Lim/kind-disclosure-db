@@ -242,10 +242,11 @@ def pick_value_from_row(row, key_idx):
         v = (row[j] or "").strip()
         if not v or v in ("-", "—"):
             continue
+        if len(v) > 200:
+            continue
         return v
         
     return ""
-
 
 def extract_from_matrix(matrix, aliases):
     als = [norm(a) for a in aliases]
@@ -276,6 +277,41 @@ def extract_from_matrix(matrix, aliases):
                 if v:
                     return v
     return ""
+
+# =========================
+# HTML 파싱 및 상태 판별 함수 (복구된 부분!)
+# =========================
+def parse_contents_html(html_text: str):
+    fields = {k: "" for k in TARGET_KEYS}
+    if not html_text:
+        return fields, 0
+
+    soup = BeautifulSoup(html_text, "lxml")
+    tables = soup.find_all("table")
+
+    for table in tables:
+        matrix = []
+        for tr in table.find_all("tr"):
+            row = []
+            for td in tr.find_all(["td", "th"]):
+                text = td.get_text(" ", strip=True)
+                row.append(text)
+            if row:
+                matrix.append(row)
+
+        for key in TARGET_KEYS:
+            if not fields[key]:
+                val = extract_from_matrix(matrix, ALIASES.get(key, []))
+                if val:
+                    fields[key] = val
+
+    return fields, len(tables)
+
+def decide_status(fields):
+    filled = sum(1 for v in fields.values() if str(v).strip())
+    if filled >= SUCCESS_FILLED_MIN:
+        return "SUCCESS"
+    return "INCOMPLETE"
 
 # =========================
 # Playwright: fetch viewer contents HTML
@@ -474,7 +510,6 @@ def main():
     save_json(SEEN_FILE, seen_list)
     save_json(RETRY_FILE, new_retry)
     print("\n✅ 모든 작업 완료!")
-
 
 if __name__ == "__main__":
     main()
