@@ -13,7 +13,6 @@ concurrency:
 jobs:
   run-script:
     runs-on: ubuntu-latest
-
     permissions:
       contents: write
 
@@ -37,7 +36,11 @@ jobs:
         env:
           GOOGLE_CREDS: ${{ secrets.GOOGLE_CREDS }}
           DEBUG_HTML: "1"
-          # 필요하면 켜서 원인 덤프
+          # 필요시 조정
+          SUCCESS_FILLED_MIN: "10"
+          SHEET_NAME: "KIND_대경"
+          RAW_TAB: "RAW"
+          ISSUE_TAB: "ISSUE"
           # DUMP_FAIL_HTML: "1"
         run: python main.py
 
@@ -46,10 +49,8 @@ jobs:
           git config --global user.name "github-actions[bot]"
           git config --global user.email "github-actions[bot]@users.noreply.github.com"
 
-          # 파일이 없어서 실패하는 케이스 방지
-          git add seen.json retry_queue.json logs.csv version_log.csv || true
+          git add seen.json retry_queue.json || true
 
-          # 변경 없으면 커밋 스킵
           if git diff --cached --quiet; then
             echo "No changes to commit."
             exit 0
