@@ -4,16 +4,15 @@ from urllib.parse import urlparse, parse_qs
 import feedparser
 import requests
 import gspread
-from bs4 import BeautifulSoup
 from google.oauth2.service_account import Credentials
+from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
 
 # =========================
 # Config
 # =========================
-BOT_VERSION = os.getenv("BOT_VERSION", "kind-bot-v2")
+BOT_VERSION = os.getenv("BOT_VERSION", "kind-bot-v3")
 RSS_URL = "https://kind.krx.co.kr/disclosure/rsstodaydistribute.do?method=searchRssTodayDistribute&repIsuSrtCd=&mktTpCd=0&searchCorpName=&currentPageSize=200"
 
-# 새로운 탭 이름이자 검색 키워드
 KEYWORDS = ["유상증자", "전환사채", "신주인수권부사채", "교환사채"]
 SHEET_NAME = "KIND_대경"
 SEEN_FILE = "seen.json"
@@ -28,6 +27,7 @@ DEFAULT_HEADERS = {
 }
 
 SLEEP_SECONDS = float(os.getenv("SLEEP_SECONDS", "1"))
+PW_NAV_TIMEOUT_MS = int(os.getenv("PW_NAV_TIMEOUT_MS", "20000"))
 
 # =========================
 # Utils
@@ -67,15 +67,13 @@ def connect_gs():
     sh = client.open(SHEET_NAME)
 
     tabs = {}
-    # 설정된 키워드대로 각각의 탭(Worksheet)을 연결하거나 생성합니다.
     for kw in KEYWORDS:
         try:
             ws = sh.worksheet(kw)
         except gspread.exceptions.WorksheetNotFound:
             print(f"[GS] Worksheet '{kw}' not found. Creating new one.")
             ws = sh.add_worksheet(title=kw, rows="1000", cols="10")
-            # 새 시트 생성 시 헤더 추가
-            ws.append_row(["ID", "수집시간", "공시일시", "공시제목", "공시링크", "Excel", "PDF"])
+            ws.append_row(["ID", "수집시간", "공시일시", "회사명", "상장시장", "공시제목", "Excel Link", "PDF Link", "공시링크"])
         tabs[kw] = ws
 
     print(f"[BOT] {BOT_VERSION} | Opened spreadsheet='{sh.title}'")
@@ -84,7 +82,7 @@ def connect_gs():
 def get_next_id(ws):
     col = ws.col_values(1)
     if len(col) <= 1:
-        return 1  # 1행이 헤더이므로 첫 데이터는 1
+        return 1
     last = str(col[-1]).strip()
     if last.isdigit():
         return int(last) + 1
@@ -100,6 +98,14 @@ def fetch_rss(session):
     print(f"[RSS] status={r.status_code} bytes={len(r.content)} entries={len(feed.entries)}")
     return feed
 
+def extract_company_from_title(title: str):
+    m = re.match(r"^\[([^\]]+)\]\s*([^\s]+)", (title or "").strip())
+    return m.group(2) if m else ""
+
+def extract_market_code_from_title(title: str):
+    m = re.match(r"^\[([^\]]+)\]", (title or "").strip())
+    return m.group(1).strip() if m else ""
+
 def extract_acptno_from_link(link: str, html_text: str):
     qs = parse_qs(urlparse(link).query)
     acpt = (qs.get("acptno") or qs.get("acptNo") or [None])[0]
@@ -109,41 +115,59 @@ def extract_acptno_from_link(link: str, html_text: str):
     if m: return m.group(2)
     return None
 
-def extract_attachments(html_text: str):
+def get_attachment_links_via_playwright(acptno: str) -> tuple[str, str]:
     """
-    공시 뷰어의 헤더 프레임에서 첨부파일(Excel, PDF) 다운로드 링크를 추출합니다.
+    Playwright를 사용하여 KIND 공시 뷰어를 열고 첨부파일 링크를 추출합니다.
     """
+    viewer_url = f"{BASE}/common/disclsviewer.do?method=search&acptno={acptno}"
     excel_link, pdf_link = "", ""
-    soup = BeautifulSoup(html_text, "lxml")
     
-    # 첨부파일은 보통 <option> 태그나 <a> 태그 안에 존재합니다.
-    for tag in soup.find_all(["a", "option"]):
-        text = tag.get_text(strip=True).lower()
-        value = tag.get("value", "")
-        onclick = tag.get("onclick", "")
-        href = tag.get("href", "")
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=True)
+        context = browser.new_context(locale="ko-KR")
+        page = context.new_page()
+        page.set_default_navigation_timeout(PW_NAV_TIMEOUT_MS)
         
-        apnd_no = None
-        
-        # 다운로드 apndNo 추출 로직
-        if "apndno=" in href.lower():
-            m = re.search(r"apndno=(\d+)", href, re.I)
-            if m: apnd_no = m.group(1)
-        elif "download" in onclick.lower() or "file" in onclick.lower():
-            m = re.search(r"['\"](\d{4,})['\"]", onclick)
-            if m: apnd_no = m.group(1)
-        elif value.isdigit() and len(value) > 3:
-            apnd_no = value
+        try:
+            page.goto(viewer_url, wait_until="networkidle")
+            page.wait_for_timeout(2500)  # 프레임 안의 데이터가 로드될 시간 확보
             
-        if apnd_no:
-            # KIND 실제 파일 다운로드 URL 조립
-            download_url = f"https://kind.krx.co.kr/common/applcmn.do?method=download&apndNo={apnd_no}"
+            # 모든 프레임을 돌면서 첨부파일 링크(a 태그나 option 태그)를 찾음
+            for fr in page.frames:
+                elements = fr.query_selector_all("a, option")
+                for el in elements:
+                    text = (el.inner_text() or "").strip().lower()
+                    onclick = el.get_attribute("onclick") or ""
+                    href = el.get_attribute("href") or ""
+                    value = el.get_attribute("value") or ""
+                    
+                    apnd_no = None
+                    
+                    # 다운로드 번호 추출 패턴 확인
+                    if "apndno=" in href.lower():
+                        m = re.search(r"apndno=(\d+)", href, re.I)
+                        if m: apnd_no = m.group(1)
+                    elif "download" in onclick.lower() or "file" in onclick.lower():
+                        m = re.search(r"['\"](\d{4,})['\"]", onclick)
+                        if m: apnd_no = m.group(1)
+                    elif value.isdigit() and len(value) > 3:
+                        apnd_no = value
+                        
+                    # 파일 번호를 찾았을 경우 다이렉트 링크 조립
+                    if apnd_no:
+                        download_url = f"https://kind.krx.co.kr/common/applcmn.do?method=download&apndNo={apnd_no}"
+                        
+                        if ".pdf" in text or "pdf" in text:
+                            if not pdf_link: pdf_link = download_url
+                        elif any(ext in text for ext in [".xls", ".xlsx", "excel", "엑셀"]):
+                            if not excel_link: excel_link = download_url
+        except PWTimeout:
+            print(" [PW Error] 페이지 로딩 타임아웃")
+        except Exception as e:
+            print(f" [PW Error] {e}")
+        finally:
+            browser.close()
             
-            if ".pdf" in text or "pdf" in text:
-                if not pdf_link: pdf_link = download_url
-            elif any(ext in text for ext in [".xls", ".xlsx", "excel", "엑셀"]):
-                if not excel_link: excel_link = download_url
-                
     return excel_link, pdf_link
 
 def main():
@@ -161,7 +185,6 @@ def main():
         pub = entry.get("published", "") or ""
         
         if not guid: continue
-        # 지정된 4개 키워드 중 하나라도 제목에 포함되어 있는지 확인
         if not any(k in title for k in KEYWORDS): continue
         if guid in seen_list: continue
         
@@ -169,7 +192,6 @@ def main():
     
     items.extend(retry_queue)
     
-    # 중복 제거
     uniq = {}
     for it in items: uniq[it["guid"]] = it
     items = list(uniq.values())
@@ -182,9 +204,10 @@ def main():
     new_retry = []
     for item in items:
         title, link, guid, pub = item["title"], item["link"], item["guid"], item.get("pub", "")
+        company = extract_company_from_title(title)
+        market_code = extract_market_code_from_title(title)
         print(f"\nProcessing: {title}")
         
-        # 제목에 포함된 키워드 찾기 (예: "유상증자"와 "전환사채"가 동시에 있다면 둘 다 해당)
         matched_kws = [k for k in KEYWORDS if k in title]
         if not matched_kws:
             continue
@@ -197,33 +220,30 @@ def main():
             new_retry.append(item)
             continue
 
-        # 첨부파일 정보가 들어있는 헤더 프레임 직접 호출
-        header_url = f"{BASE}/common/disclsviewer.do?method=header&acptno={acptno}"
-        header_res = fetch(session, header_url, referer=link)
-        
-        # 파일 링크 추출
-        excel_link, pdf_link = extract_attachments(header_res.text)
+        # Playwright를 이용해 다운로드 링크 확보
+        excel_link, pdf_link = get_attachment_links_via_playwright(acptno)
 
         now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         is_success = True
         
-        # 매칭된 모든 탭(시트)에 데이터 추가
+        # 스크린샷에 맞춘 9개 컬럼 배열 구성
         for kw in matched_kws:
             ws = tabs[kw]
             try:
                 row_id = get_next_id(ws)
-                # 요청하신 7개 컬럼 매핑
                 row_data = [
-                    row_id,        # ID
-                    now,           # 수집시간
-                    pub,           # 공시일시
-                    title,         # 공시제목
-                    link,          # 공시링크
-                    excel_link,    # Excel 링크
-                    pdf_link       # PDF 링크
+                    row_id,         # A: ID
+                    now,            # B: 수집시간
+                    pub,            # C: 공시일시
+                    company,        # D: 회사명
+                    market_code,    # E: 상장시장
+                    title,          # F: 공시제목
+                    excel_link,     # G: Excel Link
+                    pdf_link,       # H: PDF Link
+                    link            # I: 공시링크
                 ]
                 ws.append_row(row_data, value_input_option="USER_ENTERED")
-                print(f" -> Saved to '{kw}' 시트 | Excel: {'O' if excel_link else 'X'} | PDF: {'O' if pdf_link else 'X'}")
+                print(f" -> Saved to '{kw}' | Excel: {'O' if excel_link else 'X'} | PDF: {'O' if pdf_link else 'X'}")
             except Exception as e:
                 print(f" -> [Google Sheets Error for {kw}] {e}")
                 is_success = False
