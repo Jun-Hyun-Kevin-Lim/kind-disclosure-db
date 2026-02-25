@@ -40,7 +40,7 @@ jobs:
           SHEET_NAME: "KIND_대경"
           RAW_TAB: "RAW"
           # DUMP_FAIL_HTML: "1"
-        run: python main.py
+        run: python kind_everything.py
 
       - name: Commit and Push Changes
         run: |
