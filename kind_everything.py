@@ -1,4 +1,4 @@
-import os, json, time, re
+import os, json, time, re, io
 from datetime import datetime
 from urllib.parse import urlparse, parse_qs
 import feedparser
@@ -7,12 +7,12 @@ import gspread
 import pandas as pd
 import pdfplumber
 from google.oauth2.service_account import Credentials
-from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
+from playwright.sync_api import sync_playwright
 
 # =========================
 # Config & Setup
 # =========================
-BOT_VERSION = os.getenv("BOT_VERSION", "kind-bot-v7-smart-extract")
+BOT_VERSION = os.getenv("BOT_VERSION", "kind-bot-v9-ultimate")
 RSS_URL = "https://kind.krx.co.kr/disclosure/rsstodaydistribute.do?method=searchRssTodayDistribute&repIsuSrtCd=&mktTpCd=0&searchCorpName=&currentPageSize=200"
 
 SHEET_NAME = "KIND_대경"
@@ -21,13 +21,11 @@ RETRY_FILE = "retry_queue.json"
 BASE = "https://kind.krx.co.kr"
 
 DEFAULT_HEADERS = {
-    "User-Agent": "Mozilla/5.0",
-    "Accept-Language": "ko-KR,ko;q=0.9,en;q=0.8",
-    "Connection": "keep-alive",
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+    "Accept-Language": "ko-KR,ko;q=0.9",
 }
 
-SLEEP_SECONDS = float(os.getenv("SLEEP_SECONDS", "1"))
-PW_NAV_TIMEOUT_MS = int(os.getenv("PW_NAV_TIMEOUT_MS", "30000"))
+SLEEP_SECONDS = float(os.getenv("SLEEP_SECONDS", "2"))
 
 COLS_YU = [
     "ID", "수집시간", "Excel Link", "PDF Link", 
@@ -58,7 +56,7 @@ ALIASES = {
     "신규발행주식수": ["신규발행주식수", "발행신주수", "신주수", "발행할 주식의 수"],
     "확정발행가(원)": ["확정발행가", "신주발행가액", "발행가액", "1주당 발행가액"],
     "기준주가": ["기준주가", "기준주가액"],
-    "확정발행금액(억원)": ["확정발행금액", "모집총액", "자금조달목적"],
+    "확정발행금액(억원)": ["확정발행금액", "모집총액", "자금조달목적", "조달금액", "모집금액"],
     "할인(할증률)": ["할인율", "할증률", "할인율(%)"],
     "증자전 주식수": ["증자전 주식수", "기발행주식총수", "증자전 발행주식총수"],
     "증자비율": ["증자비율", "증자비율(%)"],
@@ -113,7 +111,6 @@ def connect_gs_and_setup_tabs():
     )
     client = gspread.authorize(creds)
     sh = client.open(SHEET_NAME)
-
     tabs = {}
     existing_acptnos = set()
 
@@ -125,13 +122,11 @@ def connect_gs_and_setup_tabs():
             for acpt in acpts:
                 if str(acpt).strip().isdigit(): existing_acptnos.add(str(acpt).strip())
         except gspread.exceptions.WorksheetNotFound:
-            print(f"[GS] Worksheet '{kw}' not found. Creating new one.")
+            print(f"[GS] '{kw}' 시트 생성 중...")
             cols_to_use = COLS_YU if kw in KEYWORDS_YU else COLS_BOND
             ws = sh.add_worksheet(title=kw, rows="1000", cols=str(len(cols_to_use) + 5))
             ws.append_row(cols_to_use)
         tabs[kw] = ws
-
-    print(f"[BOT] Opened spreadsheet='{sh.title}' | 기존 데이터: {len(existing_acptnos)}건")
     return tabs, existing_acptnos
 
 def get_next_id(ws):
@@ -144,119 +139,129 @@ def get_next_id(ws):
         if str(v).strip().isdigit(): mx = max(mx, int(v))
     return mx + 1
 
-def get_attachment_links_via_playwright(acptno: str) -> tuple[str, str]:
-    viewer_url = f"{BASE}/common/disclsviewer.do?method=search&acptno={acptno}"
+def extract_data_from_df(df, extracted):
+    """표(Dataframe)에서 키워드와 값을 정밀하게 매칭합니다."""
+    for _, row in df.iterrows():
+        row_list = [str(x) for x in row.tolist() if pd.notna(x)]
+        for col_idx, cell_value in enumerate(row_list):
+            cleaned_cell = norm(cell_value)
+            for key, aliases in ALIASES.items():
+                if not extracted[key]:
+                    # 키워드가 포함되어 있는지 확인
+                    if any(a in cleaned_cell for a in aliases):
+                        # 값은 보통 바로 옆 칸(+1)이나 다다음 칸(+2)에 존재함
+                        for offset in range(1, 3):
+                            if col_idx + offset < len(row_list):
+                                val = str(row_list[col_idx + offset]).strip()
+                                # 빈칸이나 의미없는 대시(-) 기호가 아니면 값으로 확정
+                                if val and val.lower() not in ["-", "—", "nan", "none", ""]: 
+                                    extracted[key] = val
+                                    break
+    return extracted
+
+# ✨ 핵심: 사람처럼 접속해서 쿠키를 확보하고 파일을 긁어오는 완전체 로직
+def process_disclosure_via_playwright(link: str):
     excel_link, pdf_link = "", ""
+    extracted = {k: "" for k in ALIASES.keys()}
+    
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=True)
-        context = browser.new_context(locale="ko-KR")
+        context = browser.new_context(locale="ko-KR", user_agent=DEFAULT_HEADERS["User-Agent"])
         page = context.new_page()
-        page.set_default_navigation_timeout(PW_NAV_TIMEOUT_MS)
+        
         try:
-            page.goto(viewer_url, wait_until="networkidle")
-            page.wait_for_timeout(3500) 
+            # 1. 공시 메인 링크로 이동 (사람과 동일하게 접속 기록 생성)
+            page.goto(link, wait_until="networkidle")
+            page.wait_for_timeout(3000)
+            
+            # 2. 모든 프레임을 탐색하여 첨부파일(Excel, PDF) 고유번호 확보
             for fr in page.frames:
-                for el in fr.query_selector_all("a, option, button, span"):
-                    text = (el.inner_text() or "").replace(" ", "").lower()
-                    href, onclick, value = (el.get_attribute("href") or "").lower(), (el.get_attribute("onclick") or "").lower(), (el.get_attribute("value") or "").lower()
+                for el in fr.query_selector_all("option, a, button"):
+                    text = (el.inner_text() or "").lower()
+                    val = (el.get_attribute("value") or "").lower()
+                    href = (el.get_attribute("href") or "").lower()
+                    
                     apnd_no = None
-                    if "apndno=" in href:
+                    if "|" in val and val.split("|")[0].isdigit():
+                        apnd_no = val.split("|")[0]
+                        text += val
+                    elif "apndno=" in href:
                         m = re.search(r"apndno=(\d+)", href)
                         if m: apnd_no = m.group(1)
-                    elif "download" in onclick and ("apndno" in onclick or "file" in onclick):
-                        m = re.search(r"['\"](\d{4,})['\"]", onclick)
-                        if m: apnd_no = m.group(1)
-                    elif "|" in value and value.split("|")[0].isdigit():
-                        apnd_no = value.split("|")[0]
-                        text += value
                     
                     if apnd_no:
-                        download_url = f"https://kind.krx.co.kr/common/applcmn.do?method=download&apndNo={apnd_no}"
-                        if any(x in text for x in ["pdf", ".pdf"]): pdf_link = pdf_link or download_url
-                        elif any(x in text for x in ["xls", "xlsx", "excel", "엑셀"]): excel_link = excel_link or download_url
-        except: pass
-        finally: browser.close()
-    return excel_link, pdf_link
-
-# ✨ 세션과 Referer를 받아 다운로드 접근 권한 획득 & 가짜 엑셀 회피 로직 추가
-def extract_data_from_excel(session: requests.Session, excel_url: str, referer: str) -> dict:
-    extracted = {k: "" for k in ALIASES.keys()}
-    if not excel_url: return extracted
-    try:
-        headers = dict(DEFAULT_HEADERS)
-        headers["Referer"] = referer # 이전 공시 페이지 주소 세팅 (접근권한 획득)
-        r = session.get(excel_url, stream=True, headers=headers, timeout=30)
-        
-        temp_file = f"temp_{int(time.time())}.xls"
-        with open(temp_file, "wb") as f: f.write(r.content)
+                        dl_url = f"https://kind.krx.co.kr/common/applcmn.do?method=download&apndNo={apnd_no}"
+                        if "pdf" in text or ".pdf" in text: pdf_link = dl_url
+                        elif "xls" in text or "excel" in text or "엑셀" in text: excel_link = dl_url
             
-        df = None
-        # 1차 시도: 진짜 엑셀 포맷으로 읽기
-        try:
-            df = pd.read_excel(temp_file, header=None)
-        except Exception:
-            # 2차 시도: KIND의 고질적인 '가짜 엑셀(HTML 문서)' 형식으로 읽기
-            try:
-                dfs = pd.read_html(temp_file, encoding='euc-kr') # 한국 관공서 기본 인코딩
-                df = pd.concat(dfs, ignore_index=True)
-            except Exception:
+            # 3. 서버를 속이기 위한 Playwright 쿠키(접속 통행증) 복사!
+            session = requests.Session()
+            for cookie in context.cookies():
+                session.cookies.set(cookie["name"], cookie["value"], domain=cookie["domain"])
+            
+            headers = {"Referer": link, "User-Agent": DEFAULT_HEADERS["User-Agent"]}
+            
+            # 4. (엑셀 추출) 쿠키를 들이밀며 진짜 엑셀 파일 다운로드
+            if excel_link:
                 try:
-                    dfs = pd.read_html(temp_file, encoding='utf-8')
-                    df = pd.concat(dfs, ignore_index=True)
-                except Exception as e:
-                    print(f"      [Excel 판독 완전 실패] {e}")
+                    r = session.get(excel_link, headers=headers, stream=True, timeout=15)
+                    tmp_xls = f"temp_{int(time.time())}.xls"
+                    with open(tmp_xls, "wb") as f: f.write(r.content)
+                    
+                    df = None
+                    try: df = pd.read_excel(tmp_xls, header=None)
+                    except:
+                        try:
+                            dfs = pd.read_html(io.StringIO(r.content.decode('euc-kr', errors='ignore')))
+                            df = pd.concat(dfs, ignore_index=True)
+                        except: pass
+                    
+                    if df is not None: extracted = extract_data_from_df(df, extracted)
+                    if os.path.exists(tmp_xls): os.remove(tmp_xls)
+                except Exception as e: print(f"   [Excel 에러] {e}")
 
-        # 데이터 추출 시작
-        if df is not None:
-            for _, row in df.iterrows():
-                row_list = [str(x) for x in row.tolist() if pd.notna(x)]
-                for col_idx, cell_value in enumerate(row_list):
-                    cleaned_cell = norm(cell_value)
-                    for key, aliases in ALIASES.items():
-                        if not extracted[key]:
-                            if any(a in cleaned_cell for a in aliases):
-                                if col_idx + 1 < len(row_list):
-                                    val = str(row_list[col_idx + 1]).strip()
-                                    if val and val.lower() not in ["-", "—", "nan", "none"]: 
-                                        extracted[key] = val
-        if os.path.exists(temp_file): os.remove(temp_file)
-    except Exception as e:
-        print(f"      [Excel 다운로드 에러] {e}")
-    return extracted
+            # 5. (PDF 추출) 엑셀이 없거나 데이터가 부족할 때 PDF 스캔
+            if pdf_link and sum(1 for v in extracted.values() if v) < 3:
+                try:
+                    r = session.get(pdf_link, headers=headers, stream=True, timeout=15)
+                    tmp_pdf = f"temp_{int(time.time())}.pdf"
+                    with open(tmp_pdf, "wb") as f: f.write(r.content)
+                    
+                    with pdfplumber.open(tmp_pdf) as pdf:
+                        for p_obj in pdf.pages:
+                            text = p_obj.extract_text()
+                            if not text: continue
+                            for line in text.split('\n'):
+                                cleaned_line = norm(line)
+                                for key, aliases in ALIASES.items():
+                                    if not extracted[key]:
+                                        if any(a in cleaned_line for a in aliases):
+                                            parts = re.split(r'[:|：]', line)
+                                            val = parts[-1].strip() if len(parts) > 1 else line.strip()
+                                            if val: extracted[key] = val
+                    if os.path.exists(tmp_pdf): os.remove(tmp_pdf)
+                except Exception as e: print(f"   [PDF 에러] {e}")
 
-def extract_data_from_pdf(session: requests.Session, pdf_url: str, referer: str) -> dict:
-    extracted = {k: "" for k in ALIASES.keys()}
-    if not pdf_url: return extracted
-    try:
-        headers = dict(DEFAULT_HEADERS)
-        headers["Referer"] = referer
-        r = session.get(pdf_url, stream=True, headers=headers, timeout=30)
-        
-        temp_file = f"temp_{int(time.time())}.pdf"
-        with open(temp_file, "wb") as f: f.write(r.content)
+            # 6. (HTML 백업) 첨부파일이 아예 없고 본문에만 표가 있는 경우
+            if sum(1 for v in extracted.values() if v) < 3:
+                for fr in page.frames:
+                    if "docno=" in fr.url or "body" in fr.name.lower():
+                        try:
+                            dfs = pd.read_html(io.StringIO(fr.content()))
+                            for df in dfs: extracted = extract_data_from_df(df, extracted)
+                        except: pass
+                        
+        except Exception as e:
+            print(f" [Playwright Error] {e}")
+        finally:
+            browser.close()
             
-        with pdfplumber.open(temp_file) as pdf:
-            for page in pdf.pages:
-                text = page.extract_text()
-                if not text: continue
-                for line in text.split('\n'):
-                    cleaned_line = norm(line)
-                    for key, aliases in ALIASES.items():
-                        if not extracted[key]:
-                            if any(a in cleaned_line for a in aliases):
-                                parts = re.split(r'[:|：]', line)
-                                val = parts[-1].strip() if len(parts) > 1 else line.strip()
-                                if val: extracted[key] = val
-        if os.path.exists(temp_file): os.remove(temp_file)
-    except Exception as e: 
-        print(f"      [PDF 다운로드/추출 에러] {e}")
-    return extracted
+    return excel_link, pdf_link, extracted
 
 def main():
     tabs, existing_acptnos = connect_gs_and_setup_tabs()
     seen_list = set(load_json(SEEN_FILE, []))
     retry_queue = load_json(RETRY_FILE, [])
-    session = requests.Session()
     
     feed = requests.get(RSS_URL, headers=DEFAULT_HEADERS)
     feed.encoding = "utf-8"
@@ -271,7 +276,7 @@ def main():
     items.extend(retry_queue)
     items = list({it["guid"]: it for it in items}.values())
     
-    print(f"[QUEUE] to_process={len(items)}")
+    print(f"[QUEUE] 처리 대기: {len(items)}건")
     
     new_retry = []
     for item in items:
@@ -282,7 +287,8 @@ def main():
         matched_kws = [k for k in ALL_KEYWORDS if k in title]
         if not matched_kws: continue
         
-        link_res = session.get(link, headers=DEFAULT_HEADERS) # session을 통해 쿠키 저장
+        # 접수번호 추출
+        link_res = requests.get(link, headers=DEFAULT_HEADERS)
         acptno = extract_acptno_from_link(link, link_res.text)
         
         if not acptno:
@@ -293,18 +299,14 @@ def main():
             continue
             
         print(f"\nProcessing: [{company}] {title}")
-        excel_link, pdf_link = get_attachment_links_via_playwright(acptno)
         
-        # ✨ session과 link(공시 주소)를 같이 넘겨주어 권한 획득 성공!
-        ex_data = extract_data_from_excel(session, excel_link, link)
-        if sum(1 for v in ex_data.values() if v) < 3 and pdf_link:
-            pdf_data = extract_data_from_pdf(session, pdf_link, link)
-            for k, v in pdf_data.items():
-                if not ex_data[k] and v: ex_data[k] = v
+        # 파일 수집 및 데이터 추출 (완전 자동화 모듈 호출)
+        excel_link, pdf_link, ex_data = process_disclosure_via_playwright(link)
 
         now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         is_success = True
         
+        # 구글 시트 입력
         for kw in matched_kws:
             ws = tabs[kw]
             target_cols = COLS_YU if kw in KEYWORDS_YU else COLS_BOND
@@ -315,11 +317,11 @@ def main():
                     "회사명": company, "보고서명": title, "상장시장": market_code, 
                     "링크": link, "접수번호": acptno
                 }
-                row_dict.update(ex_data)
+                row_dict.update(ex_data) # 추출된 데이터(발행가액, 납입일 등) 병합
                 
                 final_row = [row_dict.get(col_name, "") for col_name in target_cols]
                 ws.append_row(final_row, value_input_option="USER_ENTERED")
-                print(f" -> '{kw}' 시트 저장 완료 (추출된 항목: {sum(1 for v in final_row[4:-2] if v)}개)")
+                print(f" -> '{kw}' 시트 저장 완료 (데이터 {sum(1 for v in final_row[4:-2] if v)}개 획득)")
             except Exception as e:
                 print(f" -> [GS Error for {kw}] {e}")
                 is_success = False
