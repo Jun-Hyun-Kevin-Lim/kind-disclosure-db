@@ -9,20 +9,20 @@ from google.oauth2.service_account import Credentials
 # =========================
 # Config & Setup
 # =========================
-BOT_VERSION = os.getenv("BOT_VERSION", "kind-bot-v13-post-search")
+BOT_VERSION = os.getenv("BOT_VERSION", "kind-bot-v14-euckr-master")
 SHEET_NAME = "KIND_대경"
 SEEN_FILE = "seen.json"
 RETRY_FILE = "retry_queue.json"
 BASE = "https://kind.krx.co.kr"
 
 DEFAULT_HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
     "Accept-Language": "ko-KR,ko;q=0.9",
 }
 
 SLEEP_SECONDS = float(os.getenv("SLEEP_SECONDS", "1"))
 
-# ✨ 며칠 치 데이터를 검색할지 설정 (기본 1일=오늘. 만약 데이터가 없으면 3, 7 등으로 바꿔서 테스트해보세요!)
+# ✨ 며칠 치를 스캔할지 설정 (최근 5일간 발생한 모든 공시를 싹쓸이해서 검사합니다)
 SEARCH_DAYS_AGO = 5 
 
 COLS_YU = [
@@ -129,20 +129,22 @@ def get_next_id(ws):
         if str(v).strip().isdigit(): mx = max(mx, int(v))
     return mx + 1
 
-# ✨ 직접 찾아주신 "POST 검색" 로직 완벽 적용!
-def search_kind_by_keyword(session, keyword, from_date, to_date):
+# ✨ 한글 검색어 오류 방지를 위해 전체 데이터를 가져온 후 파이썬 자체 필터링!
+def get_disclosures_all_and_filter(session, from_date, to_date):
     url = "https://kind.krx.co.kr/disclosure/details.do"
     payload = {
         "method": "searchDetailsMain",
         "fromDate": from_date,
         "toDate": to_date,
-        "reportNm": keyword,  # <- 이 부분! 직접 보고서명에 키워드를 넣어 검색합니다.
-        "currentPageSize": "100",
+        "currentPageSize": "5000",  # 해당 기간의 모든 공시를 넉넉하게 요청
         "pageIndex": "1"
     }
     
+    # 1. 한글 검색어 없이 서버에 요청
     r = session.post(url, data=payload, headers=DEFAULT_HEADERS)
-    soup = BeautifulSoup(r.text, 'html.parser')
+    
+    # 2. 서버가 반환한 한글이 깨지지 않도록 강제 EUC-KR 번역 장착!
+    soup = BeautifulSoup(r.content, 'html.parser', from_encoding='euc-kr')
     
     results = []
     for tr in soup.find_all('tr'):
@@ -153,20 +155,25 @@ def search_kind_by_keyword(session, keyword, from_date, to_date):
             
             if title_a and 'openDisclsViewer' in title_a.get('onclick', ''):
                 title = title_a.get_text(strip=True)
-                acptno_match = re.search(r"openDisclsViewer\('(\d+)'", title_a['onclick'])
-                if acptno_match:
-                    acptno = acptno_match.group(1)
-                    link = f"https://kind.krx.co.kr/common/disclsviewer.do?method=search&acptno={acptno}"
-                    results.append({
-                        "title": title,
-                        "company": company,
-                        "link": link,
-                        "acptno": acptno,
-                        "keyword_matched": keyword
-                    })
+                
+                # 3. 파이썬이 빠르고 완벽하게 타겟 키워드만 쏙쏙 추출
+                matched_kws = [kw for kw in ALL_KEYWORDS if kw in title]
+                
+                if matched_kws:
+                    acptno_match = re.search(r"openDisclsViewer\('(\d+)'", title_a['onclick'])
+                    if acptno_match:
+                        acptno = acptno_match.group(1)
+                        link = f"https://kind.krx.co.kr/common/disclsviewer.do?method=search&acptno={acptno}"
+                        results.append({
+                            "title": title,
+                            "company": company,
+                            "link": link,
+                            "acptno": acptno,
+                            "matched_kws": matched_kws
+                        })
     return results
 
-# ✨ HTML 본문 파싱 (다운로드 없이 화면에서 바로 값 추출)
+# ✨ HTML 본문 파싱 (한글 깨짐 문제 완벽 해결!)
 def extract_data_from_html(session, acptno):
     extracted = {k: "" for k in ALIASES.keys()}
     excel_link, pdf_link = "", ""
@@ -174,18 +181,21 @@ def extract_data_from_html(session, acptno):
     try:
         viewer_url = f"{BASE}/common/disclsviewer.do?method=search&acptno={acptno}"
         vr = session.get(viewer_url, headers=DEFAULT_HEADERS)
+        # 뷰어 텍스트도 깨짐을 방지하기 위해 EUC-KR로 디코딩
+        vr_text = vr.content.decode('euc-kr', 'replace')
         
-        for m in re.finditer(r'<option\s+value="(\d+)\|([^"]+)"', vr.text):
+        for m in re.finditer(r'<option\s+value="(\d+)\|([^"]+)"', vr_text):
             dl_url = f"https://kind.krx.co.kr/common/applcmn.do?method=download&apndNo={m.group(1)}"
             if ".pdf" in m.group(2).lower(): pdf_link = dl_url
             elif ".xls" in m.group(2).lower() or "excel" in m.group(2).lower(): excel_link = dl_url
 
-        docnos = re.findall(r"docno=(\d+)", vr.text) or re.findall(r"(\d{10,14})\|", vr.text)
+        docnos = re.findall(r"docno=(\d+)", vr_text) or re.findall(r"(\d{10,14})\|", vr_text)
         if not docnos: return excel_link, pdf_link, extracted
         
         doc_url = f"{BASE}/common/disclsviewer.do?method=docdisclsviewer&acptno={acptno}&docno={docnos[0]}"
         r = session.get(doc_url, headers=DEFAULT_HEADERS)
-        soup = BeautifulSoup(r.text, 'html.parser')
+        # 가장 중요한 본문 추출 시에도 한글 깨짐 방지 번역기(from_encoding) 장착!
+        soup = BeautifulSoup(r.content, 'html.parser', from_encoding='euc-kr')
         
         for table in soup.find_all('table'):
             for tr in table.find_all('tr'):
@@ -211,7 +221,7 @@ def extract_data_from_html(session, acptno):
                                             extracted[key] = val
                                             break
     except Exception as e:
-        pass
+        print(f"   [HTML 파싱 에러] {e}")
         
     return excel_link, pdf_link, extracted
 
@@ -219,64 +229,58 @@ def main():
     tabs, existing_acptnos = connect_gs_and_setup_tabs()
     seen_list = set(load_json(SEEN_FILE, []))
     session = requests.Session()
-    session.headers.update(DEFAULT_HEADERS)
     
-    # 검색할 날짜 계산 (기본 0 = 오늘만. 만약 테스트하고 싶다면 SEARCH_DAYS_AGO를 3 정도로 올리세요)
+    # 검색할 날짜 계산 (기본 최근 5일)
     to_date = datetime.now().strftime("%Y-%m-%d")
     from_date = (datetime.now() - timedelta(days=SEARCH_DAYS_AGO)).strftime("%Y-%m-%d")
     
-    print(f"\n[{from_date} ~ {to_date}] 직접 검색 수집 시작...")
+    print(f"\n[{from_date} ~ {to_date}] 전체 공시 수집 및 자체 필터링 시작...")
     
-    all_items = []
+    # 단 1번의 요청으로 모든 것을 해결
+    all_items = get_disclosures_all_and_filter(session, from_date, to_date)
     
-    # 1. 각각의 키워드를 하나씩 KIND 서버에 직접 검색 (POST)
-    for kw in ALL_KEYWORDS:
-        print(f" -> '{kw}' 검색 중...")
-        results = search_kind_by_keyword(session, kw, from_date, to_date)
-        all_items.extend(results)
-        time.sleep(1) # 서버에 무리 가지 않게 1초 대기
-        
-    # 중복 공시 제거
+    # 중복 공시 제거 (접수번호 기준)
     unique_items = {item["acptno"]: item for item in all_items}.values()
     
-    print(f"\n[QUEUE] 대상 공시: {len(unique_items)}건 발견!")
+    print(f"[QUEUE] 타겟 키워드가 포함된 공시: {len(unique_items)}건 발견!")
     if not unique_items:
-        print(f"✅ 설정된 기간({from_date} ~ {to_date})에 올라온 공시가 없습니다.")
+        print(f"✅ 해당 기간에 목표 공시가 하나도 없습니다.")
         return
     
     new_retry = []
     for item in unique_items:
-        title, link, company, acptno, matched_kw = item["title"], item["link"], item["company"], item["acptno"], item["keyword_matched"]
+        title, link, company, acptno, matched_kws = item["title"], item["link"], item["company"], item["acptno"], item["matched_kws"]
         
         if acptno in existing_acptnos or acptno in seen_list:
             continue
             
         print(f"\nProcessing: [{company}] {title}")
         
-        # 2. 본문 HTML 파싱하여 데이터 쏙쏙 빼오기
+        # 2. 본문 HTML 파싱하여 데이터 빼오기
         excel_link, pdf_link, ex_data = extract_data_from_html(session, acptno)
 
         now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         is_success = True
         
         # 3. 구글 시트에 저장
-        ws = tabs[matched_kw]
-        target_cols = COLS_YU if matched_kw in KEYWORDS_YU else COLS_BOND
-        try:
-            row_id = get_next_id(ws)
-            row_dict = {
-                "ID": row_id, "수집시간": now, "Excel Link": excel_link, "PDF Link": pdf_link,
-                "회사명": company, "보고서명": title, "상장시장": "", 
-                "링크": link, "접수번호": acptno
-            }
-            row_dict.update(ex_data)
-            
-            final_row = [row_dict.get(col_name, "") for col_name in target_cols]
-            ws.append_row(final_row, value_input_option="USER_ENTERED")
-            print(f" -> '{matched_kw}' 시트 저장 완료 (데이터 {sum(1 for v in final_row[4:-2] if v)}개 획득)")
-        except Exception as e:
-            print(f" -> [GS Error for {matched_kw}] {e}")
-            is_success = False
+        for matched_kw in matched_kws:
+            ws = tabs[matched_kw]
+            target_cols = COLS_YU if matched_kw in KEYWORDS_YU else COLS_BOND
+            try:
+                row_id = get_next_id(ws)
+                row_dict = {
+                    "ID": row_id, "수집시간": now, "Excel Link": excel_link, "PDF Link": pdf_link,
+                    "회사명": company, "보고서명": title, "상장시장": "", 
+                    "링크": link, "접수번호": acptno
+                }
+                row_dict.update(ex_data)
+                
+                final_row = [row_dict.get(col_name, "") for col_name in target_cols]
+                ws.append_row(final_row, value_input_option="USER_ENTERED")
+                print(f" -> '{matched_kw}' 시트 저장 완료 (데이터 {sum(1 for v in final_row[4:-2] if v)}개 획득)")
+            except Exception as e:
+                print(f" -> [GS Error for {matched_kw}] {e}")
+                is_success = False
         
         if is_success:
             seen_list.add(acptno)
