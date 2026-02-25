@@ -1,11 +1,9 @@
 requests
-beautifulsoup4
-pandas
-lxml
-html5lib
 feedparser
 gspread
 google-auth
+playwright
+pandas
 openpyxl
 xlrd
-playwright
+pdfplumber
