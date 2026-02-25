@@ -5,14 +5,14 @@ import feedparser
 import requests
 import gspread
 import pandas as pd
-import pdfplumber
+from bs4 import BeautifulSoup
 from google.oauth2.service_account import Credentials
 from playwright.sync_api import sync_playwright
 
 # =========================
 # Config & Setup
 # =========================
-BOT_VERSION = os.getenv("BOT_VERSION", "kind-bot-v9-ultimate")
+BOT_VERSION = os.getenv("BOT_VERSION", "kind-bot-v10-bs4-html")
 RSS_URL = "https://kind.krx.co.kr/disclosure/rsstodaydistribute.do?method=searchRssTodayDistribute&repIsuSrtCd=&mktTpCd=0&searchCorpName=&currentPageSize=200"
 
 SHEET_NAME = "KIND_대경"
@@ -44,9 +44,7 @@ COLS_BOND = [
     "자금용도", "투자자", "링크", "접수번호"
 ]
 
-KEYWORDS_YU = ["유상증자"]
-KEYWORDS_BOND = ["전환사채", "신주인수권부사채", "교환사채"]
-ALL_KEYWORDS = KEYWORDS_YU + KEYWORDS_BOND
+ALL_KEYWORDS = ["유상증자", "전환사채", "신주인수권부사채", "교환사채"]
 
 ALIASES = {
     "최초 이사회결의일": ["최초 이사회결의일", "이사회결의일", "결의일", "결정일"],
@@ -117,13 +115,12 @@ def connect_gs_and_setup_tabs():
     for kw in ALL_KEYWORDS:
         try:
             ws = sh.worksheet(kw)
-            acpt_col_idx = len(COLS_YU) if kw in KEYWORDS_YU else len(COLS_BOND)
+            acpt_col_idx = len(COLS_YU) if kw == "유상증자" else len(COLS_BOND)
             acpts = ws.col_values(acpt_col_idx)[1:] 
             for acpt in acpts:
                 if str(acpt).strip().isdigit(): existing_acptnos.add(str(acpt).strip())
         except gspread.exceptions.WorksheetNotFound:
-            print(f"[GS] '{kw}' 시트 생성 중...")
-            cols_to_use = COLS_YU if kw in KEYWORDS_YU else COLS_BOND
+            cols_to_use = COLS_YU if kw == "유상증자" else COLS_BOND
             ws = sh.add_worksheet(title=kw, rows="1000", cols=str(len(cols_to_use) + 5))
             ws.append_row(cols_to_use)
         tabs[kw] = ws
@@ -139,42 +136,21 @@ def get_next_id(ws):
         if str(v).strip().isdigit(): mx = max(mx, int(v))
     return mx + 1
 
-def extract_data_from_df(df, extracted):
-    """표(Dataframe)에서 키워드와 값을 정밀하게 매칭합니다."""
-    for _, row in df.iterrows():
-        row_list = [str(x) for x in row.tolist() if pd.notna(x)]
-        for col_idx, cell_value in enumerate(row_list):
-            cleaned_cell = norm(cell_value)
-            for key, aliases in ALIASES.items():
-                if not extracted[key]:
-                    # 키워드가 포함되어 있는지 확인
-                    if any(a in cleaned_cell for a in aliases):
-                        # 값은 보통 바로 옆 칸(+1)이나 다다음 칸(+2)에 존재함
-                        for offset in range(1, 3):
-                            if col_idx + offset < len(row_list):
-                                val = str(row_list[col_idx + offset]).strip()
-                                # 빈칸이나 의미없는 대시(-) 기호가 아니면 값으로 확정
-                                if val and val.lower() not in ["-", "—", "nan", "none", ""]: 
-                                    extracted[key] = val
-                                    break
-    return extracted
-
-# ✨ 핵심: 사람처럼 접속해서 쿠키를 확보하고 파일을 긁어오는 완전체 로직
-def process_disclosure_via_playwright(link: str):
+# ✨ 직접 찾아주신 BeautifulSoup + Selenium(Playwright) 방식 적용!
+def process_disclosure_via_html_parsing(link: str):
     excel_link, pdf_link = "", ""
     extracted = {k: "" for k in ALIASES.keys()}
     
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=True)
-        context = browser.new_context(locale="ko-KR", user_agent=DEFAULT_HEADERS["User-Agent"])
+        context = browser.new_context(locale="ko-KR")
         page = context.new_page()
         
         try:
-            # 1. 공시 메인 링크로 이동 (사람과 동일하게 접속 기록 생성)
             page.goto(link, wait_until="networkidle")
             page.wait_for_timeout(3000)
             
-            # 2. 모든 프레임을 탐색하여 첨부파일(Excel, PDF) 고유번호 확보
+            # 1. 첨부파일(Excel, PDF) 링크 확보 (이건 화면에 있는 버튼 속성을 그대로 읽음)
             for fr in page.frames:
                 for el in fr.query_selector_all("option, a, button"):
                     text = (el.inner_text() or "").lower()
@@ -193,64 +169,43 @@ def process_disclosure_via_playwright(link: str):
                         dl_url = f"https://kind.krx.co.kr/common/applcmn.do?method=download&apndNo={apnd_no}"
                         if "pdf" in text or ".pdf" in text: pdf_link = dl_url
                         elif "xls" in text or "excel" in text or "엑셀" in text: excel_link = dl_url
-            
-            # 3. 서버를 속이기 위한 Playwright 쿠키(접속 통행증) 복사!
-            session = requests.Session()
-            for cookie in context.cookies():
-                session.cookies.set(cookie["name"], cookie["value"], domain=cookie["domain"])
-            
-            headers = {"Referer": link, "User-Agent": DEFAULT_HEADERS["User-Agent"]}
-            
-            # 4. (엑셀 추출) 쿠키를 들이밀며 진짜 엑셀 파일 다운로드
-            if excel_link:
-                try:
-                    r = session.get(excel_link, headers=headers, stream=True, timeout=15)
-                    tmp_xls = f"temp_{int(time.time())}.xls"
-                    with open(tmp_xls, "wb") as f: f.write(r.content)
-                    
-                    df = None
-                    try: df = pd.read_excel(tmp_xls, header=None)
-                    except:
-                        try:
-                            dfs = pd.read_html(io.StringIO(r.content.decode('euc-kr', errors='ignore')))
-                            df = pd.concat(dfs, ignore_index=True)
-                        except: pass
-                    
-                    if df is not None: extracted = extract_data_from_df(df, extracted)
-                    if os.path.exists(tmp_xls): os.remove(tmp_xls)
-                except Exception as e: print(f"   [Excel 에러] {e}")
 
-            # 5. (PDF 추출) 엑셀이 없거나 데이터가 부족할 때 PDF 스캔
-            if pdf_link and sum(1 for v in extracted.values() if v) < 3:
-                try:
-                    r = session.get(pdf_link, headers=headers, stream=True, timeout=15)
-                    tmp_pdf = f"temp_{int(time.time())}.pdf"
-                    with open(tmp_pdf, "wb") as f: f.write(r.content)
-                    
-                    with pdfplumber.open(tmp_pdf) as pdf:
-                        for p_obj in pdf.pages:
-                            text = p_obj.extract_text()
-                            if not text: continue
-                            for line in text.split('\n'):
-                                cleaned_line = norm(line)
-                                for key, aliases in ALIASES.items():
-                                    if not extracted[key]:
-                                        if any(a in cleaned_line for a in aliases):
-                                            parts = re.split(r'[:|：]', line)
-                                            val = parts[-1].strip() if len(parts) > 1 else line.strip()
-                                            if val: extracted[key] = val
-                    if os.path.exists(tmp_pdf): os.remove(tmp_pdf)
-                except Exception as e: print(f"   [PDF 에러] {e}")
+            # 2. BeautifulSoup으로 화면 내의 "본문 표(Table)"를 직접 파싱!!
+            # KIND 공시 뷰어에서 실제 내용이 들어있는 프레임 찾기
+            target_frame = None
+            for fr in page.frames:
+                if "docdisclsviewer" in fr.url or "body" in fr.name.lower():
+                    target_frame = fr
+                    break
+            
+            if not target_frame:
+                target_frame = page.main_frame
+                
+            # 프레임의 HTML 소스를 통째로 가져옴
+            html_content = target_frame.content()
+            soup = BeautifulSoup(html_content, 'html.parser')
+            
+            # Pandas로 HTML 안에 있는 모든 표(table)를 한 번에 읽기
+            try:
+                dfs = pd.read_html(io.StringIO(str(soup)))
+                for df in dfs:
+                    for _, row in df.iterrows():
+                        row_list = [str(x) for x in row.tolist() if pd.notna(x)]
+                        for col_idx, cell_value in enumerate(row_list):
+                            cleaned_cell = norm(cell_value)
+                            for key, aliases in ALIASES.items():
+                                if not extracted[key]:
+                                    if any(a in cleaned_cell for a in aliases):
+                                        # 키워드를 찾으면 그 오른쪽 칸들에 값이 있는지 확인
+                                        for offset in range(1, 3):
+                                            if col_idx + offset < len(row_list):
+                                                val = str(row_list[col_idx + offset]).strip()
+                                                if val and val.lower() not in ["-", "—", "nan", "none", ""]: 
+                                                    extracted[key] = val
+                                                    break
+            except Exception as e:
+                print(f"   [HTML 표 파싱 실패] {e}")
 
-            # 6. (HTML 백업) 첨부파일이 아예 없고 본문에만 표가 있는 경우
-            if sum(1 for v in extracted.values() if v) < 3:
-                for fr in page.frames:
-                    if "docno=" in fr.url or "body" in fr.name.lower():
-                        try:
-                            dfs = pd.read_html(io.StringIO(fr.content()))
-                            for df in dfs: extracted = extract_data_from_df(df, extracted)
-                        except: pass
-                        
         except Exception as e:
             print(f" [Playwright Error] {e}")
         finally:
@@ -287,7 +242,6 @@ def main():
         matched_kws = [k for k in ALL_KEYWORDS if k in title]
         if not matched_kws: continue
         
-        # 접수번호 추출
         link_res = requests.get(link, headers=DEFAULT_HEADERS)
         acptno = extract_acptno_from_link(link, link_res.text)
         
@@ -300,16 +254,15 @@ def main():
             
         print(f"\nProcessing: [{company}] {title}")
         
-        # 파일 수집 및 데이터 추출 (완전 자동화 모듈 호출)
-        excel_link, pdf_link, ex_data = process_disclosure_via_playwright(link)
+        # 다운로드를 포기하고, 브라우저 화면의 HTML을 바로 읽어버리는 함수 실행!
+        excel_link, pdf_link, ex_data = process_disclosure_via_html_parsing(link)
 
         now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         is_success = True
         
-        # 구글 시트 입력
         for kw in matched_kws:
             ws = tabs[kw]
-            target_cols = COLS_YU if kw in KEYWORDS_YU else COLS_BOND
+            target_cols = COLS_YU if kw == "유상증자" else COLS_BOND
             try:
                 row_id = get_next_id(ws)
                 row_dict = {
@@ -317,7 +270,7 @@ def main():
                     "회사명": company, "보고서명": title, "상장시장": market_code, 
                     "링크": link, "접수번호": acptno
                 }
-                row_dict.update(ex_data) # 추출된 데이터(발행가액, 납입일 등) 병합
+                row_dict.update(ex_data) 
                 
                 final_row = [row_dict.get(col_name, "") for col_name in target_cols]
                 ws.append_row(final_row, value_input_option="USER_ENTERED")
