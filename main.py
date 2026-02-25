@@ -1,25 +1,21 @@
-import os, json, time, re, html
+import os, json, time, re
 from datetime import datetime
-from urllib.parse import urlparse, parse_qs, urlencode
+from urllib.parse import urlparse, parse_qs
 import feedparser
 import requests
 import gspread
 from bs4 import BeautifulSoup
 from google.oauth2.service_account import Credentials
-from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
 
 # =========================
 # Config
 # =========================
-BOT_VERSION = os.getenv("BOT_VERSION", "kind-bot-v1")
-DEBUG_HTML = os.getenv("DEBUG_HTML", "0") == "1"
-DUMP_FAIL_HTML = os.getenv("DUMP_FAIL_HTML", "0") == "1"
-SUCCESS_FILLED_MIN = int(os.getenv("SUCCESS_FILLED_MIN", "10"))
+BOT_VERSION = os.getenv("BOT_VERSION", "kind-bot-v2")
 RSS_URL = "https://kind.krx.co.kr/disclosure/rsstodaydistribute.do?method=searchRssTodayDistribute&repIsuSrtCd=&mktTpCd=0&searchCorpName=&currentPageSize=200"
-KEYWORDS = ["전환사채","유상증자","교환사채"]
+
+# 새로운 탭 이름이자 검색 키워드
+KEYWORDS = ["유상증자", "전환사채", "신주인수권부사채", "교환사채"]
 SHEET_NAME = "KIND_대경"
-RAW_TAB = "RAW"
-ISSUE_TAB = "ISSUE"
 SEEN_FILE = "seen.json"
 RETRY_FILE = "retry_queue.json"
 BASE = "https://kind.krx.co.kr"
@@ -31,40 +27,11 @@ DEFAULT_HEADERS = {
     "Connection": "keep-alive",
 }
 
-TARGET_KEYS = [
-    "최초 이사회결의일","증자방식","발행상품","신규발행주식수","확정발행가(원)","기준주가","확정발행금액(억원)",
-    "할인(할증률)","증자전 주식수","증자비율","청약일","납입일","주관사","자금용도","투자자","증자금액"
-]
-
-ALIASES = {
-    "최초 이사회결의일": ["이사회결의일","결의일","결정일","이사회 결의일"],
-    "증자방식": ["증자방식","발행방식","배정방법","배정방식"],
-    "발행상품": ["신주의 종류","주식의 종류","증권종류","발행상품"],
-    "신규발행주식수": ["신규발행주식수","발행주식수","발행할 주식의 수","신주수","증자할 주식수"],
-    "확정발행가(원)": ["확정발행가","신주발행가액","발행가","발행가액","1주당 발행가액"],
-    "기준주가": ["기준주가","기준주가액"],
-    "확정발행금액(억원)": ["확정발행금액","모집총액","발행총액","발행금액","모집금액","조달금액"],
-    "할인(할증률)": ["할인율","할증률","할인율(%)"],
-    "증자전 주식수": ["증자전 주식수","증자전 발행주식총수","발행주식총수","기발행주식총수"],
-    "증자비율": ["증자비율","증자비율(%)"],
-    "청약일": ["청약일","청약기간","청약시작일"],
-    "납입일": ["납입일","대금납입일"],
-    "주관사": ["주관사","대표주관회사","공동주관회사","인수회사","인수단"],
-    "자금용도": ["자금용도","자금조달의 목적","자금사용 목적","자금조달 목적"],
-    "투자자": ["투자자","제3자배정대상자","배정대상자","발행대상자","대상자","인수인"],
-    "증자금액": ["증자금액","발행규모","조달금액","모집금액","총 조달금액"],
-}
-
 SLEEP_SECONDS = float(os.getenv("SLEEP_SECONDS", "1"))
-PW_NAV_TIMEOUT_MS = int(os.getenv("PW_NAV_TIMEOUT_MS", "20000"))
-PW_FRAME_TIMEOUT_MS = int(os.getenv("PW_FRAME_TIMEOUT_MS", "20000"))
 
 # =========================
 # Utils
 # =========================
-def norm(s: str) -> str:
-    return re.sub(r"\s+", "", str(s or "")).lower()
-
 def load_json(filepath, default_val):
     if os.path.exists(filepath):
         try:
@@ -99,32 +66,31 @@ def connect_gs():
     client = gspread.authorize(creds)
     sh = client.open(SHEET_NAME)
 
-    # 탭이 없을 경우 자동 생성하는 로직 추가
-    def get_or_create_ws(title, rows=1000, cols=20):
+    tabs = {}
+    # 설정된 키워드대로 각각의 탭(Worksheet)을 연결하거나 생성합니다.
+    for kw in KEYWORDS:
         try:
-            return sh.worksheet(title)
+            ws = sh.worksheet(kw)
         except gspread.exceptions.WorksheetNotFound:
-            print(f"[GS] Worksheet '{title}' not found. Creating new one.")
-            return sh.add_worksheet(title=title, rows=str(rows), cols=str(cols))
+            print(f"[GS] Worksheet '{kw}' not found. Creating new one.")
+            ws = sh.add_worksheet(title=kw, rows="1000", cols="10")
+            # 새 시트 생성 시 헤더 추가
+            ws.append_row(["ID", "수집시간", "공시일시", "공시제목", "공시링크", "Excel", "PDF"])
+        tabs[kw] = ws
 
-    raw_ws = get_or_create_ws(RAW_TAB)
-    issue_ws = get_or_create_ws(ISSUE_TAB)
-
-    print(f"[BOT] {BOT_VERSION}")
-    print(f"[GS] Opened spreadsheet='{sh.title}' RAW='{raw_ws.title}' ISSUE='{issue_ws.title}'")
-    return raw_ws, issue_ws
+    print(f"[BOT] {BOT_VERSION} | Opened spreadsheet='{sh.title}'")
+    return tabs
 
 def get_next_id(ws):
     col = ws.col_values(1)
     if len(col) <= 1:
-        return 0
+        return 1  # 1행이 헤더이므로 첫 데이터는 1
     last = str(col[-1]).strip()
     if last.isdigit():
         return int(last) + 1
-    mx = -1
-    for v in col:
-        v = str(v).strip()
-        if v.isdigit():
+    mx = 0
+    for v in col[1:]:
+        if str(v).strip().isdigit():
             mx = max(mx, int(v))
     return mx + 1
 
@@ -134,268 +100,138 @@ def fetch_rss(session):
     print(f"[RSS] status={r.status_code} bytes={len(r.content)} entries={len(feed.entries)}")
     return feed
 
-def extract_company_from_title(title: str):
-    m = re.match(r"^\[([^\]]+)\]\s*([^\s]+)", (title or "").strip())
-    return m.group(2) if m else ""
-
-def extract_market_code_from_title(title: str):
-    m = re.match(r"^\[([^\]]+)\]", (title or "").strip())
-    return m.group(1).strip() if m else ""
-
-def clean_report_title(title: str):
-    t = (title or "").strip()
-    t = re.sub(r"^\[[^\]]+\]\s*", "", t)
-    t = re.sub(r"^[^\s]+\s+", "", t, count=1)
-    t = t.replace("[정정]", "").strip()
-    return t
-
 def extract_acptno_from_link(link: str, html_text: str):
     qs = parse_qs(urlparse(link).query)
     acpt = (qs.get("acptno") or qs.get("acptNo") or [None])[0]
-    if acpt:
-        return acpt
-    m = re.search(r'acptNo"\s*value="(\d+)"', html_text)
-    if m:
-        return m.group(1)
-    m = re.search(r'_TRK_PN\s*=\s*"(\d+)"', html_text)
-    if m:
-        return m.group(1)
-    m = re.search(r"(acptno|acptNo)=(\d{8,14})", html_text)
-    if m:
-        return m.group(2)
+    if acpt: return acpt
+    
+    m = re.search(r"(acptno|acptNo)=(\d{8,14})", html_text, re.I)
+    if m: return m.group(2)
     return None
 
-def build_viewer_url(acptno: str, docno: str | None):
-    base = f"{BASE}/common/disclsviewer.do"
-    params = {
-        "method": "search",
-        "acptno": acptno,
-        "docno": docno or "",
-        "viewerhost": "",
-    }
-    return base + "?" + urlencode(params, doseq=True)
-
-def parse_docno_options(viewer_html: str):
-    soup = BeautifulSoup(viewer_html, "lxml")
-    options = []
-    for opt in soup.find_all("option"):
-        v = (opt.get("value") or "").strip()
-        txt = opt.get_text(" ", strip=True)
-        m = re.match(r"^(\d{10,14})\|", v)
-        if m:
-            options.append((m.group(1), txt))
-    if not options:
-        for m in re.finditer(r'(\d{10,14})\|', viewer_html or ""):
-            options.append((m.group(1), ""))
-    uniq = {}
-    for d, t in options:
-        uniq[d] = t
-    return [(d, uniq[d]) for d in uniq.keys()]
-
-def choose_best_docno(options, report_hint: str):
-    hint = norm(report_hint)
-    best_doc, best_score = None, -1
-    for docno, txt in options:
-        tn = norm(txt)
-        score = 0
-        if hint and tn and hint in tn:
-            score += 100
-        if "유상증자" in tn:
-            score += 10
-        if "결정" in tn:
-            score += 5
-        if txt and len(txt) < 5:
-            score -= 3
-        if not txt:
-            score += 1
-        if score > best_score:
-            best_score = score
-            best_doc = docno
-    return best_doc
-
-def table_to_matrix(table):
-    matrix = []
-    span_map = {}
-    for tr in table.find_all("tr"):
-        row = []
-        col = 0
-        while col in span_map:
-            txt, remain = span_map[col]
-            row.append(txt)
-            remain -= 1
-            if remain <= 0: del span_map[col]
-            else: span_map[col] = (txt, remain)
-            col += 1
-        for cell in tr.find_all(["th", "td"]):
-            while col in span_map:
-                txt, remain = span_map[col]
-                row.append(txt)
-                remain -= 1
-                if remain <= 0: del span_map[col]
-                else: span_map[col] = (txt, remain)
-                col += 1
-            text = cell.get_text(" ", strip=True)
-            rowspan = int(cell.get("rowspan", "1") or "1")
-            colspan = int(cell.get("colspan", "1") or "1")
-            for _ in range(colspan):
-                row.append(text)
-                if rowspan > 1:
-                    span_map[col] = (text, rowspan - 1)
-                col += 1
-        matrix.append(row)
-    return matrix
-
-def pick_value_from_row(row, key_idx):
-    for j in range(key_idx + 1, len(row)):
-        v = (row[j] or "").strip()
-        if not v or v in ("-", "—"):
-            continue
-        return v
-    return ""
-
-def extract_from_matrix(matrix, aliases):
-    als = [norm(a) for a in aliases]
-    for r in matrix:
-        for i, cell in enumerate(r):
-            c = (cell or "").strip()
-            if not c: continue
-            cn = norm(re.sub(r"^\d+\.\s*", "", c))
-            if any(a and a in cn for a in als):
-                v = pick_value_from_row(r, i)
-                if v: return v
-    return ""
-
-def parse_contents_html(html_text: str):
-    if "&lt;table" in (html_text or "").lower():
-        html_text = html.unescape(html_text)
-    soup = BeautifulSoup(html_text or "", "lxml")
-    tables = soup.find_all("table")
-    matrices = [table_to_matrix(t) for t in tables]
-    out = {k: "" for k in TARGET_KEYS}
-    for key in TARGET_KEYS:
-        for mtx in matrices:
-            v = extract_from_matrix(mtx, ALIASES[key])
-            if v:
-                out[key] = v
-                break
-    return out, len(tables)
-
-def decide_status(fields: dict):
-    filled = sum(1 for v in fields.values() if str(v).strip())
-    return "SUCCESS" if filled >= SUCCESS_FILLED_MIN else "INCOMPLETE"
-
-def get_kind_contents_html_by_playwright(viewer_url: str) -> tuple[str, str]:
-    with sync_playwright() as p:
-        browser = p.chromium.launch(headless=True)
-        context = browser.new_context(locale="ko-KR")
-        page = context.new_page()
-        page.set_default_navigation_timeout(PW_NAV_TIMEOUT_MS)
-        try:
-            page.goto(viewer_url, wait_until="networkidle")
-        except PWTimeout:
-            pass
-        page.wait_for_timeout(3000)
-        best_html = ""
-        best_label = "NONE"
-        max_tables = -1
-        for fr in page.frames:
-            try:
-                html_content = fr.content()
-                lower_html = html_content.lower()
-                table_count = lower_html.count("<table") + lower_html.count("&lt;table")
-                if table_count > max_tables:
-                    max_tables = table_count
-                    best_html = html_content
-                    best_label = f"FRAME_WITH_{table_count}_TABLES"
-            except Exception:
-                continue
-        browser.close()
-        return best_html, best_label
+def extract_attachments(html_text: str):
+    """
+    공시 뷰어의 헤더 프레임에서 첨부파일(Excel, PDF) 다운로드 링크를 추출합니다.
+    """
+    excel_link, pdf_link = "", ""
+    soup = BeautifulSoup(html_text, "lxml")
+    
+    # 첨부파일은 보통 <option> 태그나 <a> 태그 안에 존재합니다.
+    for tag in soup.find_all(["a", "option"]):
+        text = tag.get_text(strip=True).lower()
+        value = tag.get("value", "")
+        onclick = tag.get("onclick", "")
+        href = tag.get("href", "")
+        
+        apnd_no = None
+        
+        # 다운로드 apndNo 추출 로직
+        if "apndno=" in href.lower():
+            m = re.search(r"apndno=(\d+)", href, re.I)
+            if m: apnd_no = m.group(1)
+        elif "download" in onclick.lower() or "file" in onclick.lower():
+            m = re.search(r"['\"](\d{4,})['\"]", onclick)
+            if m: apnd_no = m.group(1)
+        elif value.isdigit() and len(value) > 3:
+            apnd_no = value
+            
+        if apnd_no:
+            # KIND 실제 파일 다운로드 URL 조립
+            download_url = f"https://kind.krx.co.kr/common/applcmn.do?method=download&apndNo={apnd_no}"
+            
+            if ".pdf" in text or "pdf" in text:
+                if not pdf_link: pdf_link = download_url
+            elif any(ext in text for ext in [".xls", ".xlsx", "excel", "엑셀"]):
+                if not excel_link: excel_link = download_url
+                
+    return excel_link, pdf_link
 
 def main():
-    raw_ws, issue_ws = connect_gs()
+    tabs = connect_gs()
     seen_list = load_json(SEEN_FILE, [])
     retry_queue = load_json(RETRY_FILE, [])
     session = requests.Session()
     feed = fetch_rss(session)
+    
     items = []
     for entry in feed.entries:
         title = entry.get("title", "") or ""
         link = entry.get("link", "") or ""
         guid = entry.get("id") or link
         pub = entry.get("published", "") or ""
+        
         if not guid: continue
-        if KEYWORDS and not any(k in title for k in KEYWORDS): continue
+        # 지정된 4개 키워드 중 하나라도 제목에 포함되어 있는지 확인
+        if not any(k in title for k in KEYWORDS): continue
         if guid in seen_list: continue
+        
         items.append({"title": title, "link": link, "guid": guid, "pub": pub})
     
     items.extend(retry_queue)
+    
+    # 중복 제거
     uniq = {}
     for it in items: uniq[it["guid"]] = it
     items = list(uniq.values())
     
     print(f"[QUEUE] to_process={len(items)} seen={len(seen_list)} retry={len(retry_queue)}")
     if not items:
-        print("✅ 모든 작업 완료!")
+        print("✅ 모든 작업 완료! (새로운 공시 없음)")
         return
 
     new_retry = []
     for item in items:
         title, link, guid, pub = item["title"], item["link"], item["guid"], item.get("pub", "")
-        company = extract_company_from_title(title)
-        market_code = extract_market_code_from_title(title)
-        report_hint = clean_report_title(title)
         print(f"\nProcessing: {title}")
+        
+        # 제목에 포함된 키워드 찾기 (예: "유상증자"와 "전환사채"가 동시에 있다면 둘 다 해당)
+        matched_kws = [k for k in KEYWORDS if k in title]
+        if not matched_kws:
+            continue
         
         link_res = fetch(session, link, referer=f"{BASE}/")
         acptno = extract_acptno_from_link(link, link_res.text)
+        
         if not acptno:
             print(" [FAIL] acptNo not found")
             new_retry.append(item)
             continue
 
-        viewer_shell = build_viewer_url(acptno, None)
-        vr_shell = fetch(session, viewer_shell, referer=link)
-        options = parse_docno_options(vr_shell.text)
-        if not options:
-            print(" [FAIL] docNo options not found")
-            new_retry.append(item)
-            continue
-
-        docno = choose_best_docno(options, report_hint)
-        if not docno:
-            print(" [FAIL] docNo choose failed")
-            new_retry.append(item)
-            continue
-
-        viewer_doc = build_viewer_url(acptno, docno)
-        contents_html, path = get_kind_contents_html_by_playwright(viewer_doc)
-
-        if "<title>창 닫기</title>" in (contents_html or ""):
-            print(f" [FAIL] CLOSE-WINDOW even with Playwright. path={path}")
-            fields = {k: "" for k in TARGET_KEYS}
-            tables_cnt = 0
-            status = "INCOMPLETE"
-        else:
-            fields, tables_cnt = parse_contents_html(contents_html)
-            status = decide_status(fields)
+        # 첨부파일 정보가 들어있는 헤더 프레임 직접 호출
+        header_url = f"{BASE}/common/disclsviewer.do?method=header&acptno={acptno}"
+        header_res = fetch(session, header_url, referer=link)
         
-        filled = sum(1 for v in fields.values() if str(v).strip())
-        version = f"{acptno}-{docno}"
+        # 파일 링크 추출
+        excel_link, pdf_link = extract_attachments(header_res.text)
+
         now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        is_success = True
         
-        try:
-            raw_id = get_next_id(raw_ws)
-            raw_ws.append_row([raw_id, now, pub, title, link, guid, status], value_input_option="USER_ENTERED")
-            issue_row = ([raw_id, now, pub, title, link, guid, company, market_code] 
-                         + [fields.get(k, "") for k in TARGET_KEYS] + [version])
-            issue_ws.append_row(issue_row, value_input_option="USER_ENTERED")
-            
-            if guid not in seen_list: seen_list.append(guid)
-            if status != "SUCCESS": new_retry.append(item)
-            print(f"-> Saved ({status}) path={path} tables={tables_cnt} filled={filled} VERSION={version}")
-        except Exception as e:
-            print(f"-> [Google Sheets Error] {e}")
+        # 매칭된 모든 탭(시트)에 데이터 추가
+        for kw in matched_kws:
+            ws = tabs[kw]
+            try:
+                row_id = get_next_id(ws)
+                # 요청하신 7개 컬럼 매핑
+                row_data = [
+                    row_id,        # ID
+                    now,           # 수집시간
+                    pub,           # 공시일시
+                    title,         # 공시제목
+                    link,          # 공시링크
+                    excel_link,    # Excel 링크
+                    pdf_link       # PDF 링크
+                ]
+                ws.append_row(row_data, value_input_option="USER_ENTERED")
+                print(f" -> Saved to '{kw}' 시트 | Excel: {'O' if excel_link else 'X'} | PDF: {'O' if pdf_link else 'X'}")
+            except Exception as e:
+                print(f" -> [Google Sheets Error for {kw}] {e}")
+                is_success = False
+        
+        if is_success:
+            if guid not in seen_list:
+                seen_list.append(guid)
+        else:
             new_retry.append(item)
         
         time.sleep(SLEEP_SECONDS)
