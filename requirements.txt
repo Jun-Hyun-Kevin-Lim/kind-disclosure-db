@@ -8,4 +8,5 @@ openpyxl
 xlrd
 pdfplumber
 lxml
+beautifulsoup4
 html5lib
