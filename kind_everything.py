@@ -23,7 +23,7 @@ DEFAULT_HEADERS = {
 SLEEP_SECONDS = float(os.getenv("SLEEP_SECONDS", "1"))
 
 # ✨ 며칠 치 데이터를 검색할지 설정 (기본 1일=오늘. 만약 데이터가 없으면 3, 7 등으로 바꿔서 테스트해보세요!)
-SEARCH_DAYS_AGO = 0 
+SEARCH_DAYS_AGO = 5 
 
 COLS_YU = [
     "ID", "수집시간", "Excel Link", "PDF Link", 
