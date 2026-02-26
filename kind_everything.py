@@ -1,29 +1,29 @@
-import os, json, time, re
-from datetime import datetime, timedelta
-from urllib.parse import urlparse, parse_qs
+import os, json, time, re, io
+from datetime import datetime
 import requests
+import feedparser
 import gspread
+import pandas as pd
+import tabula
+import pdfplumber
 from bs4 import BeautifulSoup
 from google.oauth2.service_account import Credentials
+from tenacity import retry, stop_after_attempt, wait_fixed
 
 # =========================
 # Config & Setup
 # =========================
-BOT_VERSION = os.getenv("BOT_VERSION", "kind-bot-v14-euckr-master")
+BOT_VERSION = os.getenv("BOT_VERSION", "kind-bot-v15-enterprise")
 SHEET_NAME = "KIND_대경"
 SEEN_FILE = "seen.json"
 RETRY_FILE = "retry_queue.json"
 BASE = "https://kind.krx.co.kr"
+RSS_URL = "https://kind.krx.co.kr/disclosure/rsstodaydistribute.do?method=searchRssTodayDistribute&repIsuSrtCd=&mktTpCd=0&searchCorpName=&currentPageSize=200"
 
 DEFAULT_HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
     "Accept-Language": "ko-KR,ko;q=0.9",
 }
-
-SLEEP_SECONDS = float(os.getenv("SLEEP_SECONDS", "1"))
-
-# ✨ 며칠 치를 스캔할지 설정 (최근 5일간 발생한 모든 공시를 싹쓸이해서 검사합니다)
-SEARCH_DAYS_AGO = 5 
 
 COLS_YU = [
     "ID", "수집시간", "Excel Link", "PDF Link", 
@@ -42,9 +42,7 @@ COLS_BOND = [
     "자금용도", "투자자", "링크", "접수번호"
 ]
 
-KEYWORDS_YU = ["유상증자"]
-KEYWORDS_BOND = ["전환사채", "신주인수권부사채", "교환사채"]
-ALL_KEYWORDS = KEYWORDS_YU + KEYWORDS_BOND
+ALL_KEYWORDS = ["유상증자", "전환사채", "신주인수권부사채", "교환사채"]
 
 ALIASES = {
     "최초 이사회결의일": ["최초 이사회결의일", "이사회결의일", "결의일", "결정일"],
@@ -80,6 +78,9 @@ ALIASES = {
     "Refixing Floor": ["최저조정가액", "조정 한도", "리픽싱 한도", "최저 조정가액"]
 }
 
+# =========================
+# Utilities & Retry Network
+# =========================
 def norm(s: str) -> str:
     return re.sub(r"\s+", "", str(s or "")).lower()
 
@@ -94,6 +95,13 @@ def save_json(filepath, data):
     with open(filepath, "w", encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False, indent=2)
 
+@retry(stop=stop_after_attempt(3), wait=wait_fixed(2))
+def fetch_url(session, url, stream=False):
+    """Tenacity를 이용해 네트워크 오류 시 최대 3번 자동 재시도합니다."""
+    r = session.get(url, headers=DEFAULT_HEADERS, stream=stream, timeout=15)
+    r.raise_for_status()
+    return r
+
 def connect_gs_and_setup_tabs():
     creds_dict = json.loads(os.environ["GOOGLE_CREDS"])
     creds = Credentials.from_service_account_info(
@@ -101,185 +109,209 @@ def connect_gs_and_setup_tabs():
     )
     client = gspread.authorize(creds)
     sh = client.open(SHEET_NAME)
-    tabs = {}
-    existing_acptnos = set()
+    tabs, existing_acptnos = {}, set()
 
     for kw in ALL_KEYWORDS:
         try:
             ws = sh.worksheet(kw)
-            acpt_col_idx = len(COLS_YU) if kw in KEYWORDS_YU else len(COLS_BOND)
-            acpts = ws.col_values(acpt_col_idx)[1:] 
+            idx = len(COLS_YU) if kw in ["유상증자"] else len(COLS_BOND)
+            acpts = ws.col_values(idx)[1:] 
             for acpt in acpts:
                 if str(acpt).strip().isdigit(): existing_acptnos.add(str(acpt).strip())
         except gspread.exceptions.WorksheetNotFound:
-            print(f"[GS] '{kw}' 시트 생성 중...")
-            cols_to_use = COLS_YU if kw in KEYWORDS_YU else COLS_BOND
-            ws = sh.add_worksheet(title=kw, rows="1000", cols=str(len(cols_to_use) + 5))
-            ws.append_row(cols_to_use)
+            cols = COLS_YU if kw in ["유상증자"] else COLS_BOND
+            ws = sh.add_worksheet(title=kw, rows="1000", cols=str(len(cols) + 5))
+            ws.append_row(cols)
         tabs[kw] = ws
     return tabs, existing_acptnos
 
 def get_next_id(ws):
     col = ws.col_values(1)
     if len(col) <= 1: return 1
-    last = str(col[-1]).strip()
-    if last.isdigit(): return int(last) + 1
-    mx = 0
-    for v in col[1:]:
-        if str(v).strip().isdigit(): mx = max(mx, int(v))
-    return mx + 1
+    return max([int(v) for v in col[1:] if str(v).strip().isdigit()] + [0]) + 1
 
-# ✨ 한글 검색어 오류 방지를 위해 전체 데이터를 가져온 후 파이썬 자체 필터링!
-def get_disclosures_all_and_filter(session, from_date, to_date):
-    url = "https://kind.krx.co.kr/disclosure/details.do"
-    payload = {
-        "method": "searchDetailsMain",
-        "fromDate": from_date,
-        "toDate": to_date,
-        "currentPageSize": "5000",  # 해당 기간의 모든 공시를 넉넉하게 요청
-        "pageIndex": "1"
-    }
-    
-    # 1. 한글 검색어 없이 서버에 요청
-    r = session.post(url, data=payload, headers=DEFAULT_HEADERS)
-    
-    # 2. 서버가 반환한 한글이 깨지지 않도록 강제 EUC-KR 번역 장착!
-    soup = BeautifulSoup(r.content, 'html.parser', from_encoding='euc-kr')
-    
-    results = []
-    for tr in soup.find_all('tr'):
-        tds = tr.find_all('td')
-        if len(tds) >= 4:
-            company = tds[1].get_text(strip=True)
-            title_a = tds[2].find('a')
-            
-            if title_a and 'openDisclsViewer' in title_a.get('onclick', ''):
-                title = title_a.get_text(strip=True)
-                
-                # 3. 파이썬이 빠르고 완벽하게 타겟 키워드만 쏙쏙 추출
-                matched_kws = [kw for kw in ALL_KEYWORDS if kw in title]
-                
-                if matched_kws:
-                    acptno_match = re.search(r"openDisclsViewer\('(\d+)'", title_a['onclick'])
-                    if acptno_match:
-                        acptno = acptno_match.group(1)
-                        link = f"https://kind.krx.co.kr/common/disclsviewer.do?method=search&acptno={acptno}"
-                        results.append({
-                            "title": title,
-                            "company": company,
-                            "link": link,
-                            "acptno": acptno,
-                            "matched_kws": matched_kws
-                        })
-    return results
+# =========================
+# Data Extraction Engine
+# =========================
+def extract_from_dataframe(df, extracted):
+    """Pandas DataFrame(표)에서 키워드와 값을 정밀하게 매핑합니다."""
+    for _, row in df.iterrows():
+        row_list = [str(x) for x in row.tolist() if pd.notna(x)]
+        for i, cell in enumerate(row_list):
+            cell_norm = norm(cell)
+            for key, aliases in ALIASES.items():
+                if not extracted[key]:
+                    if any(a in cell_norm for a in aliases):
+                        # 1. 같은 셀에 있는 경우 (발행가액: 500)
+                        if ":" in cell or "：" in cell:
+                            val = re.split(r'[:|：]', cell)[-1].strip()
+                            if val and val not in ["-", "—"]: extracted[key] = val
+                            continue
+                        # 2. 오른쪽 칸에 있는 경우
+                        for offset in range(1, 3):
+                            if i + offset < len(row_list):
+                                val = str(row_list[i + offset]).strip()
+                                if val and val.lower() not in ["-", "—", "nan", "none"]:
+                                    extracted[key] = val
+                                    break
+    return extracted
 
-# ✨ HTML 본문 파싱 (한글 깨짐 문제 완벽 해결!)
-def extract_data_from_html(session, acptno):
-    extracted = {k: "" for k in ALIASES.keys()}
+def get_attachment_links(session, acptno):
+    """뷰어에 접속하여 첨부파일(Excel/PDF) 다운로드 링크와 실제 문서번호(docno)를 가져옵니다."""
+    viewer_url = f"{BASE}/common/disclsviewer.do?method=search&acptno={acptno}"
+    r = fetch_url(session, viewer_url)
+    vr_text = r.content.decode('euc-kr', 'replace')
+    
     excel_link, pdf_link = "", ""
-    
-    try:
-        viewer_url = f"{BASE}/common/disclsviewer.do?method=search&acptno={acptno}"
-        vr = session.get(viewer_url, headers=DEFAULT_HEADERS)
-        # 뷰어 텍스트도 깨짐을 방지하기 위해 EUC-KR로 디코딩
-        vr_text = vr.content.decode('euc-kr', 'replace')
+    for m in re.finditer(r'<option\s+value="(\d+)\|([^"]+)"', vr_text):
+        dl_url = f"https://kind.krx.co.kr/common/applcmn.do?method=download&apndNo={m.group(1)}"
+        if ".pdf" in m.group(2).lower(): pdf_link = dl_url
+        elif ".xls" in m.group(2).lower() or "excel" in m.group(2).lower(): excel_link = dl_url
         
-        for m in re.finditer(r'<option\s+value="(\d+)\|([^"]+)"', vr_text):
-            dl_url = f"https://kind.krx.co.kr/common/applcmn.do?method=download&apndNo={m.group(1)}"
-            if ".pdf" in m.group(2).lower(): pdf_link = dl_url
-            elif ".xls" in m.group(2).lower() or "excel" in m.group(2).lower(): excel_link = dl_url
+    docnos = re.findall(r"docno=(\d+)", vr_text) or re.findall(r"(\d{10,14})\|", vr_text)
+    docno = docnos[0] if docnos else None
+    return excel_link, pdf_link, docno
 
-        docnos = re.findall(r"docno=(\d+)", vr_text) or re.findall(r"(\d{10,14})\|", vr_text)
-        if not docnos: return excel_link, pdf_link, extracted
-        
-        doc_url = f"{BASE}/common/disclsviewer.do?method=docdisclsviewer&acptno={acptno}&docno={docnos[0]}"
-        r = session.get(doc_url, headers=DEFAULT_HEADERS)
-        # 가장 중요한 본문 추출 시에도 한글 깨짐 방지 번역기(from_encoding) 장착!
-        soup = BeautifulSoup(r.content, 'html.parser', from_encoding='euc-kr')
-        
-        for table in soup.find_all('table'):
-            for tr in table.find_all('tr'):
-                cells = tr.find_all(['th', 'td'])
-                for i, cell in enumerate(cells):
-                    raw_text = cell.get_text(separator=" ", strip=True)
-                    text_norm = norm(raw_text)
-                    
-                    for key, aliases in ALIASES.items():
-                        if not extracted[key]:
-                            if any(a in text_norm for a in aliases):
-                                if ":" in raw_text or "：" in raw_text:
-                                    parts = re.split(r'[:|：]', raw_text)
-                                    val = parts[-1].strip()
-                                    if val and val not in ["-", "—", ""]:
-                                        extracted[key] = val
-                                        continue
-                                
-                                for offset in range(1, 3):
-                                    if i + offset < len(cells):
-                                        val = cells[i + offset].get_text(separator=" ", strip=True)
-                                        if val and val not in ["-", "—", ""]:
-                                            extracted[key] = val
-                                            break
-    except Exception as e:
-        print(f"   [HTML 파싱 에러] {e}")
-        
+def build_data_pipeline(session, acptno):
+    """[핵심] 3단계 폭포수 파이프라인: HTML -> Excel -> PDF(Tabula/Plumber)"""
+    extracted = {k: "" for k in ALIASES.keys()}
+    excel_link, pdf_link, docno = get_attachment_links(session, acptno)
+    
+    # 1순위: HTML 본문 표 추출 (가장 빠르고 정확함)
+    if docno:
+        try:
+            doc_url = f"{BASE}/common/disclsviewer.do?method=docdisclsviewer&acptno={acptno}&docno={docno}"
+            r = fetch_url(session, doc_url)
+            soup = BeautifulSoup(r.content, 'html.parser', from_encoding='euc-kr')
+            dfs = pd.read_html(io.StringIO(str(soup)))
+            for df in dfs: extracted = extract_from_dataframe(df, extracted)
+        except Exception as e:
+            print(f"   [1. HTML 파싱 실패] {e}")
+
+    # 2순위: 엑셀 파싱 (HTML에서 못 뽑은 데이터가 많을 때만 실행)
+    filled = sum(1 for v in extracted.values() if v)
+    if filled < 5 and excel_link:
+        try:
+            r = fetch_url(session, excel_link, stream=True)
+            tmp_xls = f"temp_{int(time.time())}.xls"
+            with open(tmp_xls, "wb") as f: f.write(r.content)
+            
+            try: df = pd.read_excel(tmp_xls, header=None)
+            except: 
+                dfs = pd.read_html(tmp_xls, encoding='euc-kr')
+                df = pd.concat(dfs, ignore_index=True)
+                
+            extracted = extract_from_dataframe(df, extracted)
+            if os.path.exists(tmp_xls): os.remove(tmp_xls)
+        except Exception as e:
+            print(f"   [2. Excel 파싱 실패] {e}")
+
+    # 3순위: PDF 파싱 (강력한 Tabula-py -> pdfplumber 백업)
+    filled = sum(1 for v in extracted.values() if v)
+    if filled < 5 and pdf_link:
+        try:
+            r = fetch_url(session, pdf_link, stream=True)
+            tmp_pdf = f"temp_{int(time.time())}.pdf"
+            with open(tmp_pdf, "wb") as f: f.write(r.content)
+            
+            # 3-1. Tabula로 표를 완벽하게 DataFrame으로 뽑아보기
+            try:
+                dfs = tabula.read_pdf(tmp_pdf, pages='all', multiple_tables=True, pandas_options={'header': None})
+                for df in dfs: extracted = extract_from_dataframe(df, extracted)
+            except Exception as tabula_e:
+                print(f"   [3-1. Tabula 실패, Plumber로 전환] {tabula_e}")
+                
+            # 3-2. Tabula 실패 시 텍스트 기반 Plumber 시도
+            filled_check = sum(1 for v in extracted.values() if v)
+            if filled_check < 5:
+                with pdfplumber.open(tmp_pdf) as pdf:
+                    for page in pdf.pages:
+                        text = page.extract_text()
+                        if not text: continue
+                        for line in text.split('\n'):
+                            text_norm = norm(line)
+                            for key, aliases in ALIASES.items():
+                                if not extracted[key] and any(a in text_norm for a in aliases):
+                                    val = re.split(r'[:|：]', line)[-1].strip() if ":" in line or "：" in line else line.strip()
+                                    if val: extracted[key] = val
+
+            if os.path.exists(tmp_pdf): os.remove(tmp_pdf)
+        except Exception as e:
+            print(f"   [3. PDF 파싱 최종 실패] {e}")
+
     return excel_link, pdf_link, extracted
 
+# =========================
+# Main Routine
+# =========================
 def main():
     tabs, existing_acptnos = connect_gs_and_setup_tabs()
     seen_list = set(load_json(SEEN_FILE, []))
+    retry_queue = load_json(RETRY_FILE, [])
     session = requests.Session()
     
-    # 검색할 날짜 계산 (기본 최근 5일)
-    to_date = datetime.now().strftime("%Y-%m-%d")
-    from_date = (datetime.now() - timedelta(days=SEARCH_DAYS_AGO)).strftime("%Y-%m-%d")
+    print(f"\n[{datetime.now().strftime('%Y-%m-%d')}] 엔터프라이즈 봇 수집 시작...")
     
-    print(f"\n[{from_date} ~ {to_date}] 전체 공시 수집 및 자체 필터링 시작...")
+    # RSS를 통한 실시간 당일 공시 감지
+    try:
+        feed = fetch_url(session, RSS_URL)
+        parsed_feed = feedparser.parse(feed.content.decode('utf-8'))
+    except Exception as e:
+        print(f"RSS 로드 실패: {e}")
+        return
+        
+    items = []
+    for entry in parsed_feed.entries:
+        title, link, guid = entry.get("title", ""), entry.get("link", ""), entry.get("id", "")
+        if not any(k in title for k in ALL_KEYWORDS): continue
+        items.append({"title": title, "link": link, "guid": guid})
     
-    # 단 1번의 요청으로 모든 것을 해결
-    all_items = get_disclosures_all_and_filter(session, from_date, to_date)
+    items.extend(retry_queue)
+    unique_items = list({it["guid"]: it for it in items}.values())
     
-    # 중복 공시 제거 (접수번호 기준)
-    unique_items = {item["acptno"]: item for item in all_items}.values()
-    
-    print(f"[QUEUE] 타겟 키워드가 포함된 공시: {len(unique_items)}건 발견!")
+    print(f"[QUEUE] 처리 대기: {len(unique_items)}건")
     if not unique_items:
-        print(f"✅ 해당 기간에 목표 공시가 하나도 없습니다.")
+        print("✅ 새로 올라온 공시가 없습니다.")
         return
     
     new_retry = []
     for item in unique_items:
-        title, link, company, acptno, matched_kws = item["title"], item["link"], item["company"], item["acptno"], item["matched_kws"]
+        title, link = item["title"], item["link"]
+        m_comp = re.match(r"^\[([^\]]+)\]\s*([^\s]+)", title.strip())
+        market_code, company = (m_comp.group(1).strip(), m_comp.group(2).strip()) if m_comp else ("", "")
+        matched_kws = [k for k in ALL_KEYWORDS if k in title]
         
-        if acptno in existing_acptnos or acptno in seen_list:
+        acptno = re.search(r"(acptno|acptNo)=(\d+)", link, re.I)
+        acptno = acptno.group(2) if acptno else None
+        
+        if not acptno or acptno in existing_acptnos or acptno in seen_list:
             continue
             
         print(f"\nProcessing: [{company}] {title}")
         
-        # 2. 본문 HTML 파싱하여 데이터 빼오기
-        excel_link, pdf_link, ex_data = extract_data_from_html(session, acptno)
+        # 🚀 3단 콤보 데이터 추출기 실행
+        excel_link, pdf_link, ex_data = build_data_pipeline(session, acptno)
 
         now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         is_success = True
         
-        # 3. 구글 시트에 저장
         for matched_kw in matched_kws:
             ws = tabs[matched_kw]
-            target_cols = COLS_YU if matched_kw in KEYWORDS_YU else COLS_BOND
+            target_cols = COLS_YU if matched_kw in ["유상증자"] else COLS_BOND
             try:
                 row_id = get_next_id(ws)
                 row_dict = {
                     "ID": row_id, "수집시간": now, "Excel Link": excel_link, "PDF Link": pdf_link,
-                    "회사명": company, "보고서명": title, "상장시장": "", 
+                    "회사명": company, "보고서명": title, "상장시장": market_code, 
                     "링크": link, "접수번호": acptno
                 }
                 row_dict.update(ex_data)
                 
                 final_row = [row_dict.get(col_name, "") for col_name in target_cols]
                 ws.append_row(final_row, value_input_option="USER_ENTERED")
-                print(f" -> '{matched_kw}' 시트 저장 완료 (데이터 {sum(1 for v in final_row[4:-2] if v)}개 획득)")
+                print(f" -> '{matched_kw}' 시트 저장 완료 (추출 항목: {sum(1 for v in final_row[4:-2] if v)}개)")
             except Exception as e:
-                print(f" -> [GS Error for {matched_kw}] {e}")
+                print(f" -> [GS Error] {e}")
                 is_success = False
         
         if is_success:
@@ -288,10 +320,11 @@ def main():
         else:
             new_retry.append(item)
         
-        time.sleep(SLEEP_SECONDS)
+        time.sleep(1)
 
     save_json(SEEN_FILE, list(seen_list))
-    print("\n✅ 오늘치 작업 완료!")
+    save_json(RETRY_FILE, new_retry)
+    print("\n✅ 작업 완료!")
 
 if __name__ == "__main__":
     main()
