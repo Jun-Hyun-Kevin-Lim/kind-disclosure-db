@@ -1,13 +1,4 @@
 requests
-feedparser
-beautifulsoup4
-pandas
-openpyxl
-xlrd
 gspread
 google-auth
-tabula-py
-pdfplumber
-tenacity
-lxml
-html5lib
+playwright
