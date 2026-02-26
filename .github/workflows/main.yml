@@ -1,0 +1,27 @@
+name: KIND Scraper Daily
+
+on:
+  schedule:
+    # 한국 시간 기준 월~금 오후 6시 실행 (UTC 기준 09:00)
+    - cron: '0 9 * * 1-5'
+  workflow_dispatch:
+
+jobs:
+  run-scraper:
+    runs-on: ubuntu-latest
+    steps:
+    - name: 저장소 코드 가져오기
+      uses: actions/checkout@v3
+
+    - name: 파이썬 세팅
+      uses: actions/setup-python@v4
+      with:
+        python-version: '3.10'
+
+    - name: 필수 부품 설치
+      run: pip install -r requirements.txt
+
+    - name: 파이썬 로봇 실행!
+      env:
+        GOOGLE_CREDS: ${{ secrets.GOOGLE_CREDS }}
+      run: python scraper.py
