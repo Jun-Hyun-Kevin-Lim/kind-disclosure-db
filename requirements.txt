@@ -1,12 +1,13 @@
 requests
 feedparser
-gspread
-google-auth
-playwright
+beautifulsoup4
 pandas
 openpyxl
 xlrd
+gspread
+google-auth
+tabula-py
 pdfplumber
+tenacity
 lxml
-beautifulsoup4
 html5lib
