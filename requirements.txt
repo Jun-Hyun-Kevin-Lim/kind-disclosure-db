@@ -1,5 +1,7 @@
 feedparser
 pandas
 lxml
-openpyxl
+beautifulsoup4
 playwright
+gspread
+google-auth
