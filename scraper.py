@@ -1,114 +1,199 @@
 import os
-import json
-import requests
-from bs4 import BeautifulSoup
-import pandas as pd
-import gspread
-from google.oauth2.service_account import Credentials
 import re
-from datetime import datetime, timedelta, timezone
+import json
+from datetime import datetime
+from pathlib import Path
 
-# 1. 구글 시트 연결
-SHEET_NAME = "KIND_대경"
-KEYWORDS = ["유상증자", "전환사채", "신주인수권부사채", "교환사채"]
+import feedparser
+import pandas as pd
+from playwright.sync_api import sync_playwright
 
-creds_json = os.environ.get('GOOGLE_CREDS')
-creds_dict = json.loads(creds_json)
-scopes = ['https://www.googleapis.com/auth/spreadsheets', 'https://www.googleapis.com/auth/drive']
-credentials = Credentials.from_service_account_info(creds_dict, scopes=scopes)
-gc = gspread.authorize(credentials)
 
-doc = gc.open(SHEET_NAME)
+# ======================
+# 설정
+# ======================
+RSS_URL = os.getenv(
+    "RSS_URL",
+    "http://kind.krx.co.kr:80/disclosure/rsstodaydistribute.do?method=searchRssTodayDistribute&mktTpCd=0&currentPageSize=100",
+)
 
-# 2. 데이터 정제 (할인율, 빈칸 완벽 처리)
-def clean_dataframe(df):
-    df = df.fillna('없음')
-    df = df.astype(str)
-    df = df.replace(to_replace=r'^\s*-\s*$', value='없음', regex=True)
-    df = df.replace(to_replace=r'^\s*$', value='없음', regex=True)
-    df = df.replace(['nan', 'NaN', 'None', 'null'], '없음')
-    return df
+# 팀장님 말처럼 "보고서명 키워드"로 잡기
+KEYWORDS = [x.strip() for x in os.getenv("KEYWORDS", "유상증자,전환사채,교환사채").split(",") if x.strip()]
 
-# 3. 날짜 설정 (외국 서버 시간을 한국 시간으로 변경)
-kst = timezone(timedelta(hours=9))
-today = datetime.now(kst).strftime("%Y-%m-%d")
+BASE = "https://kind.krx.co.kr"
+OUTDIR = Path(os.getenv("OUTDIR", "out"))
+SEEN_FILE = Path(os.getenv("SEEN_FILE", "seen.json"))
 
-# ★★★ 테스트용: 아래 줄의 맨 앞 '#'을 지우면 2월 20일(로지스몬 있던 날) 데이터로 테스트할 수 있습니다! ★★★
-today = "2026-02-20" 
+HEADLESS = os.getenv("HEADLESS", "true").lower() == "true"
 
-print(f"📅 검색 기준일: {today}")
 
-# 4. 해당 날짜의 공시 3000개 싹 다 가져오기
-url = "https://kind.krx.co.kr/disclosure/todaydisclosure.do"
-payload = {
-    'method': 'searchTodayDisclosureSub',
-    'currentPageSize': '3000', 
-    'pageIndex': '1',
-    'orderMode': '0',
-    'orderStat': 'D',
-    'forward': 'todaydisclosure_sub',
-    'todayFlag': 'Y',
-    'selDate': today
-}
-headers = {"User-Agent": "Mozilla/5.0"}
+def load_seen() -> set[str]:
+    if SEEN_FILE.exists():
+        try:
+            return set(json.loads(SEEN_FILE.read_text(encoding="utf-8")))
+        except Exception:
+            return set()
+    return set()
 
-res = requests.post(url, data=payload, headers=headers)
-soup = BeautifulSoup(res.text, 'html.parser')
-result_rows = soup.select('tbody tr')
 
-if not result_rows or "결과가 없습니다" in result_rows[0].text:
-    print("해당 날짜에는 올라온 공시가 아예 없습니다.")
-    exit()
+def save_seen(seen: set[str]) -> None:
+    SEEN_FILE.write_text(json.dumps(sorted(list(seen)), ensure_ascii=False, indent=2), encoding="utf-8")
 
-print(f"✅ 총 {len(result_rows)}개의 공시를 가져와서 필터링을 시작합니다.\n")
 
-# 5. 키워드별로 찾아서 표 긁어오고 구글 시트에 꽂기
-for keyword in KEYWORDS:
-    worksheet = doc.worksheet(keyword)
-    all_sheet_data = []
-    found_count = 0
-    
-    for row in result_rows:
-        title_tag = row.select_one('a[onclick*="openDisclsViewer"]')
-        if not title_tag: continue
-            
-        report_title = title_tag.text.strip()
-        
-        if keyword in report_title:
-            company_tag = row.select_one('.first')
-            company_name = company_tag.text.strip() if company_tag else "알수없음"
-            
-            onclick_text = title_tag.get('onclick', '')
-            acptno_match = re.search(r"openDisclsViewer\('(\d+)'\)", onclick_text)
-            
-            if acptno_match:
-                acptno = acptno_match.group(1)
-                popup_url = f"https://kind.krx.co.kr/common/disclsviewer.do?method=search&acptno={acptno}"
-                
+def extract_acpt_no(text: str) -> str | None:
+    # RSS link/guid 등에서 acptNo=숫자 추출
+    m = re.search(r"acptNo=(\d{14})", text or "")
+    return m.group(1) if m else None
+
+
+def match_keyword(title: str) -> bool:
+    if not title:
+        return False
+    return any(k in title for k in KEYWORDS)
+
+
+def sanitize_filename(name: str) -> str:
+    name = re.sub(r"[\\/:*?\"<>|]", "_", name)
+    name = re.sub(r"\s+", " ", name).strip()
+    return name[:180] if len(name) > 180 else name
+
+
+def viewer_url(acpt_no: str) -> str:
+    # 공시 클릭하면 뜨는 "새창/팝업" 주소 형태
+    return f"{BASE}/common/disclsviewer.do?method=searchInitInfo&acptNo={acpt_no}&docno="
+
+
+def pick_best_frame_html(page) -> str:
+    """
+    공시뷰어는 본문이 iframe/frame 안에 있을 때가 많아서,
+    page.frames 전체를 훑고 table이 가장 많은 frame의 HTML을 선택.
+    """
+    best_html = ""
+    best_count = -1
+    for fr in page.frames:
+        try:
+            html = fr.content()
+            cnt = html.lower().count("<table")
+            if cnt > best_count:
+                best_count = cnt
+                best_html = html
+        except Exception:
+            continue
+    return best_html
+
+
+def extract_tables_from_html(html: str) -> list[pd.DataFrame]:
+    dfs = pd.read_html(html)  # HTML 내 모든 table 추출
+    cleaned = []
+    for df in dfs:
+        df = df.copy().where(pd.notnull(df), "")
+        cleaned.append(df)
+    return cleaned
+
+
+def dump_tables_to_excel(dfs: list[pd.DataFrame], out_path: Path, title_line: str):
+    sheet = "dump"
+    with pd.ExcelWriter(out_path, engine="openpyxl") as writer:
+        row = 0
+        pd.DataFrame([[title_line]]).to_excel(writer, sheet_name=sheet, startrow=row, index=False, header=False)
+        row += 2
+
+        for i, df in enumerate(dfs):
+            pd.DataFrame([[f"tableIndex: {i}"]]).to_excel(
+                writer, sheet_name=sheet, startrow=row, index=False, header=False
+            )
+            row += 1
+            df.to_excel(writer, sheet_name=sheet, startrow=row, index=False)
+            row += len(df) + 3
+
+
+def main():
+    OUTDIR.mkdir(parents=True, exist_ok=True)
+    seen = load_seen()
+
+    feed = feedparser.parse(RSS_URL)
+    items = feed.entries or []
+
+    targets = []
+    for it in items:
+        title = getattr(it, "title", "") or ""
+        link = getattr(it, "link", "") or ""
+        guid = getattr(it, "guid", "") or ""
+
+        if not match_keyword(title):
+            continue
+
+        acpt_no = extract_acpt_no(link) or extract_acpt_no(guid)
+        if not acpt_no:
+            continue
+
+        if acpt_no in seen:
+            continue
+
+        targets.append((acpt_no, title))
+
+    if not targets:
+        print("[INFO] 처리할 대상이 없습니다. (키워드 매칭/중복 제외 결과 0건)")
+        return
+
+    ts = datetime.now().strftime("%Y-%m-%dT%H-%M-%S")
+
+    with sync_playwright() as p:
+        browser = p.chromium.launch(
+            headless=HEADLESS,
+            args=[
+                "--disable-blink-features=AutomationControlled",
+                "--no-sandbox",
+            ],
+        )
+        context = browser.new_context(
+            locale="ko-KR",
+            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120 Safari/537.36",
+            viewport={"width": 1400, "height": 900},
+        )
+
+        for acpt_no, title in targets:
+            url = viewer_url(acpt_no)
+
+            page = context.new_page()
+            try:
+                page.goto(url, wait_until="networkidle", timeout=60000)
+                page.wait_for_timeout(1500)  # 렌더링 안정화
+
+                html = pick_best_frame_html(page)
+                if not html or html.lower().count("<table") == 0:
+                    # 디버그용 HTML 저장
+                    dbg = OUTDIR / f"debug_{acpt_no}.html"
+                    dbg.write_text(page.content(), encoding="utf-8")
+                    print(f"[WARN] table 0개로 보임: {acpt_no} (debug 저장: {dbg})")
+                    page.close()
+                    continue
+
+                dfs = extract_tables_from_html(html)
+
+                safe_title = sanitize_filename(title) if title else f"acptNo={acpt_no}"
+                out_path = OUTDIR / f"kind_popup_dump_{ts}_{acpt_no}.xlsx"
+                title_line = f"{safe_title} (acptNo: {acpt_no})"
+
+                dump_tables_to_excel(dfs, out_path, title_line)
+
+                seen.add(acpt_no)
+                print(f"[OK] {acpt_no} tables={len(dfs)} -> {out_path}")
+
+            except Exception as e:
+                print(f"[ERROR] {acpt_no} 실패: {e}")
+            finally:
                 try:
-                    tables = pd.read_html(requests.get(popup_url, headers=headers).text)
-                    all_sheet_data.append([f"1. [{company_name}] {report_title} (acptNo: {acptno})"])
-                    
-                    for i, table in enumerate(tables):
-                        clean_table = clean_dataframe(table)
-                        col_count = len(clean_table.columns) if len(clean_table.columns) > 0 else 1
-                        
-                        all_sheet_data.append([f"tableIndex: {i}"] + [""] * (col_count - 1))
-                        all_sheet_data.append(clean_table.columns.tolist())
-                        all_sheet_data.extend(clean_table.values.tolist())
-                        
-                    all_sheet_data.append([""]) # 빈 줄
-                    found_count += 1
-                    print(f"  -> 득템! [{company_name}] {report_title} 긁어옴!")
-                    
-                except Exception as e:
-                    print(f"  -> 에러: {company_name} 표 추출 실패 ({e})")
+                    page.close()
+                except Exception:
+                    pass
 
-    if all_sheet_data:
-        worksheet.clear()
-        worksheet.update('A1', all_sheet_data)
-        print(f"🚀 '{keyword}' 시트에 {found_count}개 꽂아 넣기 완료!\n")
-    else:
-        print(f"  -> '{keyword}' 공시는 없어서 패스!\n")
+        context.close()
+        browser.close()
 
-print("🎉 모든 작업 완료!")
+    save_seen(seen)
+    print(f"[DONE] 완료. OUTDIR={OUTDIR} / seen={len(seen)}")
+
+
+if __name__ == "__main__":
+    main()
