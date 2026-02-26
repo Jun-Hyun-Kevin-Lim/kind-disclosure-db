@@ -1,67 +1,222 @@
-import os, json, time, re
-from datetime import datetime, timedelta
+import os, json, re, time
+from datetime import datetime, timezone
+from urllib.parse import urlparse, parse_qs
+
 import requests
+import pandas as pd
+import feedparser
 import gspread
 from google.oauth2.service_account import Credentials
+
+# (fallback) playwright
 from playwright.sync_api import sync_playwright
 
+
 # =========================
-# 설정 (사진에 나온 4개 탭 및 9개 컬럼)
+# 0) Config
 # =========================
-SHEET_NAME = "KIND_대경"
-SEEN_FILE = "seen.json"
-BASE = "https://kind.krx.co.kr"
+KIND_RSS_URL = os.getenv(
+    "KIND_RSS_URL",
+    "http://kind.krx.co.kr:80/disclosure/rsstodaydistribute.do?method=searchRssTodayDistribute&mktTpCd=0&currentPageSize=100"
+)
+BASE_POPUP_URL = "https://kind.krx.co.kr/common/disclsviewer.do"
 
-KEYWORDS = ["유상증자", "전환사채", "신주인수권부사채", "교환사채"]
-COLS = ["ID", "수집시간", "공시일시", "회사명", "상장시장", "공시제목", "Excel Link", "PDF Link", "공시링크"]
+TARGET_KEYWORDS = [
+    "유상증자결정",
+    "전환사채권발행결정",
+    "교환사채권발행결정",
+]
 
-# 테스트/실전을 위해 무조건 최근 7일 동안의 공시를 검색
-SEARCH_DAYS_AGO = 7 
+SHEET_ID = os.environ["GOOGLE_SHEET_ID"]
+CREDS_JSON = os.environ["GOOGLE_CREDENTIALS_JSON"]
 
-def load_json(filepath, default_val):
-    if os.path.exists(filepath):
+TAB_RAW = "RAW_POPUP"
+TAB_SEEN = "SEEN"
+TAB_LOGS = "LOGS"
+
+
+# =========================
+# 1) Google Sheet connect
+# =========================
+def open_sheet():
+    creds_dict = json.loads(CREDS_JSON)
+    scopes = [
+        "https://www.googleapis.com/auth/spreadsheets",
+        "https://www.googleapis.com/auth/drive",
+    ]
+    creds = Credentials.from_service_account_info(creds_dict, scopes=scopes)
+    gc = gspread.authorize(creds)
+    sh = gc.open_by_key(SHEET_ID)
+    return sh
+
+
+# =========================
+# 2) Helpers
+# =========================
+def now_ts():
+    return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+
+
+def safe_str(x):
+    if x is None:
+        return ""
+    return str(x).strip()
+
+
+def extract_acptno(link: str) -> str:
+    # link 예: ...disclsviewer.do?method=searchInitInfo&acptNo=202602200001169&docno=
+    q = parse_qs(urlparse(link).query)
+    return safe_str(q.get("acptNo", [""])[0])
+
+
+def is_target_title(title: str) -> bool:
+    t = safe_str(title)
+    return any(k in t for k in TARGET_KEYWORDS)
+
+
+def read_seen_ids(ws_seen):
+    # SEEN 탭 A열에 id가 쌓인다고 가정
+    col = ws_seen.col_values(1)
+    # 첫 행 헤더 제거
+    ids = set(x.strip() for x in col[1:] if x.strip())
+    return ids
+
+
+def log_append(ws_logs, status, _id, title, error=""):
+    ws_logs.append_row([now_ts(), status, _id, title, error], value_input_option="RAW")
+
+
+# =========================
+# 3) Fetch popup HTML (requests)
+# =========================
+def fetch_popup_html_requests(acpt_no: str, docno: str = "") -> str:
+    headers = {
+        "User-Agent": "Mozilla/5.0",
+        "Referer": "https://kind.krx.co.kr/",
+    }
+    params = {"method": "searchInitInfo", "acptNo": acpt_no, "docno": docno}
+    r = requests.get(BASE_POPUP_URL, params=params, headers=headers, timeout=30)
+    r.raise_for_status()
+    r.encoding = r.apparent_encoding
+    return r.text
+
+
+# =========================
+# 4) Fetch popup HTML (playwright fallback)
+# =========================
+def fetch_popup_html_playwright(acpt_no: str, docno: str = "") -> str:
+    params = f"method=searchInitInfo&acptNo={acpt_no}&docno={docno}"
+    url = f"{BASE_POPUP_URL}?{params}"
+
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=True)
+        page = browser.new_page()
+        page.goto(url, wait_until="networkidle", timeout=60000)
+        html = page.content()
+        browser.close()
+        return html
+
+
+# =========================
+# 5) Parse all tables
+# =========================
+def parse_tables_from_html(html: str) -> list[pd.DataFrame]:
+    tables = pd.read_html(html)  # list of dfs
+    cleaned = []
+    for df in tables:
+        df = df.fillna("").astype(str)
+        cleaned.append(df)
+    return cleaned
+
+
+# =========================
+# 6) Dump like screenshot (tableIndex)
+# =========================
+def build_dump_rows(title: str, link: str, acpt_no: str, tables: list[pd.DataFrame]):
+    rows = []
+    rows.append([f"{title} (acptNo: {acpt_no})"])
+    rows.append([link])
+    rows.append([""])
+
+    for i, df in enumerate(tables):
+        rows.append([f"tableIndex: {i}"])
+        # 컬럼이 숫자/NaN일 수도 있으니 문자열로
+        cols = [safe_str(c) for c in df.columns.tolist()]
+        rows.append(cols)
+        for r in df.values.tolist():
+            rows.append([safe_str(x) for x in r])
+        rows.append([""])
+        rows.append([""])
+    return rows
+
+
+def append_dump(ws_raw, rows):
+    ws_raw.append_rows(rows, value_input_option="RAW")
+
+
+# =========================
+# 7) Main: RSS → filter → dedup → dump
+# =========================
+def run():
+    sh = open_sheet()
+    ws_raw = sh.worksheet(TAB_RAW)
+    ws_seen = sh.worksheet(TAB_SEEN)
+    ws_logs = sh.worksheet(TAB_LOGS)
+
+    seen = read_seen_ids(ws_seen)
+
+    feed = feedparser.parse(KIND_RSS_URL)
+    items = feed.entries if hasattr(feed, "entries") else []
+
+    # 최신부터 처리하고 싶으면 reverse 조정
+    processed = 0
+
+    for it in items:
+        title = safe_str(getattr(it, "title", ""))
+        link = safe_str(getattr(it, "link", ""))
+        if not title or not link:
+            continue
+        if not is_target_title(title):
+            continue
+
+        acpt_no = extract_acptno(link)
+        if not acpt_no:
+            continue
+
+        _id = f"KIND:{acpt_no}"
+        if _id in seen:
+            continue
+
         try:
-            with open(filepath, "r", encoding="utf-8") as f: return json.load(f)
-        except: pass
-    return default_val
+            # 1) requests 시도
+            html = fetch_popup_html_requests(acpt_no)
+            tables = parse_tables_from_html(html)
 
-def save_json(filepath, data):
-    with open(filepath, "w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False, indent=2)
+            # 표가 너무 적거나 0개면 playwright로 재시도
+            if len(tables) == 0:
+                html = fetch_popup_html_playwright(acpt_no)
+                tables = parse_tables_from_html(html)
 
-def connect_gs():
-    creds_dict = json.loads(os.environ["GOOGLE_CREDS"])
-    creds = Credentials.from_service_account_info(
-        creds_dict, scopes=["https://www.googleapis.com/auth/spreadsheets", "https://www.googleapis.com/auth/drive"]
-    )
-    client = gspread.authorize(creds)
-    sh = client.open(SHEET_NAME)
-    tabs, existing_acptnos = {}, set()
+            rows = build_dump_rows(title, link, acpt_no, tables)
+            append_dump(ws_raw, rows)
 
-    for kw in KEYWORDS:
-        try:
-            ws = sh.worksheet(kw)
-            acpts = ws.col_values(9)[1:] # I열(공시링크) 가져오기
-            for acpt in acpts:
-                m = re.search(r"acptno=(\d+)", str(acpt), re.I)
-                if m: existing_acptnos.add(m.group(1))
-        except gspread.exceptions.WorksheetNotFound:
-            print(f"[GS] '{kw}' 시트 생성 중...")
-            ws = sh.add_worksheet(title=kw, rows="1000", cols="10")
-            ws.append_row(COLS)
-        tabs[kw] = ws
-    return tabs, existing_acptnos
+            # SEEN 기록
+            ws_seen.append_row([_id, now_ts(), title, link], value_input_option="RAW")
+            log_append(ws_logs, "OK", _id, title, "")
 
-def get_next_id(ws):
-    col = ws.col_values(1)
-    if len(col) <= 1: return 1
-    return max([int(v) for v in col[1:] if str(v).strip().isdigit()] + [0]) + 1
+            seen.add(_id)
+            processed += 1
 
-# 첨부파일 링크(Excel, PDF) 확보 로직
-def get_attachment_links(acptno):
-    header_url = f"{BASE}/common/disclsviewer.do?method=header&acptno={acptno}"
-    excel_link, pdf_link = "", ""
-    try:
+            time.sleep(1.0)  # KIND 부하/차단 방지용
+
+        except Exception as e:
+            log_append(ws_logs, "ERROR", _id, title, repr(e))
+
+    print(f"done. processed={processed}")
+
+
+if __name__ == "__main__":
+    run()    try:
         r = requests.get(header_url, timeout=10)
         for m in re.finditer(r'<option\s+value="(\d+)\|([^"]+)"', r.text):
             dl_url = f"https://kind.krx.co.kr/common/applcmn.do?method=download&apndNo={m.group(1)}"
