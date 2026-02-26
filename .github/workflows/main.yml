@@ -24,7 +24,7 @@ jobs:
       - name: Run
         env:
           GOOGLE_SHEET_ID: ${{ secrets.GOOGLE_SHEET_ID }}
-          GOOGLE_CREDENTIALS_JSON: ${{ secrets.GOOGLE_CREDENTIALS_JSON }}
+          GOOGLE_CREDENTIALS_JSON: ${{ secrets.GOOGLE_CREDS }}
           HEADLESS: "true"
           KEYWORDS: "유상증자,전환사채,교환사채"
           LIMIT: "20"
