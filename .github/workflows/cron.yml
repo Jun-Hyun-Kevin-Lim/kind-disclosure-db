@@ -3,7 +3,7 @@ name: kind-popup-to-sheet
 on:
   workflow_dispatch:
   schedule:
-    - cron: "*/20 * * * *"  # 20분마다 (원하면 수정)
+    - cron: "*/20 * * * *"  # 20분마다
 
 jobs:
   run:
@@ -27,6 +27,7 @@ jobs:
         env:
           GOOGLE_CREDENTIALS_JSON: ${{ secrets.GOOGLE_CREDENTIALS_JSON }}
           GOOGLE_SHEET_ID: ${{ secrets.GOOGLE_SHEET_ID }}
+          # (선택) 미설정이면 빈 문자열이 들어갈 수 있어서 main.py에서 default 처리함
           KIND_RSS_URL: ${{ secrets.KIND_RSS_URL }}
         run: |
           python main.py
