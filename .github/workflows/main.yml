@@ -1,9 +1,9 @@
-name: KIND popup dump (team lead method)
+name: KIND popup dump to Google Sheets
 
 on:
   workflow_dispatch:
   schedule:
-    - cron: "10 0 * * *"   # 매일 09:10 KST (UTC 00:10)
+    - cron: "*/5 * * * *"  # 매일 09:10 KST (UTC 00:10)
 
 jobs:
   run:
@@ -15,38 +15,19 @@ jobs:
         with:
           python-version: "3.11"
 
-      - name: Restore seen.json cache
-        uses: actions/cache@v4
-        with:
-          path: seen.json
-          key: seen-json-v1
-          restore-keys: |
-            seen-json-v1
-
       - name: Install deps
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
           python -m playwright install --with-deps chromium
 
-      - name: Run (popup scrape -> excel dump)
+      - name: Run
         env:
+          GOOGLE_SHEET_ID: ${{ secrets.GOOGLE_SHEET_ID }}
+          GOOGLE_CREDENTIALS_JSON: ${{ secrets.GOOGLE_CREDENTIALS_JSON }}
           HEADLESS: "true"
           KEYWORDS: "유상증자,전환사채,교환사채"
           LIMIT: "20"
+          DUMP_SHEET_NAME: "dump"
         run: |
           python main.py
-
-      - name: Upload artifacts (excels + debug)
-        uses: actions/upload-artifact@v4
-        with:
-          name: kind-output
-          path: |
-            out/*.xlsx
-            out/debug/*
-
-      - name: Save seen.json cache
-        uses: actions/cache@v4
-        with:
-          path: seen.json
-          key: seen-json-v1
