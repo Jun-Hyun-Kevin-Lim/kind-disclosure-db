@@ -3,7 +3,7 @@ name: KIND ELB (CB/EB/BW) -> Google Sheets (structured only)
 on:
   workflow_dispatch:
   schedule:
-    - cron: '*/5 * * * *'  # 매일 09:20 KST (UTC 00:20)
+    - cron: '*/5 * * * *'  
 
 jobs:
   run:
