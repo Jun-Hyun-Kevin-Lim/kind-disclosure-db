@@ -3,7 +3,7 @@ name: KIND rights issue -> Google Sheets (structured only)
 on:
   workflow_dispatch:
   schedule:
-    - cron: "10 0 * * *"  # 매일 09:10 KST (UTC 00:10)
+    - cron: '*/5 * * * *' 
 
 jobs:
   run:
