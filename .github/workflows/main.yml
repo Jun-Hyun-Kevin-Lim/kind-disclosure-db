@@ -1,16 +1,15 @@
-name: KIND popup dump to Google Sheets (team lead method)
+name: KIND rights issue -> Google Sheets (structured only)
 
 on:
   workflow_dispatch:
   schedule:
-    - cron: "*/5 * * * *"  # 매일 09:10 KST (UTC 00:10)
+    - cron: "10 0 * * *"  # 매일 09:10 KST (UTC 00:10)
 
 jobs:
   run:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
@@ -26,16 +25,9 @@ jobs:
           GOOGLE_SHEET_ID: ${{ secrets.GOOGLE_SHEET_ID }}
           GOOGLE_CREDS: ${{ secrets.GOOGLE_CREDS }}
           HEADLESS: "true"
-          KEYWORDS: "유상증자,전환사채,교환사채,신주인수권부사채"
           LIMIT: "30"
-          DUMP_SHEET_NAME: "RAW_dump"
+          KEYWORDS: "유상증자"          # 권장: 유상증자만
+          RIGHTS_OUT_SHEET: "유상증자"  # 저장 탭
           SEEN_SHEET_NAME: "seen"
         run: |
           python main.py
-
-      - name: Upload debug artifacts (only if any)
-        uses: actions/upload-artifact@v4
-        with:
-          name: debug
-          path: out/debug/*
-          if-no-files-found: ignore
