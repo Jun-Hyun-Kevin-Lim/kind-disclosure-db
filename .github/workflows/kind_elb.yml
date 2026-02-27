@@ -1,0 +1,36 @@
+name: KIND ELB (CB/EB/BW) -> Google Sheets (structured only)
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "20 0 * * *"  # 매일 09:20 KST (UTC 00:20)
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          python -m playwright install --with-deps chromium
+
+      - name: Run
+        env:
+          GOOGLE_SHEET_ID: ${{ secrets.GOOGLE_SHEET_ID }}
+          GOOGLE_CREDS: ${{ secrets.GOOGLE_CREDS }}
+
+          HEADLESS: "true"
+          LIMIT: "30"
+          KEYWORDS: "전환사채,교환사채,신주인수권부사채"
+
+          BOND_OUT_SHEET: "주식연계채권"
+          SEEN_SHEET_NAME: "seen_elb"
+          USE_SEEN: "true"
+        run: |
+          python main_elb.py
