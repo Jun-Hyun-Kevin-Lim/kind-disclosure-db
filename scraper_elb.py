@@ -5,7 +5,7 @@ import time
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import List, Optional, Tuple, Set, Dict
+from typing import List, Optional, Tuple, Set, Dict, Any
 
 import feedparser
 import pandas as pd
@@ -147,6 +147,12 @@ def _norm(s: str) -> str:
     s = s.replace(":", "")
     return s
 
+def _strip_leading_numbering(s: str) -> str:
+    # "3. 정정사항" / "1)" / "2)" 등 제거
+    t = (s or "").strip()
+    t = re.sub(r"^\s*\d+\s*[\.\)]\s*", "", t)
+    return t
+
 def _to_int(s: str) -> Optional[int]:
     if s is None:
         return None
@@ -196,7 +202,7 @@ def viewer_url(acpt_no: str, docno: str = "") -> str:
 def match_keyword(title: str) -> bool:
     return bool(title) and any(k in title for k in KEYWORDS)
 
-# ✅ 구분: 라벨 후보 없이 제목 기반 고정
+# ✅ 구분: 제목 기반 고정
 def bond_code_from_title(title: str) -> str:
     t = title or ""
     if "교환사채" in t:
@@ -206,6 +212,10 @@ def bond_code_from_title(title: str) -> str:
     if "신주인수권부사채" in t:
         return "BW"
     return ""
+
+# ✅ 정정 감지: "정정"이 맨 앞에 붙은 케이스만
+def is_correction_title(title: str) -> bool:
+    return (title or "").lstrip().startswith("정정")
 
 
 # ==========================================================
@@ -258,7 +268,8 @@ def frame_score(html: str) -> int:
         "권면총액", "표면이자율", "만기이자율", "사채만기일",
         "전환청구기간", "교환청구기간", "권리행사기간",
         "조기상환청구권", "매도청구권", "call option", "put option",
-        "특정인에 대한 대상자별", "조달자금의 구체적 사용 목적"
+        "특정인에 대한 대상자별", "조달자금의 구체적 사용 목적",
+        "정정사항", "정정 전", "정정 후"
     ]
     bonus = sum(1 for w in bonus_words if w in lower)
     length_bonus = min(len(lower) // 2000, 50)
@@ -401,6 +412,12 @@ def build_index(ws, headers: List[str], key_field: str) -> Dict[str, int]:
             idx[vv] = r
     return idx
 
+def update_row(ws, headers: List[str], row: int, record: dict):
+    ensure_headers(ws, headers)
+    row_vals = [record.get(h, "") for h in headers]
+    end = rowcol_to_a1(row, len(headers))
+    ws.update(f"A{row}:{end}", [row_vals])
+
 def upsert(ws, headers: List[str], index: Dict[str, int], record: dict, key_field: str):
     ensure_headers(ws, headers)
     key = str(record.get(key_field, "")).strip()
@@ -412,7 +429,52 @@ def upsert(ws, headers: List[str], index: Dict[str, int], record: dict, key_fiel
         ws.update(f"A{r}:{end}", [row_vals])
     else:
         ws.append_row(row_vals, value_input_option="RAW")
+        # append 이후 row 번호 재계산 (단순)
         index[key] = len(ws.col_values(1))
+
+def make_fingerprint(rec: Dict[str, Any]) -> str:
+    # 정정공시에서 원문 접수번호를 못 찾을 때 fallback 매칭 키
+    comp = _norm(rec.get("회사명", ""))
+    kind = (rec.get("구분", "") or "").strip()
+    dt = _norm(rec.get("최초 이사회결의일", ""))
+    if not comp or not kind or not dt:
+        return ""
+    return f"{comp}|{kind}|{dt}"
+
+def build_fingerprint_index(ws, headers: List[str]) -> Dict[str, int]:
+    """
+    1회 호출로 전체값을 가져와 fingerprint -> row 를 구축 (정정 fallback용)
+    """
+    ensure_headers(ws, headers)
+    values = ws.get_all_values()
+    if not values or len(values) < 2:
+        return {}
+
+    hdr = values[0]
+    def _idx(name: str) -> int:
+        return hdr.index(name) if name in hdr else -1
+
+    i_comp = _idx("회사명")
+    i_kind = _idx("구분")
+    i_dt = _idx("최초 이사회결의일")
+    i_key = _idx("접수번호")
+
+    if min(i_comp, i_kind, i_dt, i_key) < 0:
+        return {}
+
+    fp_idx: Dict[str, int] = {}
+    for r in range(2, len(values) + 1):
+        row = values[r - 1]
+        comp = row[i_comp] if i_comp < len(row) else ""
+        kind = row[i_kind] if i_kind < len(row) else ""
+        dt = row[i_dt] if i_dt < len(row) else ""
+        key = row[i_key] if i_key < len(row) else ""
+        if not key or not str(key).strip().isdigit():
+            continue
+        fp = f"{_norm(comp)}|{(kind or '').strip()}|{_norm(dt)}"
+        if fp and fp not in fp_idx:
+            fp_idx[fp] = r
+    return fp_idx
 
 
 # ==========================================================
@@ -614,9 +676,191 @@ def extract_ytc_from_text(call_text: str, put_text: str) -> str:
 
 
 # ==========================================================
+# ✅ 정정사항(3. 정정사항 표) 처리
+# ==========================================================
+def _build_label_lookup() -> List[Tuple[str, str]]:
+    """
+    정정사항 표의 '항목' 텍스트를 BOND_COLUMNS 필드로 매핑하기 위한 룩업 테이블.
+    """
+    pairs: List[Tuple[str, str]] = []
+    for field, labels in LABEL_MAP.items():
+        for lb in labels:
+            pairs.append((_norm(lb), field))
+
+    # 기간 라벨도 매핑 (정정사항 표에 "전환청구기간 시작일" 등이 들어올 수 있음)
+    for lb in START_LABELS_PERIOD_START:
+        pairs.append((_norm(lb), "전환청구 시작"))
+    for lb in START_LABELS_PERIOD_END:
+        pairs.append((_norm(lb), "전환청구 종료"))
+
+    # 자주 나오는 섹션명도(혹시 정정사항 표에 직접 들어오는 경우)
+    pairs.append((_norm("조달자금의 구체적 사용 목적"), "자금용도"))
+    pairs.append((_norm("발행 대상자명"), "투자자"))
+    pairs.append((_norm("발행대상자명"), "투자자"))
+
+    # Put/Call 섹션명
+    pairs.append((_norm("조기상환청구권(Put Option)에 관한 사항"), "Put Option"))
+    pairs.append((_norm("매도청구권(Call Option)에 관한 사항"), "Call Option"))
+
+    # 중복 제거
+    uniq = {}
+    for k, v in pairs:
+        if k and k not in uniq:
+            uniq[k] = v
+    # 길이 긴 후보가 매칭 우선이 되도록 정렬
+    out = list(uniq.items())
+    out.sort(key=lambda x: len(x[0]), reverse=True)
+    return out
+
+LABEL_LOOKUP = _build_label_lookup()
+
+def map_item_to_field(item_text: str) -> str:
+    t = _strip_leading_numbering(item_text or "")
+    tn = _norm(t)
+    if not tn:
+        return ""
+
+    # 가장 긴 후보부터 부분포함 매칭
+    for cand_norm, field in LABEL_LOOKUP:
+        if not cand_norm:
+            continue
+        if cand_norm in tn or tn in cand_norm:
+            return field
+    return ""
+
+def extract_correction_overrides_and_meta(dfs: List[pd.DataFrame]) -> Tuple[Dict[str, str], Optional[str]]:
+    """
+    정정사항 표에서 '정정 후' 값을 우선으로 필드별 override를 만들고,
+    가능하면 '정정 전 접수번호(원문 acptNo)'도 함께 추출한다.
+    """
+    overrides: Dict[str, str] = {}
+    original_acpt_no: Optional[str] = None
+
+    def _is_pre_header(x: str) -> bool:
+        xn = _norm(x)
+        return ("정정전" in xn) or (("정정" in xn) and ("전" in xn))
+
+    def _is_post_header(x: str) -> bool:
+        xn = _norm(x)
+        return ("정정후" in xn) or (("정정" in xn) and ("후" in xn))
+
+    def _is_item_header(x: str) -> bool:
+        xn = _norm(x)
+        return ("항목" in xn) or ("정정사항" in xn) or ("정정내용" in xn) or ("구분" == xn)
+
+    for df in dfs:
+        arr = df.astype(str).values
+        R, C = arr.shape
+        if R == 0 or C == 0:
+            continue
+
+        # 정정사항 관련 테이블 후보 빠르게 필터
+        flat = " ".join(_norm(str(x)) for x in arr.flatten() if str(x).strip() and str(x).lower() != "nan")
+        if ("정정사항" not in flat) and ("정정전" not in flat) and ("정정후" not in flat):
+            continue
+
+        header_r = None
+        col_pre = None
+        col_post = None
+        col_item = None
+
+        # 1) 헤더 행 탐색 (정정 전/정정 후가 같은 행에 있는 케이스)
+        for r in range(R):
+            row = [str(arr[r][c]) for c in range(C)]
+            pre_cols = [c for c, v in enumerate(row) if _is_pre_header(v)]
+            post_cols = [c for c, v in enumerate(row) if _is_post_header(v)]
+            if post_cols:
+                header_r = r
+                col_post = post_cols[0]
+                col_pre = pre_cols[0] if pre_cols else None
+
+                item_cols = [c for c, v in enumerate(row) if _is_item_header(v)]
+                if item_cols:
+                    col_item = item_cols[0]
+                else:
+                    # 항목 헤더가 없으면, 정정전/정정후가 아닌 첫 컬럼을 항목으로
+                    for c in range(C):
+                        if c != col_post and (col_pre is None or c != col_pre):
+                            col_item = c
+                            break
+                break
+
+        if header_r is None or col_post is None or col_item is None:
+            continue
+
+        last_field = ""
+        for r in range(header_r + 1, R):
+            item = str(arr[r][col_item]).strip() if col_item < C else ""
+            post = str(arr[r][col_post]).strip() if col_post < C else ""
+            pre = str(arr[r][col_pre]).strip() if (col_pre is not None and col_pre < C) else ""
+
+            if item.lower() == "nan":
+                item = ""
+            if post.lower() == "nan":
+                post = ""
+            if pre.lower() == "nan":
+                pre = ""
+
+            # 줄바꿈/병합 형태 처리: item이 비면 직전 항목 continuation으로 간주
+            if not item and last_field and post:
+                if overrides.get(last_field):
+                    overrides[last_field] = (overrides[last_field] + " " + post).strip()
+                else:
+                    overrides[last_field] = post.strip()
+                continue
+
+            if not item or not post:
+                continue
+
+            # 원문 접수번호 후보: 항목에 "접수번호"가 들어가고 pre가 14자리면 원문으로 채택
+            itemn = _norm(item)
+            if ("접수번호" in itemn or "acptno" in itemn.lower()) and (not original_acpt_no):
+                if re.fullmatch(r"\d{14}", _norm(pre)) if pre else False:
+                    original_acpt_no = _norm(pre)
+                # 혹시 post에 원문이 들어오는 반대 케이스도 보조로
+                if (not original_acpt_no) and re.fullmatch(r"\d{14}", _norm(post)):
+                    original_acpt_no = _norm(post)
+
+            field = map_item_to_field(item)
+            if not field:
+                last_field = ""
+                continue
+
+            overrides[field] = post.strip()
+            last_field = field
+
+    # 2) 표에서 못 찾았으면 텍스트에서 "정정 전" 주변 14자리로 한 번 더 시도
+    if not original_acpt_no:
+        text = dfs_to_text(dfs)
+        # 정정 전 ... acptNo=########## 형태
+        m = re.search(r"정정\s*전.{0,200}?acptNo=(\d{14})", text, flags=re.IGNORECASE)
+        if m:
+            original_acpt_no = m.group(1)
+        else:
+            # 정정전 근처 14자리 숫자
+            for mm in re.finditer(r"\d{14}", text):
+                s = max(0, mm.start() - 60)
+                e = min(len(text), mm.end() + 60)
+                win = _norm(text[s:e])
+                if "정정전" in win or ("정정" in win and "전" in win):
+                    original_acpt_no = mm.group(0)
+                    break
+
+    return overrides, original_acpt_no
+
+
+# ==========================================================
 # Parser
 # ==========================================================
-def parse_bond_record(dfs: List[pd.DataFrame], title: str, acpt_no: str, link: str) -> dict:
+def parse_bond_record(dfs: List[pd.DataFrame], title: str, acpt_no: str, link: str) -> Tuple[dict, dict]:
+    """
+    return: (record, meta)
+      meta = {
+        "is_correction": bool,
+        "original_acpt_no": Optional[str],
+        "overrides": Dict[str,str]
+      }
+    """
     rec = {k: "" for k in BOND_COLUMNS}
     rec["접수번호"] = acpt_no
     rec["링크"] = link
@@ -624,31 +868,47 @@ def parse_bond_record(dfs: List[pd.DataFrame], title: str, acpt_no: str, link: s
     # ✅ 구분: 제목 기반 (교환=EB / 전환=CB / 신주인수권부=BW)
     rec["구분"] = bond_code_from_title(title)
 
-    # Scalar fields
-    rec["회사명"] = scan_label_value(dfs, LABEL_MAP["회사명"]) or company_from_title(title)
-    rec["상장시장"] = scan_label_value(dfs, LABEL_MAP["상장시장"]) or market_from_title(title)
-    rec["최초 이사회결의일"] = scan_label_value(dfs, LABEL_MAP["최초 이사회결의일"])
+    corr = is_correction_title(title)
+    overrides: Dict[str, str] = {}
+    original_acpt_no: Optional[str] = None
+    if corr:
+        overrides, original_acpt_no = extract_correction_overrides_and_meta(dfs)
 
-    amt = _to_int(scan_label_value(dfs, LABEL_MAP["권면총액(원)"]))
+    def pick(field: str, candidates: List[str]) -> str:
+        # ✅ 정정 공시라면 정정 후 값이 있으면 최우선
+        v = overrides.get(field, "")
+        if v:
+            return v
+        return scan_label_value(dfs, candidates)
+
+    # Scalar fields
+    rec["회사명"] = (overrides.get("회사명") or pick("회사명", LABEL_MAP["회사명"]) or company_from_title(title))
+    rec["상장시장"] = (overrides.get("상장시장") or pick("상장시장", LABEL_MAP["상장시장"]) or market_from_title(title))
+    rec["최초 이사회결의일"] = overrides.get("최초 이사회결의일") or pick("최초 이사회결의일", LABEL_MAP["최초 이사회결의일"])
+
+    amt_raw = overrides.get("권면총액(원)") or pick("권면총액(원)", LABEL_MAP["권면총액(원)"])
+    amt = _to_int(amt_raw)
     if amt is not None:
         rec["권면총액(원)"] = f"{amt:,}"
 
-    coupon = _to_float(scan_label_value(dfs, LABEL_MAP["Coupon"]))
+    coupon_raw = overrides.get("Coupon") or pick("Coupon", LABEL_MAP["Coupon"])
+    coupon = _to_float(coupon_raw)
     if coupon is not None:
         rec["Coupon"] = f"{coupon}"
 
-    ytm = _to_float(scan_label_value(dfs, LABEL_MAP["YTM"]))
+    ytm_raw = overrides.get("YTM") or pick("YTM", LABEL_MAP["YTM"])
+    ytm = _to_float(ytm_raw)
     if ytm is not None:
         rec["YTM"] = f"{ytm}"
 
-    rec["만기"] = scan_label_value(dfs, LABEL_MAP["만기"])
+    rec["만기"] = overrides.get("만기") or pick("만기", LABEL_MAP["만기"])
 
-    rec["전환청구 시작"] = scan_label_value(dfs, START_LABELS_PERIOD_START)
-    rec["전환청구 종료"] = scan_label_value(dfs, START_LABELS_PERIOD_END)
+    rec["전환청구 시작"] = overrides.get("전환청구 시작") or pick("전환청구 시작", START_LABELS_PERIOD_START)
+    rec["전환청구 종료"] = overrides.get("전환청구 종료") or pick("전환청구 종료", START_LABELS_PERIOD_END)
 
-    rec["모집방식"] = scan_label_value(dfs, LABEL_MAP["모집방식"])
+    rec["모집방식"] = overrides.get("모집방식") or pick("모집방식", LABEL_MAP["모집방식"])
 
-    rec["발행상품"] = scan_label_value(dfs, LABEL_MAP["발행상품"])
+    rec["발행상품"] = overrides.get("발행상품") or pick("발행상품", LABEL_MAP["발행상품"])
     if not rec["발행상품"]:
         if rec["구분"] == "CB":
             rec["발행상품"] = "전환사채"
@@ -657,23 +917,25 @@ def parse_bond_record(dfs: List[pd.DataFrame], title: str, acpt_no: str, link: s
         elif rec["구분"] == "BW":
             rec["발행상품"] = "신주인수권부사채"
 
-    strike = _to_int(scan_label_value(dfs, LABEL_MAP["행사(전환)가액(원)"]))
+    strike_raw = overrides.get("행사(전환)가액(원)") or pick("행사(전환)가액(원)", LABEL_MAP["행사(전환)가액(원)"])
+    strike = _to_int(strike_raw)
     if strike is not None:
         rec["행사(전환)가액(원)"] = f"{strike:,}"
 
-    shares = _to_int(scan_label_value(dfs, LABEL_MAP["전환주식수"]))
+    shares_raw = overrides.get("전환주식수") or pick("전환주식수", LABEL_MAP["전환주식수"])
+    shares = _to_int(shares_raw)
     if shares is not None:
         rec["전환주식수"] = f"{shares:,}"
 
-    rec["주식총수대비 비율"] = scan_label_value(dfs, LABEL_MAP["주식총수대비 비율"])
+    rec["주식총수대비 비율"] = overrides.get("주식총수대비 비율") or pick("주식총수대비 비율", LABEL_MAP["주식총수대비 비율"])
 
-    floor_raw = scan_label_value(dfs, LABEL_MAP["Refixing Floor"])
+    floor_raw = overrides.get("Refixing Floor") or pick("Refixing Floor", LABEL_MAP["Refixing Floor"])
     floor_int = _to_int(floor_raw)
     rec["Refixing Floor"] = f"{floor_int:,}" if floor_int is not None else floor_raw
 
-    rec["납입일"] = scan_label_value(dfs, LABEL_MAP["납입일"])
+    rec["납입일"] = overrides.get("납입일") or pick("납입일", LABEL_MAP["납입일"])
 
-    # Put/Call 본문 블록 (PDF 관찰 패턴 반영)
+    # Put/Call 본문 블록
     put_start = [
         "조기상환청구권(Put Option)에 관한 사항",
         "인수인의 조기상환청구권(Put Option)에 관한 사항",
@@ -699,7 +961,6 @@ def parse_bond_record(dfs: List[pd.DataFrame], title: str, acpt_no: str, link: s
     put_text = extract_text_block(dfs, put_start, call_start + stop_common, max_chars=900)
     call_text = extract_text_block(dfs, call_start, stop_common, max_chars=900)
 
-    # 어떤 공시는 "세부내용은 19. 기타..."만 찍고 본문은 다른 섹션에 있음 → 기타 투자판단에서 재시도
     if (len(put_text) < 120) or ("세부내용" in put_text and "기타" in put_text):
         put_text2 = extract_text_block(
             dfs,
@@ -720,18 +981,22 @@ def parse_bond_record(dfs: List[pd.DataFrame], title: str, acpt_no: str, link: s
         if call_text2 and ("매도청구권" in call_text2 or "Call Option" in call_text2):
             call_text = call_text2
 
-    rec["Put Option"] = put_text
-    rec["Call Option"] = call_text
-    rec["Call 비율"] = extract_call_ratio(call_text)
-    rec["YTC"] = extract_ytc_from_text(call_text, put_text)
+    # ✅ 정정사항 표에 Put/Call이 있으면 그것도 우선
+    rec["Put Option"] = (overrides.get("Put Option") or put_text)
+    rec["Call Option"] = (overrides.get("Call Option") or call_text)
+    rec["Call 비율"] = extract_call_ratio(rec["Call Option"])
+    rec["YTC"] = extract_ytc_from_text(rec["Call Option"], rec["Put Option"])
 
-    # 자금용도: "조달자금의 구체적 사용 목적" 블록
-    rec["자금용도"] = extract_fund_use_block(dfs)
+    # 자금용도 / 투자자
+    rec["자금용도"] = overrides.get("자금용도") or extract_fund_use_block(dfs)
+    rec["투자자"] = overrides.get("투자자") or extract_investors_from_table(dfs)
 
-    # 투자자: '발행 대상자명' 테이블 컬럼 추출
-    rec["투자자"] = extract_investors_from_table(dfs)
-
-    return rec
+    meta = {
+        "is_correction": corr,
+        "original_acpt_no": original_acpt_no,
+        "overrides": overrides,
+    }
+    return rec, meta
 
 
 # ==========================================================
@@ -740,7 +1005,9 @@ def parse_bond_record(dfs: List[pd.DataFrame], title: str, acpt_no: str, link: s
 def run():
     _, bond_ws, seen_ws = gs_open()
     ensure_headers(bond_ws, BOND_COLUMNS)
+
     bond_index = build_index(bond_ws, BOND_COLUMNS, key_field="접수번호")
+    fp_index = build_fingerprint_index(bond_ws, BOND_COLUMNS)  # ✅ 정정 fallback용
 
     seen = load_seen(seen_ws) if USE_SEEN else set()
 
@@ -771,14 +1038,52 @@ def run():
         for t in targets:
             try:
                 dfs, src = scrape_one(context, t)
-                rec = parse_bond_record(dfs, t.title, t.acpt_no, src)
-                upsert(bond_ws, BOND_COLUMNS, bond_index, rec, key_field="접수번호")
+                rec, meta = parse_bond_record(dfs, t.title, t.acpt_no, src)
+
+                # ======================================================
+                # ✅ 정정 공시: "기존 값이 있으면 append 말고 update"
+                #   1) 정정 전(원문) 접수번호가 시트에 있으면 그 행 덮어쓰기
+                #   2) 없으면 fingerprint(회사명|구분|이사회결의일)로 행 찾아 덮어쓰기
+                #   3) 둘 다 못 찾으면 일반 upsert(정정 접수번호로 신규 append)
+                # ======================================================
+                did_update_existing = False
+
+                if meta.get("is_correction"):
+                    orig = (meta.get("original_acpt_no") or "").strip()
+
+                    # (1) 원문 접수번호로 매칭
+                    if orig and orig in bond_index:
+                        # 기존 키 유지(원문 접수번호로 행 선택), 링크는 정정 공시 링크로 최신화됨
+                        rec["접수번호"] = orig
+                        upsert(bond_ws, BOND_COLUMNS, bond_index, rec, key_field="접수번호")
+                        did_update_existing = True
+
+                    # (2) fingerprint fallback
+                    if not did_update_existing:
+                        fp = make_fingerprint(rec)
+                        if fp and fp in fp_index:
+                            row = fp_index[fp]
+                            # 기존 행의 접수번호를 유지
+                            key_col = BOND_COLUMNS.index("접수번호") + 1
+                            existing_key = str(bond_ws.cell(row, key_col).value or "").strip()
+                            if existing_key.isdigit():
+                                rec["접수번호"] = existing_key
+                            update_row(bond_ws, BOND_COLUMNS, row, rec)
+                            did_update_existing = True
+                            # 인덱스 최신화(혹시 모를 변경 대비)
+                            bond_index[rec["접수번호"]] = row
+
+                # (3) 일반 upsert
+                if not did_update_existing:
+                    upsert(bond_ws, BOND_COLUMNS, bond_index, rec, key_field="접수번호")
 
                 if USE_SEEN:
+                    # 정정 공시도 "정정 접수번호"로 seen 처리
                     append_seen(seen_ws, t.acpt_no)
 
                 ok += 1
-                print(f"[OK] {t.acpt_no} type={rec.get('구분','')}")
+                tag = "CORR" if meta.get("is_correction") else "NEW"
+                print(f"[OK] {t.acpt_no} {tag} type={rec.get('구분','')}")
 
             except Exception as e:
                 print(f"[FAIL] {t.acpt_no} {t.title} :: {e}")
@@ -789,3 +1094,7 @@ def run():
         browser.close()
 
     print(f"[DONE] ok={ok}")
+
+
+if __name__ == "__main__":
+    run()
