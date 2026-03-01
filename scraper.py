@@ -31,7 +31,7 @@ RSS_URL = os.getenv("RSS_URL", DEFAULT_RSS)
 KEYWORDS = [x.strip() for x in os.getenv("KEYWORDS", "유상증자").split(",") if x.strip()]
 
 HEADLESS = os.getenv("HEADLESS", "true").lower() == "true"
-LIMIT = int(os.getenv("LIMIT", "30"))
+LIMIT = int(os.getenv("LIMIT", "0"))
 RUN_ONE_ACPTNO = os.getenv("RUN_ONE_ACPTNO", "").strip()
 
 # RSS 페이징을 "지원하면" 끝까지 시도 (지원 안하면 자동으로 1페이지로 fallback)
@@ -146,8 +146,10 @@ def make_event_key(company: str, first_board_date: str, method: str) -> str:
     return f"{_norm(company)}|{_norm_date(first_board_date)}|{_norm(method)}"
 
 
+from urllib.parse import urlparse, parse_qs, urlencode, urlunparse
+
 # ==========================================================
-# RSS → targets (single page)
+# RSS → targets
 # ==========================================================
 def _parse_rss_targets_from_url(url: str) -> List[Target]:
     feed = feedparser.parse(url)
@@ -183,18 +185,20 @@ def _add_query(url: str, **params) -> str:
         q[k] = [str(v)]
     return urlunparse(u._replace(query=urlencode(q, doseq=True)))
 
-def parse_rss_targets_paged(max_pages: int = 10) -> List[Target]:
+def parse_rss_targets_paged(max_pages: int = 10, debug: bool = True) -> List[Target]:
     """
     RSS가 페이지 파라미터를 지원하면 1..max_pages 합침.
     지원 안 하면(2페이지 요청해도 1페이지와 동일/빈값) 자동으로 1페이지만 반환.
     """
     base = _parse_rss_targets_from_url(RSS_URL)
+    if debug:
+        print(f"[RSS] base url={RSS_URL}")
+        print(f"[RSS] base entries={len(base)}")
+
     if not base:
         return []
 
     base_map = {t.acpt_no: t for t in base}
-
-    # KIND에서 흔히 쓰는 페이지 파라미터 후보들
     page_param_candidates = ["currentPage", "pageIndex", "pageNo", "page"]
 
     for param in page_param_candidates:
@@ -211,17 +215,22 @@ def parse_rss_targets_paged(max_pages: int = 10) -> List[Target]:
                     merged[t.acpt_no] = t
                     new_cnt += 1
 
+            if debug:
+                print(f"[RSS] try {param}={p} -> items={len(items)} new={new_cnt}")
+
             if new_cnt > 0:
                 saw_new = True
             else:
-                # 다음 페이지가 1페이지와 동일/비어있으면 페이징 미지원 판단 → 중단
                 break
 
         if saw_new:
+            if debug:
+                print(f"[RSS] pagination supported via param={param} total={len(merged)}")
             return list(merged.values())
 
+    if debug:
+        print("[RSS] pagination NOT supported (all params produced no new items). returning base only.")
     return list(base_map.values())
-
 
 # ==========================================================
 # Playwright: popup html → dfs
