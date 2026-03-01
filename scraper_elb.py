@@ -219,10 +219,10 @@ def is_correction_title(title: str) -> bool:
 
 
 # ==========================================================
-# RSS → targets
+# RSS → targets (single page)
 # ==========================================================
-def parse_rss_targets() -> List[Target]:
-    feed = feedparser.parse(RSS_URL)
+def _parse_rss_targets_from_url(url: str) -> List[Target]:
+    feed = feedparser.parse(url)
     items = feed.entries or []
     targets: List[Target] = []
 
@@ -240,12 +240,59 @@ def parse_rss_targets() -> List[Target]:
 
         targets.append(Target(acpt_no=acpt_no, title=title, link=link))
 
-    uniq = {}
+    uniq: Dict[str, Target] = {}
     for t in targets:
-        if t.acpt_no not in uniq:
-            uniq[t.acpt_no] = t
+        uniq.setdefault(t.acpt_no, t)
     return list(uniq.values())
 
+def parse_rss_targets() -> List[Target]:
+    return _parse_rss_targets_from_url(RSS_URL)
+
+def _add_query(url: str, **params) -> str:
+    u = urlparse(url)
+    q = parse_qs(u.query)
+    for k, v in params.items():
+        q[k] = [str(v)]
+    return urlunparse(u._replace(query=urlencode(q, doseq=True)))
+
+def parse_rss_targets_paged(max_pages: int = 10) -> List[Target]:
+    """
+    RSS가 페이지 파라미터를 지원하면 1..max_pages 합침.
+    지원 안 하면(2페이지 요청해도 1페이지와 동일/빈값) 자동으로 1페이지만 반환.
+    """
+    base = _parse_rss_targets_from_url(RSS_URL)
+    if not base:
+        return []
+
+    base_map = {t.acpt_no: t for t in base}
+
+    # KIND에서 흔히 쓰는 페이지 파라미터 후보들
+    page_param_candidates = ["currentPage", "pageIndex", "pageNo", "page"]
+
+    for param in page_param_candidates:
+        merged = dict(base_map)
+        saw_new = False
+
+        for p in range(2, max_pages + 1):
+            url = _add_query(RSS_URL, **{param: p})
+            items = _parse_rss_targets_from_url(url)
+
+            new_cnt = 0
+            for t in items:
+                if t.acpt_no not in merged:
+                    merged[t.acpt_no] = t
+                    new_cnt += 1
+
+            if new_cnt > 0:
+                saw_new = True
+            else:
+                # 다음 페이지가 1페이지와 동일/비어있으면 페이징 미지원 판단 → 중단
+                break
+
+        if saw_new:
+            return list(merged.values())
+
+    return list(base_map.values())
 
 # ==========================================================
 # Playwright: popup html → dfs
