@@ -21,7 +21,7 @@ from playwright.sync_api import sync_playwright
 BASE = "https://kind.krx.co.kr"
 DEFAULT_RSS = (
     "http://kind.krx.co.kr:80/disclosure/rsstodaydistribute.do"
-    "?method=searchRssTodayDistribute&mktTpCd=0&currentPageSize=200"
+    "?method=searchRssTodayDistribute&mktTpCd=0&currentPageSize=100"
 )
 
 RSS_URL = os.getenv("RSS_URL", DEFAULT_RSS)
