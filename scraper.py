@@ -3,6 +3,7 @@
 # - 상장시장: (주), 주식회사 등 접두/접미사 제거 후 정밀 Smart Mapping
 # - 발행가액: 50원 이하 숫자는 항목 인덱스(오류)로 간주하여 원천 차단 ("6" 버그 픽스)
 # - 할인율: 표기 변형(할증률, 산정시 할인율 등) 키워드 스캔 후보 대폭 추가
+# - [추가] 회사명 옆에 '보고서명' 컬럼 추가
 # ==========================================================
 import os
 import re
@@ -44,8 +45,9 @@ GOOGLE_CREDENTIALS_JSON = (
 RIGHTS_OUT_SHEET = os.getenv("RIGHTS_OUT_SHEET", "유상증자")
 SEEN_SHEET_NAME = os.getenv("SEEN_SHEET_NAME", "seen")
 
+# [변경] "회사명" 바로 다음에 "보고서명"을 추가했습니다.
 RIGHTS_COLUMNS = [
-    "회사명", "상장시장", "최초 이사회결의일", "증자방식", "발행상품",
+    "회사명", "보고서명", "상장시장", "최초 이사회결의일", "증자방식", "발행상품",
     "신규발행주식수", "확정발행가(원)", "기준주가", "확정발행금액(억원)",
     "할인(할증률)", "증자전 주식수", "증자비율", "납입일",
     "신주의 배당기산일", "신주의 상장 예정일", "이사회결의일",
@@ -424,6 +426,10 @@ def parse_rights_issue_record(dfs, t: Target, corr_after, html_raw, company_mark
     rec["링크"] = t.link if t.link else viewer_url(t.acpt_no)
 
     title_clean = t.title.replace("[자동복구대상]", "").strip()
+    
+    # [추가] 보고서명을 title_clean으로 저장합니다.
+    rec["보고서명"] = title_clean
+    
     rec["회사명"] = (
         scan_label_value_preferring_correction(dfs, ["회사명", "회사 명"], corr_after) 
         or company_from_title(title_clean)
@@ -572,7 +578,8 @@ def run():
         )
         
         if needs_fix and acpt not in targets_dict:
-            title = get_val(row, "회사명") or "[자동복구대상]"
+            # [변경] 복구 대상 제목을 가져올 때 '보고서명'을 먼저 찾습니다.
+            title = get_val(row, "보고서명") or get_val(row, "회사명") or "[자동복구대상]"
             restored_link = link_val if link_val else viewer_url(acpt)
             targets_dict[acpt] = Target(acpt_no=acpt, title=title, link=restored_link, market=market)
             print(f"[INFO] 빈칸/오류 감지됨: {title} ({acpt}) -> 강제 재파싱 대기열 추가")
