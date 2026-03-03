@@ -1,5 +1,4 @@
-# scraper.py
-# 유상증자_코드V2 (PDF 케이스 반영 최종)
+#유상증자_코드V2
 
 import os
 import re
@@ -8,7 +7,7 @@ import time
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import List, Optional, Tuple, Set, Dict
+from typing import List, Optional, Tuple, Set, Dict, Any
 
 import feedparser
 import pandas as pd
@@ -31,7 +30,7 @@ RSS_URL = os.getenv("RSS_URL", DEFAULT_RSS)
 KEYWORDS = [x.strip() for x in os.getenv("KEYWORDS", "유상증자").split(",") if x.strip()]
 
 HEADLESS = os.getenv("HEADLESS", "true").lower() == "true"
-LIMIT = int(os.getenv("LIMIT", "30"))  # 0이면 RSS가 주는 만큼 전부
+LIMIT = int(os.getenv("LIMIT", "30"))
 RUN_ONE_ACPTNO = os.getenv("RUN_ONE_ACPTNO", "").strip()
 
 GOOGLE_SHEET_ID = os.environ.get("GOOGLE_SHEET_ID", "").strip()
@@ -43,7 +42,7 @@ GOOGLE_CREDENTIALS_JSON = (
 RIGHTS_OUT_SHEET = os.getenv("RIGHTS_OUT_SHEET", "유상증자")
 SEEN_SHEET_NAME = os.getenv("SEEN_SHEET_NAME", "seen")
 
-# Debug
+# Debug (원하면 유지: 실패 시 out/debug에 저장)
 OUTDIR = Path(os.getenv("OUTDIR", "out"))
 DEBUGDIR = OUTDIR / "debug"
 
@@ -74,10 +73,6 @@ def _norm(s: str) -> str:
 def _norm_date(s: str) -> str:
     """날짜 매칭용: 숫자만 남김 (예: 2026-02-28 / 2026년2월28일 -> 20260228)"""
     return re.sub(r"[^\d]", "", (s or "").strip())
-
-def _is_date_like(s: str) -> bool:
-    d = _norm_date(s)
-    return len(d) == 8 and d.startswith("20")
 
 def _to_int(s: str) -> Optional[int]:
     if s is None:
@@ -123,26 +118,15 @@ def company_from_title(title: str) -> str:
     m = re.search(r"\[([^\]]+)\]", title or "")
     return m.group(1).strip() if m else ""
 
-def normalize_market(s: str) -> str:
-    t = (s or "").strip()
-    low = t.lower()
-    if "코스닥" in t or "kosdaq" in low:
-        return "코스닥"
-    if "코넥스" in t or "konex" in low:
-        return "코넥스"
-    if "유가" in t or "유가증권" in t or "코스피" in t or "kospi" in low:
-        return "유가증권"
-    return t
-
 def market_from_title(title: str) -> str:
     if not title:
         return ""
-    if "코스닥" in title or "[코]" in title:
+    if "[코]" in title:
         return "코스닥"
-    if "코넥스" in title or "[넥]" in title or "[코넥]" in title:
-        return "코넥스"
-    if "유가" in title or "유가증권" in title or "코스피" in title or "[유]" in title:
+    if "[유]" in title:
         return "유가증권"
+    if "[넥]" in title or "[코넥]" in title:
+        return "코넥스"
     return ""
 
 def viewer_url(acpt_no: str, docno: str = "") -> str:
@@ -161,7 +145,7 @@ def make_event_key(company: str, first_board_date: str, method: str) -> str:
 
 
 # ==========================================================
-# RSS → targets (single page only)
+# RSS → targets
 # ==========================================================
 def parse_rss_targets() -> List[Target]:
     feed = feedparser.parse(RSS_URL)
@@ -182,9 +166,10 @@ def parse_rss_targets() -> List[Target]:
 
         targets.append(Target(acpt_no=acpt_no, title=title, link=link))
 
-    uniq: Dict[str, Target] = {}
+    uniq = {}
     for t in targets:
-        uniq.setdefault(t.acpt_no, t)
+        if t.acpt_no not in uniq:
+            uniq[t.acpt_no] = t
     return list(uniq.values())
 
 
@@ -205,7 +190,7 @@ def frame_score(html: str) -> int:
     tcnt = lower.count("<table")
     if tcnt == 0:
         return -1
-    bonus_words = ["기준주가", "납입", "이사회", "할인", "할증", "발행", "청약", "증자방식", "자금조달", "정정사항", "신주발행가액"]
+    bonus_words = ["기준주가", "납입", "이사회", "할인", "할증", "발행", "청약", "증자방식", "자금조달", "정정사항"]
     bonus = sum(1 for w in bonus_words if w in lower)
     length_bonus = min(len(lower) // 2000, 50)
     return tcnt * 100 + bonus * 30 + length_bonus
@@ -224,6 +209,9 @@ def pick_best_frame_html(page) -> str:
     return best_html
 
 def extract_tables_from_html_robust(html: str) -> List[pd.DataFrame]:
+    """
+    ✅ 라벨/값 추출 안정: header=None
+    """
     html = (html or "").replace("\x00", "")
 
     try:
@@ -300,7 +288,7 @@ def scrape_one(context, t: Target) -> Tuple[List[pd.DataFrame], str]:
 
 
 # ==========================================================
-# Google Sheets
+# Google Sheets (structured only)
 # ==========================================================
 def gs_open():
     if not GOOGLE_SHEET_ID or not GOOGLE_CREDENTIALS_JSON:
@@ -324,6 +312,13 @@ def gs_open():
         rights_ws = sh.add_worksheet(title=RIGHTS_OUT_SHEET, rows=2000, cols=len(RIGHTS_COLUMNS) + 5)
 
     return sh, rights_ws, seen_ws
+
+def load_seen(seen_ws) -> Set[str]:
+    col = seen_ws.col_values(1)
+    return set([x.strip() for x in col if x and x.strip().isdigit()])
+
+def append_seen(seen_ws, acpt_no: str):
+    seen_ws.append_row([acpt_no, datetime.now().strftime("%Y-%m-%d %H:%M:%S")], value_input_option="RAW")
 
 def ensure_headers(ws, headers: List[str]):
     cur = ws.row_values(1)
@@ -350,6 +345,9 @@ def build_acpt_index_from_values(values: List[List[str]], headers: List[str], ke
     return idx
 
 def build_event_index_from_values(values: List[List[str]], headers: List[str]) -> Dict[str, Tuple[int, str]]:
+    """
+    event_key -> (row_number, existing_acpt_no)
+    """
     col_company = headers.index("회사명")
     col_first = headers.index("최초 이사회결의일")
     col_method = headers.index("증자방식")
@@ -374,6 +372,9 @@ def update_row(ws, headers: List[str], row: int, record: dict):
     ws.update(f"A{row}:{end}", [row_vals])
 
 def upsert(ws, headers: List[str], index: Dict[str, int], record: dict, key_field: str, last_row_ref: Optional[List[int]] = None) -> Tuple[str, int]:
+    """
+    return: ("update"/"append", row_number)
+    """
     ensure_headers(ws, headers)
     key = str(record.get(key_field, "")).strip()
     row_vals = [record.get(h, "") for h in headers]
@@ -393,37 +394,14 @@ def upsert(ws, headers: List[str], index: Dict[str, int], record: dict, key_fiel
     index[key] = r
     return "append", r
 
-# seen: 스킵용이 아니라 "마지막 처리시각 기록용"
-def build_seen_index(seen_ws) -> Dict[str, int]:
-    vals = seen_ws.get_all_values()
-    if not vals:
-        seen_ws.update("A1:B1", [["acptNo", "ts"]])
-        vals = seen_ws.get_all_values()
-    if vals and vals[0] != ["acptNo", "ts"]:
-        seen_ws.update("A1:B1", [["acptNo", "ts"]])
-        vals = seen_ws.get_all_values()
-
-    idx: Dict[str, int] = {}
-    for r, row in enumerate(vals[1:], start=2):
-        acpt = (row[0] if len(row) > 0 else "").strip()
-        if acpt.isdigit():
-            idx[acpt] = r
-    return idx
-
-def upsert_seen(seen_ws, seen_index: Dict[str, int], acpt_no: str):
-    ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    if acpt_no in seen_index:
-        r = seen_index[acpt_no]
-        seen_ws.update(f"B{r}", [[ts]])
-    else:
-        seen_ws.append_row([acpt_no, ts], value_input_option="RAW")
-        seen_index[acpt_no] = len(seen_ws.get_all_values())
-
 
 # ==========================================================
-# Parser helpers
+# Rights issue parser helpers
 # ==========================================================
 def scan_label_value(dfs: List[pd.DataFrame], label_candidates: List[str]) -> str:
+    """
+    라벨 매칭 후 값 후보: 오른쪽/두칸오른쪽/아래/아래오른쪽/같은행 값
+    """
     cand = {_norm(x) for x in label_candidates}
 
     for df in dfs:
@@ -446,121 +424,10 @@ def scan_label_value(dfs: List[pd.DataFrame], label_candidates: List[str]) -> st
                     row_vals = [x for x in row_vals if _norm(x) not in cand]
 
                     for v in checks + row_vals:
-                        # "4." 같은 번호 제거 + "6" 같은 단일 번호도 제거
-                        if re.fullmatch(r"\d+\.", v) or re.fullmatch(r"\d+", v):
+                        if re.fullmatch(r"\d+\.", v):
                             continue
                         return v
     return ""
-
-def extract_correction_after_map(dfs: List[pd.DataFrame]) -> Dict[str, str]:
-    """
-    '정정사항' 표에서 (항목 -> 정정후) 값 추출
-    """
-    out: Dict[str, str] = {}
-
-    for df in dfs:
-        try:
-            arr = df.astype(str).values
-        except Exception:
-            continue
-
-        R, C = arr.shape
-        header_r = None
-        after_col = None
-        item_col = None
-
-        for r in range(R):
-            row_norm = [_norm(x) for x in arr[r].tolist()]
-            has_before = any("정정전" in x for x in row_norm)
-            has_after = any("정정후" in x for x in row_norm)
-            if has_before and has_after:
-                header_r = r
-                after_col = next((i for i, x in enumerate(row_norm) if "정정후" in x), None)
-                item_col = next(
-                    (i for i, x in enumerate(row_norm) if ("정정사항" in x or "정정항목" in x or x == "항목")),
-                    0
-                )
-                break
-
-        if header_r is None or after_col is None:
-            continue
-
-        last_item = ""
-        for rr in range(header_r + 1, R):
-            item = str(arr[rr][item_col]).strip() if item_col is not None and item_col < C else ""
-            if item and item.lower() != "nan":
-                last_item = item
-            else:
-                item = last_item
-
-            if not item:
-                continue
-
-            after_val = ""
-            for cc in [after_col, after_col + 1, after_col - 1]:
-                if 0 <= cc < C:
-                    v = str(arr[rr][cc]).strip()
-                    if v and v.lower() != "nan":
-                        vn = _norm(v)
-                        if vn not in ("정정후", "정정전", "정정사항", "정정항목", "항목"):
-                            after_val = v
-                            break
-
-            if after_val:
-                out[_norm(item)] = after_val
-
-    return out
-
-def scan_label_value_preferring_correction(
-    dfs: List[pd.DataFrame],
-    label_candidates: List[str],
-    corr_after: Optional[Dict[str, str]] = None
-) -> str:
-    if corr_after:
-        cand_norm = [_norm(x) for x in label_candidates]
-
-        for c in cand_norm:
-            v = corr_after.get(c, "")
-            if str(v).strip():
-                return str(v).strip()
-
-        for k, v in corr_after.items():
-            if not str(v).strip():
-                continue
-            if any(c in k for c in cand_norm):
-                return str(v).strip()
-
-    return scan_label_value(dfs, label_candidates)
-
-def scan_label_date(
-    dfs: List[pd.DataFrame],
-    label_candidates: List[str],
-    corr_after: Optional[Dict[str, str]] = None
-) -> str:
-    # 정정후 우선 (단, 날짜처럼 생긴 값만)
-    v = scan_label_value_preferring_correction(dfs, label_candidates, corr_after=corr_after)
-    if _is_date_like(v):
-        return v
-
-    cand = {_norm(x) for x in label_candidates}
-
-    for df in dfs:
-        arr = df.astype(str).values
-        R, C = arr.shape
-        for r in range(R):
-            for c in range(C):
-                if _norm(arr[r][c]) in cand:
-                    checks = []
-                    for rr, cc in [(r, c+1), (r, c+2), (r+1, c), (r+1, c+1)]:
-                        if 0 <= rr < R and 0 <= cc < C:
-                            checks.append(str(arr[rr][cc]).strip())
-
-                    row_vals = [str(x).strip() for x in arr[r].tolist()]
-                    for vv in checks + row_vals:
-                        if _is_date_like(vv):
-                            return vv
-    return ""
-
 
 def find_row_best_int(dfs: List[pd.DataFrame], must_contain: List[str]) -> Optional[int]:
     keys = [_norm(x) for x in must_contain]
@@ -594,121 +461,28 @@ def find_row_best_float(dfs: List[pd.DataFrame], must_contain: List[str]) -> Opt
                     return max(vals, key=lambda z: abs(z))
     return None
 
-
-# ==========================================================
-# 자금조달의 목적 기반
-# ==========================================================
-FUND_SPECS = [
-    ("시설자금", ["시설자금"]),
-    ("영업양수자금", ["영업양수자금", "영업양수 자금"]),
-    ("운영자금", ["운영자금"]),
-    ("채무상환자금", ["채무상환자금", "채무 상환 자금"]),
-    ("타법인증권취득자금", ["타법인증권취득자금", "타법인 증권 취득자금", "타법인증권 취득자금"]),
-    ("기타자금", ["기타자금"]),
-]
-
-def _best_amount_from_row(row: List[str]) -> Optional[int]:
-    nums = [_to_int(x) for x in row]
-    nums = [x for x in nums if x is not None and x > 0]
-    if not nums:
-        return None
-    for thr in (1_000_000, 10_000, 1):
-        cand = [x for x in nums if x >= thr]
-        if cand:
-            return max(cand)
-    return None
-
-def extract_fund_amounts(
-    dfs: List[pd.DataFrame],
-    corr_after: Optional[Dict[str, str]] = None
-) -> Dict[str, int]:
-    out: Dict[str, int] = {}
-
-    # 정정후 우선
-    if corr_after:
-        for disp, cands in FUND_SPECS:
-            nk_list = [_norm(x) for x in cands]
-            found = None
-            for ck, cv in corr_after.items():
-                if any(nk in ck for nk in nk_list):
-                    found = _max_int_in_text(cv)
-                    break
-            if found and found > 0:
-                out[disp] = found
-
-    # 본문 탐색
-    for disp, cands in FUND_SPECS:
-        if disp in out:
-            continue
+def build_fund_use_text(dfs: List[pd.DataFrame]) -> str:
+    """
+    자금용도 금액은 커서(원 단위) 100만 이상만 인정 → '시설자금:4' 같은 오인식 방지
+    """
+    keys = ["시설자금", "영업양수자금", "운영자금", "채무상환자금", "타법인증권취득자금", "타법인증권", "기타자금"]
+    parts = []
+    for k in keys:
         best = None
-        nk_list = [_norm(x) for x in cands]
         for df in dfs:
             arr = df.astype(str).values
             for r in range(arr.shape[0]):
                 row = [str(x).strip() for x in arr[r].tolist()]
-                joined = _norm("".join(row))
-                if any(nk in joined for nk in nk_list):
-                    amt = _best_amount_from_row(row)
-                    if amt is not None:
-                        if best is None or amt > best:
-                            best = amt
-        if best and best > 0:
-            out[disp] = best
-
-    return out
-
-def fund_use_from_amounts(amounts: Dict[str, int]) -> str:
-    uses = [disp for disp, _ in FUND_SPECS if amounts.get(disp)]
-    return "; ".join(uses)
-
-def sum_amounts_to_eok(amounts: Dict[str, int]) -> str:
-    total = sum(v for v in amounts.values() if isinstance(v, int) and v > 0)
-    if total <= 0:
-        return ""
-    return f"{total / 100_000_000:,.2f}"
-
-
-# ==========================================================
-# 신주발행가액 표 전용: 확정 없으면 예정 사용 (PDF 케이스 해결)
-# ==========================================================
-def extract_issue_price_won(
-    dfs: List[pd.DataFrame],
-    corr_after: Optional[Dict[str, str]] = None
-) -> Optional[int]:
-    """
-    6. 신주 발행가액 표에서 가격을 뽑는다.
-    우선순위: (1) 확정발행가(보통주식) 숫자 → (2) 예정발행가(보통주식) 숫자
-    """
-    # 정정후 표에 가격이 직접 있을 때
-    if corr_after:
-        for key_hint in ["확정발행가", "예정발행가", "신주발행가액", "신주발행가액(원)", "신주 발행가액"]:
-            for k, v in corr_after.items():
-                if key_hint in k:
-                    n = _max_int_in_text(v)
-                    if n and n >= 100:  # '6' 같은 번호 방지
-                        return n
-
-    best_confirmed = None
-    best_planned = None
-
-    for df in dfs:
-        arr = df.astype(str).values
-        for r in range(arr.shape[0]):
-            row = [str(x).strip() for x in arr[r].tolist()]
-            joined = _norm("".join(row))
-
-            if ("확정발행가" in joined) and ("보통주식" in joined):
-                n = _best_amount_from_row(row)
-                if n and n >= 100:
-                    best_confirmed = max(best_confirmed or 0, n)
-
-            if ("예정발행가" in joined) and ("보통주식" in joined):
-                n = _best_amount_from_row(row)
-                if n and n >= 100:
-                    best_planned = max(best_planned or 0, n)
-
-    return best_confirmed or best_planned
-
+                if _norm(k) in _norm("".join(row)):
+                    nums = [_to_int(x) for x in row]
+                    nums = [x for x in nums if x is not None and x >= 1_000_000]
+                    if nums:
+                        m = max(nums)
+                        if best is None or m > best:
+                            best = m
+        if best is not None:
+            parts.append(f"{k}:{best:,}")
+    return "; ".join(parts)
 
 def extract_investors(dfs: List[pd.DataFrame], corr_after: Optional[Dict[str, str]] = None) -> str:
     v = scan_label_value_preferring_correction(
@@ -718,10 +492,97 @@ def extract_investors(dfs: List[pd.DataFrame], corr_after: Optional[Dict[str, st
     )
     return v or ""
 
+def extract_correction_after_map(dfs: List[pd.DataFrame]) -> Dict[str, str]:
+    """
+    '정정사항' 표에서 (항목 -> 정정후) 값을 뽑아낸다.
+    - 정정전/정정후 헤더가 있는 표를 찾는다.
+    - 항목 셀이 비어 있으면 (병합셀) 직전 항목을 carry-forward.
+    """
+    out: Dict[str, str] = {}
 
-# ==========================================================
-# Rights issue parser (record)
-# ==========================================================
+    for df in dfs:
+        try:
+            arr = df.astype(str).values
+        except Exception:
+            continue
+
+        R, C = arr.shape
+        header_r = None
+        before_col = None
+        after_col = None
+        item_col = None
+
+        for r in range(R):
+            row_norm = [_norm(x) for x in arr[r].tolist()]
+            has_before = any("정정전" in x for x in row_norm)
+            has_after = any("정정후" in x for x in row_norm)
+            if has_before and has_after:
+                header_r = r
+                before_col = next((i for i, x in enumerate(row_norm) if "정정전" in x), None)
+                after_col = next((i for i, x in enumerate(row_norm) if "정정후" in x), None)
+                item_col = next(
+                    (i for i, x in enumerate(row_norm) if ("정정사항" in x or "정정항목" in x or x == "항목")),
+                    0
+                )
+                break
+
+        if header_r is None or after_col is None:
+            continue
+
+        last_item = ""
+        for rr in range(header_r + 1, R):
+            item = str(arr[rr][item_col]).strip() if item_col is not None and item_col < C else ""
+            if item and item.lower() != "nan":
+                last_item = item
+            else:
+                item = last_item
+
+            if not item:
+                continue
+
+            # after value with small fallbacks
+            after_val = ""
+            for cc in [after_col, after_col + 1, after_col - 1]:
+                if 0 <= cc < C:
+                    v = str(arr[rr][cc]).strip()
+                    if v and v.lower() != "nan":
+                        vn = _norm(v)
+                        if vn not in ("정정후", "정정전", "정정사항", "정정항목", "항목"):
+                            after_val = v
+                            break
+
+            if after_val:
+                out[_norm(item)] = after_val
+
+    return out
+
+def scan_label_value_preferring_correction(
+    dfs: List[pd.DataFrame],
+    label_candidates: List[str],
+    corr_after: Optional[Dict[str, str]] = None
+) -> str:
+    """
+    ✅ 정정 공시일 때: '정정사항 표(정정후)' 값을 먼저 반환
+    """
+    if corr_after:
+        cand_norm = [_norm(x) for x in label_candidates]
+
+        # 1) exact match
+        for c in cand_norm:
+            v = corr_after.get(c, "")
+            if str(v).strip():
+                return str(v).strip()
+
+        # 2) contains match (항목명이 약간 다를 때)
+        for k, v in corr_after.items():
+            if not str(v).strip():
+                continue
+            if any(c in k for c in cand_norm):
+                return str(v).strip()
+
+    return scan_label_value(dfs, label_candidates)
+
+
 def parse_rights_issue_record(
     dfs: List[pd.DataFrame],
     title: str,
@@ -735,24 +596,29 @@ def parse_rights_issue_record(
 
     # 회사명/시장
     rec["회사명"] = scan_label_value_preferring_correction(dfs, ["회 사 명", "회사명", "회사 명"], corr_after) or company_from_title(title)
-    mkt_raw = scan_label_value_preferring_correction(dfs, ["상장시장", "시장구분", "시장 구분"], corr_after) or market_from_title(title)
-    rec["상장시장"] = normalize_market(mkt_raw)
+    rec["상장시장"] = scan_label_value_preferring_correction(dfs, ["상장시장", "시장구분", "시장 구분"], corr_after) or market_from_title(title)
 
     # 결의일
-    rec["이사회결의일"] = scan_label_date(
-        dfs, ["15. 이사회결의일(결정일)", "이사회결의일(결정일)", "이사회결의일", "결정일"], corr_after
+    rec["이사회결의일"] = scan_label_value_preferring_correction(
+        dfs,
+        ["15. 이사회결의일(결정일)", "이사회결의일(결정일)", "이사회결의일", "결정일"],
+        corr_after
     )
-    rec["최초 이사회결의일"] = scan_label_date(dfs, ["최초 이사회결의일", "최초이사회결의일"], corr_after) or rec["이사회결의일"]
+    rec["최초 이사회결의일"] = scan_label_value_preferring_correction(dfs, ["최초 이사회결의일", "최초이사회결의일"], corr_after) or rec["이사회결의일"]
 
     # 증자방식
     rec["증자방식"] = scan_label_value_preferring_correction(dfs, ["5. 증자방식", "증자방식", "발행방법", "배정방식"], corr_after)
 
-    # 주식수
+    # 주식수 (정정후 우선 시도 -> 없으면 기존 로직)
     issue_txt = scan_label_value_preferring_correction(
-        dfs, ["1. 신주의 종류와 수", "신주의 종류와 수", "신주의종류와수", "신주의 종류 및 수", "신주의종류및수"], corr_after
+        dfs,
+        ["1. 신주의 종류와 수", "신주의 종류와 수", "신주의종류와수", "신주의 종류 및 수", "신주의종류및수"],
+        corr_after
     )
     prev_txt = scan_label_value_preferring_correction(
-        dfs, ["증자전발행주식총수", "증자전 발행주식총수", "증자전발행주식총수(보통주식)", "발행주식총수", "발행주식 총수"], corr_after
+        dfs,
+        ["증자전발행주식총수", "증자전 발행주식총수", "증자전발행주식총수(보통주식)", "발행주식총수", "발행주식 총수"],
+        corr_after
     )
 
     issue_shares = _to_int(issue_txt) or _max_int_in_text(issue_txt) or \
@@ -766,14 +632,24 @@ def parse_rights_issue_record(
     if prev_shares:
         rec["증자전 주식수"] = f"{prev_shares:,}"
 
-    # ✅ 확정발행가(원): 확정 없으면 예정발행가 사용 (PDF 케이스 해결)
-    price = extract_issue_price_won(dfs, corr_after=corr_after)
-    rec["확정발행가(원)"] = f"{price:,}" if price else ""
+    # 발행가/기준주가/할인율 (정정후 우선)
+    price_txt = scan_label_value_preferring_correction(
+        dfs,
+        ["6. 신주 발행가액", "신주 발행가액", "신주발행가액", "신주 발행가액(원)", "신주발행가액(원)"],
+        corr_after
+    )
+    price = _to_int(price_txt) or find_row_best_int(dfs, ["신주발행가액", "보통주식"]) or find_row_best_int(dfs, ["신주", "발행가액"])
+    if price:
+        rec["확정발행가(원)"] = f"{price:,}"
+    else:
+        rec["확정발행가(원)"] = price_txt
 
-    # 기준주가/할인율
     base_txt = scan_label_value_preferring_correction(dfs, ["7. 기준주가", "기준주가"], corr_after)
     base_price = _to_int(base_txt) or find_row_best_int(dfs, ["기준주가", "보통주식"]) or find_row_best_int(dfs, ["기준주가"])
-    rec["기준주가"] = f"{base_price:,}" if base_price else (base_txt or "")
+    if base_price:
+        rec["기준주가"] = f"{base_price:,}"
+    else:
+        rec["기준주가"] = base_txt
 
     disc_txt = scan_label_value_preferring_correction(
         dfs,
@@ -783,32 +659,26 @@ def parse_rights_issue_record(
     disc = _to_float(disc_txt)
     if disc is None:
         disc = find_row_best_float(dfs, ["기준주가에대한할인율또는할증율"]) or find_row_best_float(dfs, ["할인율또는할증율"])
-    rec["할인(할증률)"] = f"{disc}" if disc is not None else (disc_txt or "")
-
-    # 일정(날짜만)
-    rec["납입일"] = scan_label_date(dfs, ["9. 납입일", "납입일"], corr_after)
-    rec["신주의 배당기산일"] = scan_label_date(dfs, ["10. 신주의 배당기산일", "신주의 배당기산일", "배당기산일"], corr_after)
-    rec["신주의 상장 예정일"] = scan_label_date(dfs, ["12. 신주의 상장 예정일", "신주의 상장 예정일", "상장예정일"], corr_after)
-
-    # ✅ 자금조달 목적(6개) 기반: 자금용도 + 확정발행금액(억원)
-    fund_amounts = extract_fund_amounts(dfs, corr_after=corr_after)
-    rec["자금용도"] = fund_use_from_amounts(fund_amounts)
-
-    sum_eok = sum_amounts_to_eok(fund_amounts)
-    if sum_eok:
-        rec["확정발행금액(억원)"] = sum_eok
+    if disc is not None:
+        rec["할인(할증률)"] = f"{disc}"
     else:
-        # fallback: 합산 실패 시에만 주식수*발행가
-        sh = _to_int(rec["신규발행주식수"])
-        pr = _to_int(rec["확정발행가(원)"])
-        if sh and pr:
-            rec["확정발행금액(억원)"] = f"{(sh * pr) / 100_000_000:,.2f}"
+        rec["할인(할증률)"] = disc_txt
 
-    # 투자자
+    # 일정 (정정후 우선)
+    rec["납입일"] = scan_label_value_preferring_correction(dfs, ["9. 납입일", "납입일"], corr_after)
+    rec["신주의 배당기산일"] = scan_label_value_preferring_correction(dfs, ["10. 신주의 배당기산일", "신주의 배당기산일", "배당기산일"], corr_after)
+    rec["신주의 상장 예정일"] = scan_label_value_preferring_correction(dfs, ["12. 신주의 상장 예정일", "신주의 상장 예정일", "상장예정일"], corr_after)
+
+    # 자금용도 / 투자자 (정정후 우선)
+    rec["자금용도"] = scan_label_value_preferring_correction(dfs, ["4. 자금조달의 목적", "자금조달의 목적", "자금용도"], corr_after) or build_fund_use_text(dfs)
     rec["투자자"] = extract_investors(dfs, corr_after=corr_after)
 
-    # 증자비율
+    # 계산 보강
     sh = _to_int(rec["신규발행주식수"])
+    pr = _to_int(rec["확정발행가(원)"])
+    if sh and pr:
+        rec["확정발행금액(억원)"] = f"{(sh * pr) / 100_000_000:,.2f}"
+
     pv = _to_int(rec["증자전 주식수"])
     if sh and pv and pv > 0:
         rec["증자비율"] = f"{sh / pv * 100:.2f}%"
@@ -821,22 +691,21 @@ def parse_rights_issue_record(
 # ==========================================================
 def run():
     _, rights_ws, seen_ws = gs_open()
+    seen = load_seen(seen_ws)
 
-    # 시트 값 로드 + 인덱스 구성
+    # 시트 값 한 번 로드해서 인덱스 구성
     values = load_sheet_values(rights_ws, RIGHTS_COLUMNS)
-    last_row_ref = [len(values)]
+    last_row_ref = [len(values)]  # append 시 row 계산용
 
     rights_index = build_acpt_index_from_values(values, RIGHTS_COLUMNS, key_field="접수번호")
     event_index = build_event_index_from_values(values, RIGHTS_COLUMNS)
-
-    # seen은 스킵용이 아니라 기록용
-    seen_index = build_seen_index(seen_ws)
 
     # 대상 선정
     if RUN_ONE_ACPTNO:
         targets = [Target(acpt_no=RUN_ONE_ACPTNO, title=f"[MANUAL]{RUN_ONE_ACPTNO}", link="")]
     else:
         targets = parse_rss_targets()
+        targets = [t for t in targets if t.acpt_no not in seen]
         targets = targets[:LIMIT] if LIMIT > 0 else targets
 
     if not targets:
@@ -859,6 +728,7 @@ def run():
             try:
                 dfs, src = scrape_one(context, t)
 
+                # 유상증자만 정규 컬럼 저장
                 if "유상증자" in (t.title or ""):
                     corr_after = None
                     if is_correction_title(t.title):
@@ -866,7 +736,7 @@ def run():
 
                     rec = parse_rights_issue_record(dfs, t.title, t.acpt_no, src, corr_after=corr_after)
 
-                    # 정정 공시: event_key로 기존행 update 우선
+                    # ✅ 정정 공시라면: 기존 행을 찾아 update(덮어쓰기)
                     if is_correction_title(t.title):
                         evk = make_event_key(
                             rec.get("회사명", ""),
@@ -885,6 +755,7 @@ def run():
                         if target_row:
                             update_row(rights_ws, RIGHTS_COLUMNS, target_row, rec)
 
+                            # 인덱스 갱신 (접수번호가 바뀌는 케이스 대비)
                             if old_acpt and old_acpt in rights_index and old_acpt != rec["접수번호"]:
                                 del rights_index[old_acpt]
                             rights_index[rec["접수번호"]] = target_row
@@ -892,20 +763,19 @@ def run():
 
                             print(f"[OK] {t.acpt_no} correction=Y mode=UPDATE row={target_row}")
                         else:
-                            mode, row = upsert(
-                                rights_ws, RIGHTS_COLUMNS, rights_index, rec,
-                                key_field="접수번호", last_row_ref=last_row_ref
+                            mode, row = upsert(rights_ws, RIGHTS_COLUMNS, rights_index, rec, key_field="접수번호", last_row_ref=last_row_ref)
+                            evk = make_event_key(
+                                rec.get("회사명", ""),
+                                rec.get("최초 이사회결의일", "") or rec.get("이사회결의일", ""),
+                                rec.get("증자방식", "")
                             )
                             event_index[evk] = (row, rec["접수번호"])
                             print(f"[OK] {t.acpt_no} correction=Y mode={mode.upper()} row={row}")
-
                     else:
-                        # 일반 공시도 항상 upsert (있으면 update)
-                        mode, row = upsert(
-                            rights_ws, RIGHTS_COLUMNS, rights_index, rec,
-                            key_field="접수번호", last_row_ref=last_row_ref
-                        )
+                        # 일반 공시: 기존 접수번호 기준 upsert
+                        mode, row = upsert(rights_ws, RIGHTS_COLUMNS, rights_index, rec, key_field="접수번호", last_row_ref=last_row_ref)
 
+                        # event index도 같이 업데이트(후속 정정 대비)
                         evk = make_event_key(
                             rec.get("회사명", ""),
                             rec.get("최초 이사회결의일", "") or rec.get("이사회결의일", ""),
@@ -915,8 +785,7 @@ def run():
 
                         print(f"[OK] {t.acpt_no} correction=N mode={mode.upper()} row={row}")
 
-                # 처리 시각 기록
-                upsert_seen(seen_ws, seen_index, t.acpt_no)
+                append_seen(seen_ws, t.acpt_no)
                 ok += 1
 
             except Exception as e:
