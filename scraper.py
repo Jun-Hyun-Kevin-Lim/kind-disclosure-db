@@ -1,7 +1,8 @@
 # ==========================================================
-# #유상증자_코드V4.5 (Self-Healing 링크 증발 버그 픽스)
-# - 과거 데이터 재파싱 시 기존 링크(URL)가 삭제되는 현상 완벽 수정
-# - 빈칸이 된 링크도 접수번호를 기반으로 자동 생성하여 복구
+# #유상증자_코드V4.6 (상장시장 빈칸 완벽 복구판)
+# - 시트 내 동일 회사(동료 데이터)의 시장 정보를 찾아와서 빈칸을 채우는 Smart Mapping 추가
+# - KIND 뷰어 프레임 렌더링 대기 시간 연장 및 상장시장 HTML 스캔 정규식 초강화
+# - 기타 Squash 버그, 링크 증발, 날짜 텍스트 오류 방지 로직 유지
 # ==========================================================
 import os
 import re
@@ -115,13 +116,21 @@ def market_from_title(title: str) -> str:
 
 def market_from_html(html: str) -> str:
     if not html: return ""
-    m = re.search(r'alt="(코스닥|유가증권|코넥스)"', html)
+    html_lower = html.lower()
+    
+    # 1. 헤더 프레임의 마크업 이미지 파일명 스캔 (가장 확실함)
+    if "mark_kosdaq" in html_lower: return "코스닥"
+    if "mark_kospi" in html_lower: return "유가증권"
+    if "mark_konex" in html_lower: return "코넥스"
+    
+    # 2. 이미지의 alt 속성 스캔
+    m = re.search(r'alt=["\']?(코스닥|유가증권|코넥스)["\']?', html)
     if m: return m.group(1)
-    m = re.search(r'(코스닥|유가증권|코넥스)시장\s*본부', html)
-    if m: return m.group(1)
-    if "코넥스" in html or "KONEX" in html: return "코넥스"
-    if "코스닥" in html or "KOSDAQ" in html: return "코스닥"
-    if "유가증권" in html or "KOSPI" in html: return "유가증권"
+    
+    # 3. HTML 텍스트 전체에서 시장 키워드 강제 탐색
+    if "코스닥" in html: return "코스닥"
+    if "유가증권" in html: return "유가증권"
+    if "코넥스" in html: return "코넥스"
     return ""
 
 def viewer_url(acpt_no: str, docno: str = "") -> str:
@@ -195,8 +204,12 @@ def scrape_one(context, acpt_no: str) -> Tuple[List[pd.DataFrame], str, str]:
     page = context.new_page()
     try:
         page.goto(url, wait_until="networkidle", timeout=60000)
-        page.wait_for_timeout(1500)
-        all_frames_html = " ".join([fr.content() for fr in page.frames])
+        # 상단 헤더 프레임이 완전히 로드될 수 있도록 대기 시간을 살짝 늘립니다.
+        page.wait_for_timeout(2500) 
+        
+        # 문서(DOM) 구조 전체와 하위 프레임을 모두 합쳐서 풀 스캔용으로 반환
+        all_frames_html = page.content() + " " + " ".join([fr.content() for fr in page.frames])
+        
         best_html = pick_best_frame_html(page) or ""
         if best_html.lower().count("<table") == 0: raise RuntimeError("table 못 찾음")
         return extract_tables_from_html_robust(best_html), url, all_frames_html
@@ -406,11 +419,10 @@ def extract_fund_use_and_amount(dfs, corr_after) -> Tuple[str, float]:
 # ==========================================================
 # 레코드 파싱 로직 
 # ==========================================================
-def parse_rights_issue_record(dfs, t: Target, corr_after, html_raw) -> dict:
+def parse_rights_issue_record(dfs, t: Target, corr_after, html_raw, company_market_map) -> dict:
     rec = {k: "" for k in RIGHTS_COLUMNS}
     rec["접수번호"] = t.acpt_no
     
-    # [핵심] 수집된 링크가 있다면 사용하고, 없다면 뷰어 URL 강제 생성
     rec["링크"] = t.link if t.link else viewer_url(t.acpt_no)
 
     title_clean = t.title.replace("[자동복구대상]", "").strip()
@@ -423,10 +435,13 @@ def parse_rights_issue_record(dfs, t: Target, corr_after, html_raw) -> dict:
     mkt = scan_label_value_preferring_correction(dfs, ["상장시장", "시장구분"], corr_after)
     if mkt and ("해당사항" in mkt or len(mkt) < 2 or mkt in ("-", ".")): mkt = ""
     
+    # [Smart Mapping] 구글 시트에 같은 이름의 회사가 상장시장을 가지고 있다면 즉각 빌려옵니다.
     rec["상장시장"] = (
         mkt 
         or market_from_title(title_clean) 
         or t.market 
+        or company_market_map.get(rec["회사명"])
+        or company_market_map.get(title_clean)
         or market_from_html(html_raw)
     )
 
@@ -500,6 +515,14 @@ def run():
     for r, row in enumerate(seen_values[1:], start=2):
         if row and row[0].strip().isdigit(): seen_index[row[0].strip()] = r
 
+    # [Smart Mapping 사전 준비] 시트에 있는 모든 회사의 상장시장을 맵으로 묶어둡니다.
+    company_market_map = {}
+    for row in values[1:]:
+        c_name = row[RIGHTS_COLUMNS.index("회사명")].strip() if len(row) > RIGHTS_COLUMNS.index("회사명") else ""
+        c_mkt = row[RIGHTS_COLUMNS.index("상장시장")].strip() if len(row) > RIGHTS_COLUMNS.index("상장시장") else ""
+        if c_name and c_mkt in ["코스닥", "유가증권", "코넥스"]:
+            company_market_map[c_name] = c_mkt
+
     targets_dict = {t.acpt_no: t for t in parse_rss_targets()}
 
     def get_val(row_data, col_name):
@@ -516,8 +539,6 @@ def run():
         market = get_val(row, "상장시장")
         pay_date = get_val(row, "납입일")
         first_date = get_val(row, "최초 이사회결의일")
-        
-        # [링크 복구 조건 추가] 시트에 링크가 없으면 강제로 재파싱 대기열에 추가!
         link_val = get_val(row, "링크")
         
         needs_fix = (
@@ -532,7 +553,6 @@ def run():
         
         if needs_fix and acpt not in targets_dict:
             title = get_val(row, "회사명") or "[자동복구대상]"
-            # [핵심] 기존에 링크가 있었다면 살리고, 없었다면 url을 새로 만들어 Target에 넘김
             restored_link = link_val if link_val else viewer_url(acpt)
             targets_dict[acpt] = Target(acpt_no=acpt, title=title, link=restored_link, market=market)
             print(f"[INFO] 빵꾸/오류 감지됨: {title} ({acpt}) -> 강제 재파싱 대기열 추가")
@@ -557,7 +577,7 @@ def run():
                 dfs, src, html_raw = scrape_one(context, t.acpt_no)
 
                 corr_after = extract_correction_after_map(dfs) if is_correction_title(t.title) else None
-                rec = parse_rights_issue_record(dfs, t, corr_after, html_raw)
+                rec = parse_rights_issue_record(dfs, t, corr_after, html_raw, company_market_map)
 
                 evk = make_event_key(
                     rec.get("회사명", ""),
