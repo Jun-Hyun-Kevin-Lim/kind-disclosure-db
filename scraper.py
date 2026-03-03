@@ -1,11 +1,10 @@
 # ==========================================================
-# #유상증자_코드V4.7_Ultimate (정확도 완벽 픽스 및 정정공시 고도화)
-# - [유지] V4.7 원본 뼈대 및 Smart Mapping 로직 유지
-# - [추가] 회사명 옆에 '보고서명' 컬럼 추가
-# - [개선1] 정정공시일 경우 '정정사유' 문자열을 무시하고 무조건 '정정후' 날짜를 가져오는 고급 스캔 적용
-# - [개선2] 증자전 주식수 "3" 오류 차단: 항목 번호(1., 3. 등) 사전 제거 엔진 적용 (자회사 1주 완벽 인식)
-# - [개선3] 회사명 추출 시 [유], [코] 등 시장 마크 오인식 제거 및 빈칸 방지 (SK하이닉스 복구)
-# - [개선4] 확정발행가 50원 이하 숫자(항목 "6") 및 연도 오인식 원천 차단
+# #유상증자_코드V5.2_Ultimate (정확도 극강화 및 전 컬럼 정정후 우선 적용판)
+# - [유지] '회사명' 옆에 '보고서명' 컬럼 유지
+# - [개선1] 날짜 외 모든 컬럼(가격, 주식수 등)도 '정정후' 표를 0순위로 강제 적용
+# - [개선2] "정정사유" 등 쓰레기 텍스트 추출 원천 차단 필터 적용
+# - [개선3] 항목번호(1., 3. 등) 사전 제거 필터 적용 (주식수 "3" 오류 완벽 해결)
+# - [개선4] 표 셀 병합(Rowspan/Colspan) 밀림 방지 커스텀 그리드 파서 내장
 # ==========================================================
 import os
 import re
@@ -100,7 +99,7 @@ def _to_float(s: str) -> Optional[float]:
 
 def _max_int_in_text(s: str) -> Optional[int]:
     if not s: return None
-    # [개선2] 주식수가 "3"으로 나오는 버그 수정 (항목 번호인 "3." 등을 숫자 추출 전 미리 삭제)
+    # [개선] 1., 3. 같은 항목 번호 패턴을 강제로 지워버려 숫자로 둔갑하는 것 방지
     s_clean = re.sub(r'(^|\s)[\(①-⑩]?\s*\d+\s*[\.\)]\s+', ' ', str(s))
     nums = re.findall(r"\d[\d,]*", s_clean)
     vals = []
@@ -115,7 +114,6 @@ def extract_acpt_no(text: str) -> Optional[str]:
     return m.group(1) if m else None
 
 def company_from_title(title: str) -> str:
-    # [개선3] 하이닉스가 "유"로 나오는 버그 수정 (시장 마크 완벽 제거 및 스마트 추출)
     if not title: return ""
     t = re.sub(r"\[(유|코|넥|코넥|KOSPI|KOSDAQ|KONEX)\]", "", title).strip()
     t = re.sub(r"\[.*?정정.*?\]", "", t).strip()
@@ -150,10 +148,63 @@ def match_keyword(title: str) -> bool:
     return bool(title) and any(k in title for k in KEYWORDS)
 
 def is_correction_title(title: str) -> bool:
-    return bool(title) and title.strip().startswith("정정")
+    return "정정" in (title or "")
 
 def make_event_key(company: str, first_board_date: str, method: str) -> str:
     return f"{_norm(company)}|{_norm_date(first_board_date)}|{_norm(method)}"
+
+# ==========================================================
+# 커스텀 HTML 표 파서 (칸 밀림 방지용)
+# ==========================================================
+def parse_html_table_to_df(tbl_soup) -> Optional[pd.DataFrame]:
+    """정정사항 표처럼 셀이 복잡하게 병합된 경우 칸이 밀리는 현상을 막기 위한 구조화 엔진"""
+    rows = tbl_soup.find_all('tr')
+    grid = []
+    for r in rows: grid.append([])
+        
+    for i, row in enumerate(rows):
+        cells = row.find_all(['td', 'th'])
+        j = 0
+        for cell in cells:
+            while j < len(grid[i]) and grid[i][j] is not None:
+                j += 1
+            text = cell.get_text(" ", strip=True)
+            
+            try: rowspan = int(cell.get('rowspan', 1))
+            except: rowspan = 1
+            try: colspan = int(cell.get('colspan', 1))
+            except: colspan = 1
+            
+            for r_span in range(rowspan):
+                for c_span in range(colspan):
+                    row_idx = i + r_span
+                    col_idx = j + c_span
+                    
+                    while len(grid) <= row_idx: grid.append([])
+                    while len(grid[row_idx]) <= col_idx: grid[row_idx].append(None)
+                    grid[row_idx][col_idx] = text
+    
+    clean_grid = []
+    for row in grid:
+        clean_row = [c if c is not None else "" for c in row]
+        if any(clean_row): clean_grid.append(clean_row)
+            
+    if clean_grid: return pd.DataFrame(clean_grid)
+    return None
+
+def extract_tables_from_html_robust(html: str) -> List[pd.DataFrame]:
+    html = (html or "").replace("\x00", "")
+    soup = BeautifulSoup(html, "lxml")
+    for tag in soup(["script", "style", "noscript"]): tag.decompose()
+    
+    results = []
+    for tbl in soup.find_all("table"):
+        df = parse_html_table_to_df(tbl)
+        if df is not None and not df.empty:
+            results.append(df)
+            
+    if not results: raise ValueError("표 파싱 실패")
+    return results
 
 # ==========================================================
 # RSS / Playwright 추출
@@ -186,29 +237,6 @@ def pick_best_frame_html(page) -> str:
         except Exception: continue
     return best_html
 
-def extract_tables_from_html_robust(html: str) -> List[pd.DataFrame]:
-    html = (html or "").replace("\x00", "")
-    try:
-        return [df.where(pd.notnull(df), "") for df in pd.read_html(html, header=None)]
-    except Exception: pass
-
-    soup = BeautifulSoup(html, "lxml")
-    for tag in soup(["script", "style", "noscript"]): tag.decompose()
-    results = []
-    for tbl in soup.find_all("table"):
-        try:
-            one = pd.read_html(str(tbl), header=None)
-            if one: results.append(one[0].where(pd.notnull(one[0]), ""))
-            continue
-        except Exception: pass
-        rows = [[c.get_text(" ", strip=True) for c in tr.find_all(["th", "td"])] for tr in tbl.find_all("tr")]
-        rows = [r for r in rows if r]
-        if rows:
-            max_len = max(len(r) for r in rows)
-            results.append(pd.DataFrame([r + [""] * (max_len - len(r)) for r in rows]))
-    if not results: raise ValueError("표 파싱 실패")
-    return results
-
 def scrape_one(context, acpt_no: str) -> Tuple[List[pd.DataFrame], str, str]:
     url = viewer_url(acpt_no)
     page = context.new_page()
@@ -222,7 +250,7 @@ def scrape_one(context, acpt_no: str) -> Tuple[List[pd.DataFrame], str, str]:
         except Exception: pass
 
         page.goto(url, wait_until="networkidle", timeout=60000)
-        page.wait_for_timeout(2500) 
+        page.wait_for_timeout(1500) 
         
         all_frames_html = header_html + " " + page.content() + " " + " ".join([fr.content() for fr in page.frames])
         best_html = pick_best_frame_html(page) or ""
@@ -308,14 +336,16 @@ def extract_correction_after_map(dfs: List[pd.DataFrame]) -> Dict[str, str]:
         except Exception: continue
         R, C = arr.shape
         header_r = after_col = item_col = None
-        reason_col = -1
 
+        # 정정사항 표의 헤더를 완벽하게 탐색합니다.
         for r in range(R):
             row_norm = [_norm(x) for x in arr[r].tolist()]
-            if any("정정전" in x for x in row_norm) and any("정정후" in x for x in row_norm):
+            has_before = any(w in x for w in ["정정전", "변경전"] for x in row_norm)
+            has_after = any(w in x for w in ["정정후", "변경후"] for x in row_norm)
+            
+            if has_before and has_after:
                 header_r = r
-                after_col = next((i for i, x in enumerate(row_norm) if "정정후" in x), None)
-                reason_col = next((i for i, x in enumerate(row_norm) if "사유" in x), -1)
+                after_col = next((i for i, x in enumerate(row_norm) if "정정후" in x or "변경후" in x), None)
                 item_col = next((i for i, x in enumerate(row_norm) if ("정정사항" in x or "항목" in x or "구분" in x)), 0)
                 break
 
@@ -328,20 +358,16 @@ def extract_correction_after_map(dfs: List[pd.DataFrame]) -> Dict[str, str]:
             if not item: continue
             last_item = item
 
+            # 정정후 칸의 데이터 가져오기 (정정사유 등 쓰레기값 완벽 차단)
             after_val = ""
             if 0 <= after_col < C:
                 v = str(arr[rr][after_col]).strip()
                 if v and v.lower() != "nan" and _norm(v) not in ("정정후", "정정전", "항목", "변경사유", "정정사유", "-"):
                     after_val = v
 
-            if not after_val:
-                for cc in [after_col - 1, after_col + 1]:
-                    if 0 <= cc < C and cc != reason_col:
-                        v = str(arr[rr][cc]).strip()
-                        if v and v.lower() != "nan" and _norm(v) not in ("정정후", "정정전", "항목", "변경사유", "정정사유", "-"):
-                            after_val = v
-                            break
-            if after_val: out[_norm(item)] = after_val
+            if after_val: 
+                out[_norm(item)] = after_val
+                out[_clean_label(item)] = after_val
     return out
 
 def scan_label_value(dfs, label_candidates) -> str:
@@ -380,7 +406,6 @@ def find_row_best_int(dfs, must_contain, min_val=0) -> Optional[int]:
             if all(k in _norm("".join(row)) for k in keys):
                 row_max = 0
                 for cell in row:
-                    # 년, 월, 일 등 날짜는 금액/주식수 스캔에서 완전 제외
                     if any(d in cell for d in ["년", "월", "일", "예정일", "납입일", "기일"]): continue
                     amt = _max_int_in_text(cell)
                     if amt and amt > min_val: 
@@ -463,20 +488,16 @@ def extract_investors(dfs: List[pd.DataFrame], corr_after: Dict[str, str]) -> st
                     for rr in range(r + 1, R):
                         val = str(arr[rr][name_col]).strip()
                         val_norm = _norm(val)
-                        
                         if re.match(r"^\d+\.", val) or "기타투자판단" in val_norm or "합계" in val_norm:
                             break
-                            
                         if val and val.lower() != "nan" and val_norm not in blacklist and "관계" not in val_norm and "주식수" not in val_norm:
                             if len(val) < 50 and val not in investors:
                                 investors.append(val)
     
-    if investors:
-        return ", ".join(investors)
+    if investors: return ", ".join(investors)
         
     val = scan_label_value_preferring_correction(dfs, ["제3자배정대상자", "제3자배정 대상자", "투자자", "성명(법인명)"], corr_after)
-    if val and "관계" not in _norm(val):
-        return val
+    if val and "관계" not in _norm(val): return val
         
     return ""
 
@@ -491,8 +512,7 @@ def parse_rights_issue_record(dfs, t: Target, corr_after, html_raw, company_mark
     title_clean = t.title.replace("[자동복구대상]", "").strip()
     rec["보고서명"] = title_clean
     
-    # [개선3] 회사명 추출 완벽 방어
-    comp_cands = ["회사명", "회사 명", "발행회사", "발행회사명", "법인명"]
+    comp_cands = ["회사명", "회사 명", "발행회사", "발행회사명", "법인명", "종속회사명"]
     table_comp = scan_label_value_preferring_correction(dfs, comp_cands, corr_after)
     if table_comp and (re.search(r'[A-Za-z]', table_comp) or len(table_comp) > 15):
         table_comp = ""
@@ -517,19 +537,19 @@ def parse_rights_issue_record(dfs, t: Target, corr_after, html_raw, company_mark
         company_market_map[norm_company_name(rec["회사명"])] = rec["상장시장"]
         company_market_map[norm_company_name(title_clean)] = rec["상장시장"]
 
-    # [개선1] 정정공시 날짜(납입일 등) 추출 완벽 방어: "정정사유" 쓰레기 텍스트 원천 차단
+    # [개선1] 모든 날짜 컬럼에 정정후 값 완벽 적용을 위한 강력 필터 
     def get_valid_date(labels):
         cand_clean = {_clean_label(x) for x in labels}
         
-        # 1순위: 정정후 표에서 정확히 찾기
+        # 1. 정정후 딕셔너리에서 우선 강제 매칭
         if corr_after:
             for k, v in corr_after.items():
                 if any(c in k for c in cand_clean):
                     val = str(v).strip()
-                    if re.search(r'\d', val) and not any(b in val for b in ["정정", "변경", "요청", "사유"]):
+                    if re.search(r'\d', val) and not any(b in val for b in ["정정", "변경", "요청", "사유", "기재", "오기"]):
                         return val
-        
-        # 2순위: 전체 행을 스캔하여 '오른쪽 끝(가장 나중)'의 정상 날짜만 강제 스크랩
+
+        # 2. 본문 표 전체에서 스캔하되 오른쪽에 있는 정답을 픽업
         for df in dfs:
             arr = df.astype(str).values
             R, C = arr.shape
@@ -540,7 +560,7 @@ def parse_rights_issue_record(dfs, t: Target, corr_after, html_raw, company_mark
                     for v in row_vals:
                         if _clean_label(v) in cand_clean: continue
                         if re.fullmatch(r"([①-⑩]|\(\d+\)|\d+\.)", _norm(v)): continue
-                        # 쓰레기(사유) 텍스트는 가차없이 버림
+                        # 쓰레기 텍스트 가차없이 버림
                         if any(b in v for b in ["정정", "변경", "요청", "사유", "기재", "오기"]): continue
                         
                         if re.search(r'\d', v) and any(sep in v for sep in ["년", "월", "일", "-", ".", "/"]):
@@ -549,11 +569,10 @@ def parse_rights_issue_record(dfs, t: Target, corr_after, html_raw, company_mark
                     if possible_dates:
                         return possible_dates[-1] 
                         
-        # 3순위: 구형 스캔
-        val = scan_label_value_preferring_correction(dfs, labels, corr_after)
-        if val and re.search(r'\d', val) and not any(b in val for b in ["정정", "변경", "요청", "사유"]):
+        # 3. 최후의 보루
+        val = scan_label_value(dfs, labels)
+        if val and re.search(r'\d', val) and not any(b in val for b in ["정정", "변경", "요청", "사유", "기재", "오기"]):
             return val
-            
         return ""
 
     rec["이사회결의일"] = get_valid_date(["이사회결의일(결정일)", "이사회결의일", "결정일"])
@@ -564,55 +583,57 @@ def parse_rights_issue_record(dfs, t: Target, corr_after, html_raw, company_mark
 
     rec["증자방식"] = scan_label_value_preferring_correction(dfs, ["증자방식", "발행방법", "배정방식"], corr_after)
 
-    # [개선2] 주식수가 "3"으로 오인되는 버그 엔진 교체 적용
-    issue_txt = scan_label_value_preferring_correction(dfs, ["신주의 종류와 수", "신주의종류와수", "발행예정주식수"], corr_after)
-    prev_cands = ["증자전발행주식총수", "증자전 발행주식총수", "기발행주식총수", "발행주식총수", "증자전 주식수", "증자전발행주식총수(보통주식)", "발행주식 총수"]
-    prev_txt = scan_label_value_preferring_correction(dfs, prev_cands, corr_after)
+    # [개선] 숫자를 스캔할 때 무조건 정정후 맵부터 완벽하게 뒤짐
+    def get_corr_num(labels, min_val=0, as_float=False):
+        if not corr_after: return None
+        cand_clean = {_clean_label(x) for x in labels}
+        for k, v in corr_after.items():
+            if any(c in k for c in cand_clean):
+                if as_float: return _to_float(v)
+                else: 
+                    amt = _max_int_in_text(v)
+                    if amt is not None and amt > min_val: return amt
+        return None
 
-    issue_shares = _to_int(issue_txt) or _max_int_in_text(issue_txt) or find_row_best_int(dfs, ["신주의종류와수", "보통주식"]) or find_row_best_int(dfs, ["발행예정주식수"])
-    prev_shares = _max_int_in_text(prev_txt)
-    if prev_shares is None:
+    # 주식수 & 가격에 get_corr_num 100% 반영
+    issue_shares = get_corr_num(["신주의 종류와 수", "신주의종류와수", "발행예정주식수"])
+    if not issue_shares:
+        issue_shares = _max_int_in_text(scan_label_value(dfs, ["신주의 종류와 수", "신주의종류와수", "발행예정주식수"]))
+    if not issue_shares:
+        issue_shares = find_row_best_int(dfs, ["신주의종류와수", "보통주식"]) or find_row_best_int(dfs, ["발행예정주식수"])
+
+    prev_shares = get_corr_num(["증자전발행주식총수", "기발행주식총수", "발행주식총수", "증자전 주식수", "증자전발행주식총수(보통주식)"])
+    if not prev_shares:
+        prev_shares = _max_int_in_text(scan_label_value(dfs, ["증자전발행주식총수", "기발행주식총수", "발행주식총수", "증자전 주식수", "증자전발행주식총수(보통주식)"]))
+    if not prev_shares:
         prev_shares = find_row_best_int(dfs, ["증자전발행주식총수", "보통주식"]) or find_row_best_int(dfs, ["발행주식총수", "보통주식"])
 
-    if issue_shares:
-        rec["발행상품"] = "보통주식"
-        rec["신규발행주식수"] = f"{issue_shares:,}"
+    if issue_shares: rec["신규발행주식수"] = f"{issue_shares:,}"
     if prev_shares: rec["증자전 주식수"] = f"{prev_shares:,}"
 
-    # [개선4] 확정발행가 50원 이하는 항목번호 "6"이므로 파기
-    price_cands = ["신주 발행가액", "신주발행가액", "예정발행가액", "예정발행가", "확정발행가액", "1주당 확정발행가액", "발행가액", "1주당 발행가액", "1주당발행가액(원)"]
-    price_txt = scan_label_value_preferring_correction(dfs, price_cands, corr_after)
-    price = _max_int_in_text(price_txt) 
-    
-    if price is not None and price <= 50: 
-        price = None 
-        
+    price = get_corr_num(["신주 발행가액", "신주발행가액", "예정발행가액", "확정발행가액", "발행가액", "1주당 확정발행가액"], min_val=50)
     if not price:
-        price = (find_row_best_int(dfs, ["신주발행가액", "보통주식"], min_val=50) or 
-                 find_row_best_int(dfs, ["예정발행가액"], min_val=50) or 
-                 find_row_best_int(dfs, ["발행가액", "원"], min_val=50))
+        price = _max_int_in_text(scan_label_value(dfs, ["신주 발행가액", "신주발행가액", "예정발행가액", "확정발행가액", "발행가액", "1주당 확정발행가액"]))
+        if price is not None and price <= 50: price = None
+    if not price:
+        price = find_row_best_int(dfs, ["신주발행가액", "보통주식"], min_val=50) or find_row_best_int(dfs, ["예정발행가액"], min_val=50) or find_row_best_int(dfs, ["발행가액", "원"], min_val=50)
         
     if price: rec["확정발행가(원)"] = f"{price:,}"
-    else: rec["확정발행가(원)"] = price_txt if price_txt else ""
 
-    base_txt = scan_label_value_preferring_correction(dfs, ["기준주가", "기준 주가", "기준발행가액"], corr_after)
-    base_price = _to_int(base_txt)
-    if base_price is not None and base_price <= 50: base_price = None
+    base_price = get_corr_num(["기준주가", "기준발행가액"], min_val=50)
+    if not base_price:
+        base_price = _max_int_in_text(scan_label_value(dfs, ["기준주가", "기준발행가액"]))
+        if base_price is not None and base_price <= 50: base_price = None
     if not base_price:
         base_price = find_row_best_int(dfs, ["기준주가", "보통주식"], min_val=50) or find_row_best_int(dfs, ["기준주가"], min_val=50)
     if base_price: rec["기준주가"] = f"{base_price:,}"
-    else: rec["기준주가"] = base_txt if base_txt else ""
 
-    disc_cands = [
-        "할인율", "할증률", "할인율(%)", "할인율 또는 할증률", 
-        "할인(할증)율", "발행가액 산정시 할인율", 
-        "기준주가에 대한 할인율 또는 할증율 (%)", "기준주가에대한할인율"
-    ]
-    disc_txt = scan_label_value_preferring_correction(dfs, disc_cands, corr_after)
-    disc = _to_float(disc_txt) or find_row_best_float(dfs, ["기준주가에대한할인율또는할증율"]) or find_row_best_float(dfs, ["할인율"])
-    
+    disc = get_corr_num(["할인율", "할증률", "할인율 또는 할증률", "할인(할증)율", "발행가액 산정시 할인율"], as_float=True)
+    if disc is None:
+        disc = _to_float(scan_label_value(dfs, ["할인율", "할증률", "할인율 또는 할증률", "할인(할증)율"]))
+    if disc is None:
+        disc = find_row_best_float(dfs, ["할인율또는할증율"]) or find_row_best_float(dfs, ["할인율"])
     if disc is not None: rec["할인(할증률)"] = f"{disc}"
-    else: rec["할인(할증률)"] = disc_txt if disc_txt else ""
 
     uses_text, total_fund_amt = extract_fund_use_and_amount(dfs, corr_after)
     rec["자금용도"] = uses_text
@@ -672,7 +693,6 @@ def run():
         comp_name = get_val(row, "회사명")
         prev_shares = get_val(row, "증자전 주식수")
         
-        # [감지 트리거] 주식수가 3이거나 회사명이 깨진 것도 모두 감지하여 자동 복구
         needs_fix = (
             not link_val or 
             not fund or "(원)" in fund or
