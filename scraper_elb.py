@@ -1,9 +1,9 @@
 # ==========================================================
-# #주식연계채권_코드V5.8_Ultimate (유상증자 V5.8 엔진 완전 이식판)
-# - 타겟 키워드: 전환사채권발행결정, 교환사채권발행결정, 신주인수권부사채권발행결정
-# - 정정공시 덮어쓰기: 기존 시트에 있던 항목을 '정정후' 값으로 UPDATE (Append 아님)
-# - 구분 컬럼 자동화: 보고서명에 따라 CB, EB, BW 자동 기입
-# - 옵션 추출기: Put/Call Option 하단 텍스트 블록 및 '비율', 'YTC(수익률)' 정밀 파싱
+# #주식연계채권_코드V5.9_Ultra (정확도 극대화 & 한줄 텍스트 렌더링)
+# - 타겟 필터링 완벽화: 정확히 '사채권발행결정' 3종만 캡처 (기타 공시 원천 차단)
+# - 텍스트 한줄 처리: 줄바꿈(\n)을 띄어쓰기로 변환하여 시트 가독성 최적화
+# - 정정공시 덮어쓰기: '정정후' 데이터를 기존 접수번호 혹은 일치하는 이벤트 행에 UPDATE
+# - 데이터 정제: 날짜(YYYY-MM-DD) 규격화, 표 순번(1,2,3..) 오인 방지 로직 강화
 # ==========================================================
 import os
 import re
@@ -12,7 +12,6 @@ import time
 import urllib.request
 from dataclasses import dataclass
 from datetime import datetime
-from pathlib import Path
 from typing import List, Optional, Tuple, Dict
 
 import feedparser
@@ -32,10 +31,6 @@ DEFAULT_RSS = (
 )
 
 RSS_URL = os.getenv("RSS_URL", DEFAULT_RSS)
-
-# [요청 반영] 대상 키워드 설정
-TARGET_KWS = "전환사채권발행결정,교환사채권발행결정,신주인수권부사채권발행결정"
-KEYWORDS = [x.strip() for x in os.getenv("KEYWORDS", TARGET_KWS).split(",") if x.strip()]
 
 HEADLESS = os.getenv("HEADLESS", "true").lower() == "true"
 LIMIT = int(os.getenv("LIMIT", "0"))
@@ -68,61 +63,43 @@ class Target:
     market: str = ""
 
 # ==========================================================
-# 유틸
+# 유틸리티
 # ==========================================================
 def _norm(s: str) -> str:
-    s = (s or "").strip()
-    return re.sub(r"\s+", "", s).replace(":", "")
+    return re.sub(r"\s+", "", str(s or "")).replace(":", "")
 
 def _clean_label(s: str) -> str:
-    s = _norm(s)
-    return re.sub(r"^([①-⑩]|\(\d+\)|\d+\.)+", "", s)
+    return re.sub(r"^([①-⑩]|\(\d+\)|\d+\.)+", "", _norm(s))
 
-def norm_company_name(name: str) -> str:
-    if not name: return ""
-    n = name.replace("주식회사", "").replace("(주)", "").strip()
-    return _norm(n)
+def _single_line(s: str) -> str:
+    """모든 텍스트를 한 줄로 만듭니다. (줄바꿈 제거)"""
+    if not s: return ""
+    return re.sub(r'\s+', ' ', str(s)).strip()
 
-def _norm_date(s: str) -> str:
-    return re.sub(r"[^\d]", "", (s or "").strip())
+def _format_date(s: str) -> str:
+    """텍스트에서 YYYY-MM-DD 형식의 날짜만 추출"""
+    m = re.search(r'(\d{4})[-년\.\s]+(\d{1,2})[-월\.\s]+(\d{1,2})', str(s))
+    if m: return f"{m.group(1)}-{int(m.group(2)):02d}-{int(m.group(3)):02d}"
+    return _single_line(s)
 
 def _to_int(s: str) -> Optional[int]:
-    if s is None: return None
-    t = re.sub(r"[^\d\-]", "", str(s).replace(",", ""))
-    if t in ("", "-"): return None
-    try: return int(t)
-    except Exception: return None
+    t = re.sub(r"[^\d\-]", "", str(s or "").replace(",", ""))
+    return int(t) if t not in ("", "-") else None
 
 def _to_float(s: str) -> Optional[float]:
-    if s is None: return None
-    t = re.sub(r"[^\d\.\-]", "", str(s).replace(",", ""))
-    if t in ("", "-", "."): return None
-    try: return float(t)
-    except Exception: return None
+    t = re.sub(r"[^\d\.\-]", "", str(s or "").replace(",", ""))
+    return float(t) if t not in ("", "-", ".") else None
 
-def _max_int_in_text(s: str) -> Optional[int]:
-    if not s: return None
-    s_clean = re.sub(r'(^|\s)[\(①-⑩]?\s*\d+\s*[\.\)]\s+', ' ', str(s))
-    nums = re.findall(r"\d[\d,]*", s_clean)
-    vals = []
-    for x in nums:
-        t = x.replace(",", "")
-        if t.isdigit():
-            vals.append(int(t))
-    return max(vals) if vals else None
-
-def extract_acpt_no(text: str) -> Optional[str]:
-    m = re.search(r"acptNo=(\d{14})", text or "")
-    return m.group(1) if m else None
+def norm_company_name(name: str) -> str:
+    return _norm(name or "").replace("주식회사", "").replace("(주)", "")
 
 def company_from_title(title: str) -> str:
-    if not title: return ""
-    t = re.sub(r"\[(유|코|넥|코넥|KOSPI|KOSDAQ|KONEX)\]", "", title).strip()
-    t = re.sub(r"\[.*?정정.*?\]", "", t).strip()
-    parts = t.split()
+    t2 = re.sub(r"\[(유|코|넥|코넥|KOSPI|KOSDAQ|KONEX)\]", "", title or "").strip()
+    t2 = re.sub(r"\[.*?정정.*?\]", "", t2).strip()
+    parts = t2.split()
     if not parts: return ""
-    if parts[0] in ("주식회사", "(주)", "㈜"):
-        return f"{parts[0]} {parts[1]}" if len(parts) > 1 else parts[0]
+    if parts[0] in ("주식회사", "(주)", "㈜") and len(parts) > 1:
+        return parts[1]
     return parts[0]
 
 def market_from_title(title: str) -> str:
@@ -135,18 +112,24 @@ def market_from_title(title: str) -> str:
 def viewer_url(acpt_no: str, docno: str = "") -> str:
     return f"{BASE}/common/disclsviewer.do?method=searchInitInfo&acptNo={acpt_no}&docno={docno}"
 
-def match_keyword(title: str) -> bool:
-    return bool(title) and any(k in title for k in KEYWORDS)
-
 def is_correction_title(title: str) -> bool:
     return "정정" in (title or "")
 
 def make_event_key(company: str, first_board_date: str, bond_type: str) -> str:
-    # 정정공시 덮어쓰기 식별용 고유 키 (회사명 | 이사회결의일 | CB/EB/BW)
     return f"{_norm(company)}|{_norm_date(first_board_date)}|{_norm(bond_type)}"
 
+def _norm_date(s: str) -> str:
+    return re.sub(r"[^\d]", "", str(s or ""))
+
+# [타겟 필터링 완벽화] 띄어쓰기를 무시하고 오직 3가지 키워드만 타겟팅
+def match_strict_keyword(title: str) -> bool:
+    if not title: return False
+    title_no_space = title.replace(" ", "")
+    target_kws = ["전환사채권발행결정", "교환사채권발행결정", "신주인수권부사채권발행결정"]
+    return any(kw in title_no_space for kw in target_kws)
+
 # ==========================================================
-# 커스텀 HTML 파서 (V5.8 엔진)
+# 커스텀 HTML 파서
 # ==========================================================
 def extract_tables_from_html_robust(html: str) -> List[pd.DataFrame]:
     html = (html or "").replace("\x00", "")
@@ -170,16 +153,15 @@ def extract_tables_from_html_robust(html: str) -> List[pd.DataFrame]:
     if not results: raise ValueError("표 파싱 실패")
     return results
 
-# ==========================================================
-# RSS / Playwright 추출
-# ==========================================================
 def parse_rss_targets() -> List[Target]:
     feed = feedparser.parse(RSS_URL)
     targets = []
-    for it in (feed.entries or []):
+    for it in getattr(feed, "entries", []):
         title = getattr(it, "title", "") or ""
         link = getattr(it, "link", "") or ""
-        if not match_keyword(title): continue
+        
+        if not match_strict_keyword(title): continue # 철통 필터링 적용
+        
         acpt_no = extract_acpt_no(link) or extract_acpt_no(getattr(it, "guid", ""))
         if acpt_no: targets.append(Target(acpt_no=acpt_no, title=title, link=link))
     return list({t.acpt_no: t for t in targets}.values())
@@ -198,7 +180,7 @@ def pick_best_frame_html(page) -> str:
             if sc > best_score:
                 best_score = sc
                 best_html = html
-        except Exception: continue
+        except: continue
     return best_html
 
 def scrape_one(context, acpt_no: str) -> Tuple[List[pd.DataFrame], str, str]:
@@ -207,32 +189,28 @@ def scrape_one(context, acpt_no: str) -> Tuple[List[pd.DataFrame], str, str]:
     try:
         page.goto(url, wait_until="networkidle", timeout=60000)
         page.wait_for_timeout(1500) 
-        
         all_frames_html = page.content() + " " + " ".join([fr.content() for fr in page.frames])
         best_html = pick_best_frame_html(page) or ""
         if best_html.lower().count("<table") == 0: raise RuntimeError("table 못 찾음")
         return extract_tables_from_html_robust(best_html), url, all_frames_html
     finally:
         try: page.close()
-        except Exception: pass
+        except: pass
 
 # ==========================================================
-# 파싱 보조 함수들 (정정 반영 최우선)
+# 파싱 엔진 (정정 반영 & 한줄 포맷팅)
 # ==========================================================
 def extract_correction_after_map(dfs: List[pd.DataFrame]) -> Dict[str, str]:
     out: Dict[str, str] = {}
     for df in dfs:
         try: arr = df.astype(str).values
-        except Exception: continue
+        except: continue
         R, C = arr.shape
         header_r = after_col = item_col = None
 
         for r in range(R):
             row_norm = [_norm(x) for x in arr[r].tolist()]
-            has_before = any(w in x for w in ["정정전", "변경전"] for x in row_norm)
-            has_after = any(w in x for w in ["정정후", "변경후"] for x in row_norm)
-            
-            if has_before and has_after:
+            if any(w in x for w in ["정정전", "변경전"] for x in row_norm) and any(w in x for w in ["정정후", "변경후"] for x in row_norm):
                 header_r = r
                 after_col = next((i for i, x in enumerate(row_norm) if "정정후" in x or "변경후" in x), None)
                 item_col = next((i for i, x in enumerate(row_norm) if ("정정사항" in x or "항목" in x or "구분" in x)), 0)
@@ -250,14 +228,21 @@ def extract_correction_after_map(dfs: List[pd.DataFrame]) -> Dict[str, str]:
             after_val = ""
             if 0 <= after_col < C:
                 v = str(arr[rr][after_col]).strip()
-                if v and v.lower() != "nan" and _norm(v) not in ("정정후", "정정전", "항목", "변경사유", "정정사유", "-"):
-                    after_val = v
+                if v and v.lower() != "nan" and _norm(v) not in ("정정후", "정정전", "항목", "변경사유", "-"):
+                    after_val = _single_line(v) # 정정값도 한줄로
             if after_val: 
                 out[_norm(item)] = after_val
                 out[_clean_label(item)] = after_val
     return out
 
-def scan_label_value(dfs, label_candidates) -> str:
+def scan_label_value_preferring_correction(dfs, label_candidates, corr_after) -> str:
+    if corr_after:
+        cand_clean = {_clean_label(x) for x in label_candidates}
+        for c in cand_clean:
+            if c in corr_after and str(corr_after[c]).strip(): return _single_line(str(corr_after[c]))
+        for k, v in corr_after.items():
+            if str(v).strip() and any(c in k for c in cand_clean): return _single_line(str(v))
+            
     cand_clean = {_clean_label(x) for x in label_candidates}
     for df in dfs:
         arr = df.astype(str).values
@@ -271,81 +256,58 @@ def scan_label_value(dfs, label_candidates) -> str:
                         v_norm = _norm(v)
                         if _clean_label(v) in cand_clean: continue
                         if re.fullmatch(r"([①-⑩]|\(\d+\)|\d+\.)", v_norm): continue
-                        return v
+                        return _single_line(v)
     return ""
 
-def scan_label_value_preferring_correction(dfs, label_candidates, corr_after) -> str:
-    if corr_after:
-        cand_clean = {_clean_label(x) for x in label_candidates}
-        for c in cand_clean:
-            if c in corr_after and str(corr_after[c]).strip(): return str(corr_after[c]).strip()
-        for k, v in corr_after.items():
-            if str(v).strip() and any(c in k for c in cand_clean): return str(v).strip()
-    return scan_label_value(dfs, label_candidates)
-
-# [옵션 및 텍스트 블록 전용 파서]
 def extract_option_details(html_raw: str, option_type: str) -> str:
+    """본문에서 옵션 내용 추출 후 완벽한 한줄 텍스트로 반환"""
     soup = BeautifulSoup(html_raw, 'lxml')
-    text = soup.get_text(separator='\n', strip=True)
+    text = soup.get_text(separator=' ', strip=True) # 줄바꿈을 공백으로 치환하며 가져옴
     
     kws = ["조기상환청구권", "Put Option", "PutOption"] if option_type == 'put' else ["매도청구권", "Call Option", "CallOption"]
-    
     idx = -1
     for kw in kws:
         idx = text.find(kw)
         if idx != -1: break
         
     if idx != -1:
-        # 키워드 발견 시 뒤의 약 1500자 추출
         snippet = text[idx:idx+1500]
-        # 다음 주요 항목(10. 합병, 20. 공매도 등)이 나오면 거기서 자름
-        match = re.search(r'\n\s*(1[0-9]|2[0-9])\.\s', snippet[50:])
+        # 다음 목차 번호(예: 10., 11., 20.)가 나오면 자름
+        match = re.search(r'\s(1[0-9]|2[0-9])\.\s', snippet[50:])
         if match:
             snippet = snippet[:50+match.start()]
-        return snippet.strip()
+        return _single_line(snippet)
     return ""
 
 def extract_call_ratio_and_ytc(call_text: str) -> Tuple[str, str]:
     if not call_text: return "", ""
     ratio, ytc = "", ""
-    
-    # 비율 추출 (예: "35/100", "35%")
     r_match = re.search(r'(\d{1,3})(?:\s*/\s*100|\s*%)', call_text)
     if r_match:
         val = float(r_match.group(1))
         if 0 < val <= 100: ratio = f"{val:g}%"
-        
-    # YTC 추출 (예: "연 10.0%", "연복리 5%")
     y_match = re.search(r'연\s*(?:복리)?\s*(\d+(?:\.\d+)?)\s*%', call_text)
     if y_match: ytc = f"{y_match.group(1)}%"
-        
     return ratio, ytc
 
 def extract_period_dates(dfs, corr_after, period_kws) -> Tuple[str, str]:
-    start_date, end_date = "", ""
-    
-    if corr_after:
-        for k, v in corr_after.items():
-            if any(p in k for p in period_kws):
-                dates = re.findall(r'\d{4}[-년\.]\s*\d{1,2}[-월\.]\s*\d{1,2}', v)
-                if len(dates) >= 2: return dates[0], dates[-1]
-
+    s_date, e_date = "", ""
     for df in dfs:
         arr = df.astype(str).values
         for r in range(arr.shape[0]):
             row_str = _norm("".join(arr[r]))
             if any(p in row_str for p in period_kws) or "시작일" in row_str or "종료일" in row_str:
-                dates = re.findall(r'\d{4}[-년\.]\s*\d{1,2}[-월\.]\s*\d{1,2}', " ".join(arr[r]))
-                if "시작" in row_str and not start_date and dates: start_date = dates[0]
-                elif "종료" in row_str and not end_date and dates: end_date = dates[-1]
+                dates = re.findall(r'\d{4}[-년\.\s]+\d{1,2}[-월\.\s]+\d{1,2}', " ".join(arr[r]))
+                if "시작" in row_str and not s_date and dates: s_date = _format_date(dates[0])
+                elif "종료" in row_str and not e_date and dates: e_date = _format_date(dates[-1])
                 elif len(dates) >= 2:
-                    return dates[0], dates[-1]
-    return start_date, end_date
+                    return _format_date(dates[0]), _format_date(dates[-1])
+    return s_date, e_date
 
-# V5.8 투자자 추출 및 자금용도 (그대로 유지)
 def extract_investors(dfs: List[pd.DataFrame], corr_after: Dict[str, str]) -> str:
+    """투자자 리스트를 한 줄(A, B, C)로 추출"""
     investors = []
-    blacklist = ["관계", "지분", "%", "주식", "배정", "선정", "경위", "비고", "합계", "소계", "명"]
+    blacklist = ["관계", "지분", "%", "배정", "비고", "합계", "소계", "명", "출자자"]
     def is_valid(sn):
         sn = sn.strip()
         if not sn or len(sn) > 40 or re.fullmatch(r'[\d,\.\s]+', sn): return False
@@ -353,26 +315,39 @@ def extract_investors(dfs: List[pd.DataFrame], corr_after: Dict[str, str]) -> st
             if bw in _norm(sn): return False
         return True
 
-    for df in dfs:
-        arr = df.astype(str).values
-        for r in range(arr.shape[0]):
-            row_str = "".join([_norm(str(x)) for x in arr[r]])
-            if any(kw in row_str for kw in ["발행대상자", "성명(법인명)", "인수인"]):
-                for rr in range(r + 1, arr.shape[0]):
-                    val = str(arr[rr][0]).strip()
-                    if "합계" in _norm(val) or val.startswith("주1)"): break
-                    for chunk in val.split('\n'):
-                        if is_valid(chunk) and chunk not in investors: investors.append(chunk)
-                if investors: return ", ".join(investors[:12])
-
-    val = scan_label_value_preferring_correction(dfs, ["발행대상자", "배정대상자", "투자자", "인수인"], corr_after)
+    val = scan_label_value_preferring_correction(dfs, ["발행대상자", "배정대상자", "투자자", "성명(법인명)", "인수인"], corr_after)
     if val:
         for chunk in re.split(r'[\n,]', val):
-            if is_valid(chunk) and chunk not in investors: investors.append(chunk.strip())
-    return ", ".join(investors)
+            if is_valid(chunk) and chunk.strip() not in investors: investors.append(chunk.strip())
+    
+    if not investors:
+        for df in dfs:
+            if "발행대상자명" in _norm(df.to_string()) or "대상자명" in _norm(df.to_string()):
+                arr = df.astype(str).values
+                for r in range(1, arr.shape[0]):
+                    name = arr[r][0].split('\n')[0].strip()
+                    if is_valid(name) and name not in investors: investors.append(name)
+                    
+    return _single_line(", ".join(investors[:15])) # 한 줄로 결합
+
+def extract_fund_usage(dfs: List[pd.DataFrame], corr_after) -> str:
+    """자금조달 목적을 한 줄(운영자금 50억, 시설자금 10억)로 추출"""
+    uses_map = {"시설자금":0, "영업양수자금":0, "운영자금":0, "채무상환자금":0, "타법인증권":0, "기타자금":0}
+    for df in dfs:
+        text = _norm(df.to_string())
+        if "자금조달의목적" in text:
+            for k in uses_map.keys():
+                m = re.search(f"{k}.*?([\d,]{{4,}})", text)
+                if m: uses_map[k] += int(m.group(1).replace(",", ""))
+                
+    result = [f"{k} {v:,}원" for k, v in sorted(uses_map.items(), key=lambda x: x[1], reverse=True) if v > 0]
+    if result: return _single_line(", ".join(result))
+    
+    val = scan_label_value_preferring_correction(dfs, ["조달자금의 구체적 사용 목적", "자금용도"], corr_after)
+    return _single_line(val)
 
 # ==========================================================
-# 레코드 파싱 로직
+# 레코드 파싱 (최종 매핑)
 # ==========================================================
 def parse_bond_record(dfs, t: Target, corr_after, html_raw, company_market_map) -> dict:
     rec = {k: "" for k in BOND_COLUMNS}
@@ -382,24 +357,17 @@ def parse_bond_record(dfs, t: Target, corr_after, html_raw, company_market_map) 
     title_clean = t.title.replace("[자동복구대상]", "").strip()
     rec["보고서명"] = title_clean
     
-    # [1] 구분 컬럼 자동 지정
-    if "교환" in title_clean: rec["구분"] = "EB"
-    elif "신주" in title_clean: rec["구분"] = "BW"
-    elif "전환" in title_clean: rec["구분"] = "CB"
+    title_no_space = title_clean.replace(" ", "")
+    if "교환사채" in title_no_space: rec["구분"] = "EB"
+    elif "신주인수권" in title_no_space: rec["구분"] = "BW"
+    elif "전환사채" in title_no_space: rec["구분"] = "CB"
     
-    rec["회사명"] = scan_label_value_preferring_correction(dfs, ["회사명", "회사 명", "발행회사"], corr_after) or company_from_title(title_clean) or title_clean
-    
-    mkt = scan_label_value_preferring_correction(dfs, ["상장시장", "시장구분"], corr_after)
-    rec["상장시장"] = mkt or market_from_title(title_clean) or t.market or company_market_map.get(norm_company_name(rec["회사명"]))
+    rec["회사명"] = scan_label_value_preferring_correction(dfs, ["회사명", "회사 명"], corr_after) or company_from_title(title_clean)
+    rec["상장시장"] = scan_label_value_preferring_correction(dfs, ["상장시장", "시장구분"], corr_after) or market_from_title(title_clean) or company_market_map.get(norm_company_name(rec["회사명"]), "")
 
-    def get_valid_date(labels):
-        val = scan_label_value_preferring_correction(dfs, labels, corr_after)
-        if val and re.search(r'\d{4}', val) and "정정" not in val: return val
-        return ""
-
-    rec["최초 이사회결의일"] = get_valid_date(["이사회결의일(결정일)", "이사회결의일", "최초 이사회결의일"])
-    rec["납입일"] = get_valid_date(["납입일", "납입기일", "청약일"])
-    rec["만기"] = get_valid_date(["사채만기일", "만기일", "상환기일"])
+    rec["최초 이사회결의일"] = _format_date(scan_label_value_preferring_correction(dfs, ["이사회결의일(결정일)", "이사회결의일", "최초이사회결의일"], corr_after))
+    rec["납입일"] = _format_date(scan_label_value_preferring_correction(dfs, ["납입일", "납입기일", "청약일"], corr_after))
+    rec["만기"] = _format_date(scan_label_value_preferring_correction(dfs, ["사채만기일", "만기일", "상환기일"], corr_after))
     
     rec["모집방식"] = scan_label_value_preferring_correction(dfs, ["사채발행방법", "모집방법", "발행방법"], corr_after)
     rec["발행상품"] = scan_label_value_preferring_correction(dfs, ["사채의 종류", "종류", "사채종류"], corr_after)
@@ -407,8 +375,8 @@ def parse_bond_record(dfs, t: Target, corr_after, html_raw, company_market_map) 
     def get_corr_num(labels, as_float=False):
         val = scan_label_value_preferring_correction(dfs, labels, corr_after)
         if as_float: return str(_to_float(val)) if _to_float(val) is not None else ""
-        amt = _max_int_in_text(val)
-        return f"{amt:,}" if amt and amt > 50 else ""
+        amt = _to_int(val)
+        return f"{amt:,}" if amt and amt > 50 else "" # 항목번호(1,2,3) 오인 방지 (50 초과만 허용)
 
     rec["권면총액(원)"] = get_corr_num(["사채의권면(전자등록)총액(원)", "권면(전자등록)총액(원)", "사채의 권면총액", "사채의 총액", "발행총액"])
     rec["Coupon"] = get_corr_num(["표면이자율(%)", "표면이자율", "표면금리"], as_float=True)
@@ -418,32 +386,19 @@ def parse_bond_record(dfs, t: Target, corr_after, html_raw, company_market_map) 
     rec["주식총수대비 비율"] = scan_label_value_preferring_correction(dfs, ["주식총수 대비 비율(%)", "총수 대비 비율"], corr_after)
     rec["Refixing Floor"] = get_corr_num(["최저 조정가액 (원)", "최저조정가액", "리픽싱하한"])
 
-    # 기간 추출
     s_date, e_date = extract_period_dates(dfs, corr_after, ["전환청구기간", "교환청구기간", "권리행사기간"])
     rec["전환청구 시작"] = s_date
     rec["전환청구 종료"] = e_date
 
-    # 옵션 추출 (텍스트 블록)
     rec["Put Option"] = extract_option_details(html_raw, 'put')
     rec["Call Option"] = extract_option_details(html_raw, 'call')
     
-    # 비율 및 YTC 자동 파싱
     ratio, ytc = extract_call_ratio_and_ytc(rec["Call Option"])
     rec["Call 비율"] = ratio
     rec["YTC"] = ytc
 
     rec["투자자"] = extract_investors(dfs, corr_after)
-    
-    # 자금용도 (기존 V5.8 로직)
-    uses_map = {"시설자금":0, "영업양수자금":0, "운영자금":0, "채무상환자금":0, "타법인증권":0, "기타자금":0}
-    for df in dfs:
-        text = _norm(df.to_string())
-        if "자금조달의목적" in text:
-            for k in uses_map.keys():
-                m = re.search(f"{k}.*?([\d,]{{4,}})", text)
-                if m: uses_map[k] += int(m.group(1).replace(",", ""))
-    sorted_uses = [k for k, v in sorted(uses_map.items(), key=lambda x: x[1], reverse=True) if v > 0]
-    rec["자금용도"] = ", ".join(sorted_uses) if sorted_uses else scan_label_value_preferring_correction(dfs, ["조달자금의 구체적 사용 목적"], corr_after)
+    rec["자금용도"] = extract_fund_usage(dfs, corr_after)
 
     return rec
 
@@ -463,6 +418,7 @@ def gs_open():
     return sh, bond_ws, seen_ws
 
 def build_indices(values: List[List[str]], headers: List[str]):
+    if not values or len(values) < 2: return {}, {}
     col_acpt = headers.index("접수번호")
     col_comp = headers.index("회사명")
     col_first = headers.index("최초 이사회결의일")
@@ -488,7 +444,7 @@ def build_indices(values: List[List[str]], headers: List[str]):
 def run():
     sh, bond_ws, seen_ws = gs_open()
 
-    if bond_ws.row_values(1) != BOND_COLUMNS: 
+    if not bond_ws.get_all_values() or bond_ws.row_values(1) != BOND_COLUMNS: 
         bond_ws.update(f"A1:{rowcol_to_a1(1, len(BOND_COLUMNS))}", [BOND_COLUMNS])
 
     values = bond_ws.get_all_values()
@@ -501,14 +457,14 @@ def run():
 
     company_market_map = {}
     for row in values[1:]:
-        c_name = row[BOND_COLUMNS.index("회사명")].strip() if len(row) > 1 else ""
-        c_mkt = row[BOND_COLUMNS.index("상장시장")].strip() if len(row) > 3 else ""
+        c_name = row[BOND_COLUMNS.index("회사명")].strip() if len(row) > BOND_COLUMNS.index("회사명") else ""
+        c_mkt = row[BOND_COLUMNS.index("상장시장")].strip() if len(row) > BOND_COLUMNS.index("상장시장") else ""
         if c_name and c_mkt in ["코스닥", "유가증권", "코넥스"]:
             company_market_map[norm_company_name(c_name)] = c_mkt
 
     targets_dict = {t.acpt_no: t for t in parse_rss_targets()}
 
-    # 복구(재독) 로직
+    # [복구 시스템] 빈칸/오류 감지 시 강제 재파싱
     for row in values[1:]:
         acpt = row[BOND_COLUMNS.index("접수번호")] if len(row) > BOND_COLUMNS.index("접수번호") else ""
         if not acpt.isdigit(): continue
@@ -520,7 +476,7 @@ def run():
         if needs_fix and acpt not in targets_dict:
             title = row[BOND_COLUMNS.index("보고서명")] if len(row) > BOND_COLUMNS.index("보고서명") else "[자동복구대상]"
             targets_dict[acpt] = Target(acpt_no=acpt, title=title, link="")
-            print(f"[INFO] 빈칸/오류 감지됨: {title} ({acpt}) -> 강제 재파싱 대기열 추가")
+            print(f"[INFO] 누락 데이터 복구 진행: {title} ({acpt})")
 
     if RUN_ONE_ACPTNO:
         targets = [Target(acpt_no=RUN_ONE_ACPTNO, title=f"[MANUAL]{RUN_ONE_ACPTNO}", link="")]
@@ -542,7 +498,6 @@ def run():
                 corr_after = extract_correction_after_map(dfs) if is_correction_title(t.title) else None
                 rec = parse_bond_record(dfs, t, corr_after, html_raw, company_market_map)
 
-                # 정정공시 덮어쓰기 로직 (UPDATE)
                 evk = make_event_key(rec.get("회사명", ""), rec.get("최초 이사회결의일", ""), rec.get("구분", ""))
                 mode = "APPEND"
                 row = -1
@@ -566,9 +521,8 @@ def run():
                     bond_index[rec["접수번호"]] = row
                     event_index[evk] = (row, rec["접수번호"])
 
-                print(f"[OK] {t.acpt_no} mode={mode} row={row}")
+                print(f"[OK] {t.acpt_no} mode={mode} row={row} | {rec['회사명']} {rec['구분']}")
                 
-                # SEEN 처리
                 ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
                 if t.acpt_no in seen_index: seen_ws.update(f"B{seen_index[t.acpt_no]}", [[ts]])
                 else:
