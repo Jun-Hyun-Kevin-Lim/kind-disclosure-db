@@ -1,8 +1,5 @@
 # ==========================================================
-# #유상증자_코드V5.5_Ultimate (투자자 블랙리스트 극강화판)
-# - [유지] '회사명' 옆에 '보고서명' 컬럼 추가 및 기존 정확도 로직 100% 유지
-# - [개선] 투자자 추출 시 "출자자수 (명)", "본점소재지" 등 악성 쓰레기값 필터링 추가
-# - [개선] 시트에 남아있는 오답(출자자수 등) 감지 시 자동 재파싱(Self-Healing) 작동
+# #유상증자_코드V5.6
 # ==========================================================
 import os
 import re
@@ -451,13 +448,8 @@ def extract_fund_use_and_amount(dfs, corr_after) -> Tuple[str, float]:
     total_sum = sum(found_amts.get(name, 0) for name in uses)
     return ", ".join(uses), total_sum
 
-# ==========================================================
-# [개선] 투자자 추출 블랙리스트 & 정밀 필터링 함수
-# ==========================================================
 def extract_investors(dfs: List[pd.DataFrame], corr_after: Dict[str, str]) -> str:
     investors = []
-    
-    # [핵심] 여기에 있는 단어가 포함된 칸은 무조건 "이름이 아니다"라고 판단하고 버림
     blacklist = [
         "관계", "지분", "%", "주식", "배정", "선정", "경위", "비고", "해당사항", 
         "정정전", "정정후", "정정", "변경", "합계", "소계", "총계", "발행", "납입", 
@@ -469,7 +461,6 @@ def extract_investors(dfs: List[pd.DataFrame], corr_after: Dict[str, str]) -> st
         sn = s.strip()
         if not sn or sn in ("-", ".", ",", "(", ")", "0", "1"): return False
         if len(sn) > 40: return False
-        # 숫자로만 이루어진 텍스트(예: 999,999, 6)는 무조건 버림
         if re.fullmatch(r'[\d,\.\s]+', sn): return False 
         
         sn_norm = _norm(sn)
@@ -559,14 +550,25 @@ def parse_rights_issue_record(dfs, t: Target, corr_after, html_raw, company_mark
         company_market_map[norm_company_name(rec["회사명"])] = rec["상장시장"]
         company_market_map[norm_company_name(title_clean)] = rec["상장시장"]
 
+    # [핵심] 날짜 추출 시 "추가상장", "상장주식총수", "교부예정일" 등의 표 헤더를 무조건 차단하는 철벽 필터
     def get_valid_date(labels):
         cand_clean = {_clean_label(x) for x in labels}
+        
+        def is_clean_date(v):
+            v = str(v).strip()
+            if not re.search(r'\d', v): return False
+            # 이 단어들이 있으면 날짜가 아니라 표 항목이거나 쓰레기값임
+            bad_kws = ["정정", "변경", "요청", "사유", "기재", "오기", "추가상장", "상장주식", "총수", "교부예정일", "사항", "기준", "발행", "항목"]
+            if any(b in v for b in bad_kws): return False
+            # 날짜라면 최소한 연도(4자리 숫자)나, 특수기호(년,월,일,-,.)를 포함해야 함
+            if not (re.search(r'\d{4}', v) or re.search(r'\d{2,4}[\.\-\/년]\s*\d{1,2}', v)):
+                return False
+            return True
+
         if corr_after:
             for k, v in corr_after.items():
                 if any(c in k for c in cand_clean):
-                    val = str(v).strip()
-                    if re.search(r'\d', val) and not any(b in val for b in ["정정", "변경", "요청", "사유", "기재", "오기"]):
-                        return val
+                    if is_clean_date(v): return str(v).strip()
 
         for df in dfs:
             arr = df.astype(str).values
@@ -578,14 +580,13 @@ def parse_rights_issue_record(dfs, t: Target, corr_after, html_raw, company_mark
                     for v in row_vals:
                         if _clean_label(v) in cand_clean: continue
                         if re.fullmatch(r"([①-⑩]|\(\d+\)|\d+\.)", _norm(v)): continue
-                        if any(b in v for b in ["정정", "변경", "요청", "사유", "기재", "오기"]): continue
                         
-                        if re.search(r'\d', v) and any(sep in v for sep in ["년", "월", "일", "-", ".", "/"]):
+                        if is_clean_date(v):
                             possible_dates.append(v)
                     if possible_dates: return possible_dates[-1] 
                         
         val = scan_label_value(dfs, labels)
-        if val and re.search(r'\d', val) and not any(b in val for b in ["정정", "변경", "요청", "사유", "기재", "오기"]):
+        if is_clean_date(val):
             return val
         return ""
 
@@ -649,8 +650,6 @@ def parse_rights_issue_record(dfs, t: Target, corr_after, html_raw, company_mark
 
     uses_text, total_fund_amt = extract_fund_use_and_amount(dfs, corr_after)
     rec["자금용도"] = uses_text
-    
-    # [핵심] 개선된 블랙리스트가 적용된 투자자 추출 로직
     rec["투자자"] = extract_investors(dfs, corr_after)
 
     sh = _to_int(rec["신규발행주식수"])
@@ -707,7 +706,18 @@ def run():
         comp_name = get_val(row, "회사명")
         prev_shares = get_val(row, "증자전 주식수")
         
-        # [감지 트리거] 투자자 컬럼에 "출자자수", "소재지" 등의 쓰레기 데이터가 있으면 무조건 재파싱
+        # 날짜 컬럼들에 쓰레기값(표 항목명)이 들어갔는지 확인하는 감지기
+        div_date = get_val(row, "신주의 배당기산일")
+        list_date = get_val(row, "신주의 상장 예정일")
+        board_date = get_val(row, "이사회결의일")
+        
+        bad_date_kws = ["상장", "총수", "교부", "추가", "사항", "항목"]
+        date_needs_fix = (
+            any(k in div_date for k in bad_date_kws) or
+            any(k in list_date for k in bad_date_kws) or
+            any(k in board_date for k in bad_date_kws)
+        )
+        
         bad_inv_kws = ["관계", "최대주주", "지분", "%", "정정", "주1", "합계", "소계", "출자자", "소재지", "명"]
         investor_needs_fix = any(k in investor_val for k in bad_inv_kws) or bool(re.search(r'\d{4,}', investor_val))
         
@@ -720,6 +730,7 @@ def run():
             not re.search(r'\d', pay_date) or "정정" in pay_date or "변경" in pay_date or "요청" in pay_date or
             not first_date or
             investor_needs_fix or
+            date_needs_fix or  # [추가] 날짜 컬럼 오작동 감지 시 강제 재파싱
             not comp_name or comp_name in ["유", "코", "넥"] or
             prev_shares == "3" 
         )
