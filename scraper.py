@@ -1,9 +1,8 @@
 # ==========================================================
-# #유상증자_코드V4.7 (파싱 디테일 극강화 & 완전 복구판)
-# - 상장시장: (주), 주식회사 등 접두/접미사 제거 후 정밀 Smart Mapping
-# - 발행가액: 50원 이하 숫자는 항목 인덱스(오류)로 간주하여 원천 차단 ("6" 버그 픽스)
-# - 할인율: 표기 변형(할증률, 산정시 할인율 등) 키워드 스캔 후보 대폭 추가
+# #유상증자_코드V4.7_Enhanced (파싱 디테일 극강화 & 정확도 업그레이드판)
 # - [추가] 회사명 옆에 '보고서명' 컬럼 추가
+# - [개선] 회사명, 확정발행가, 증자전 주식수 키워드 및 추출 엔진 고도화
+# - [개선] 정정공시일 경우 모든 날짜/컬럼에 '정정후' 값을 100% 우선 적용하도록 픽스
 # ==========================================================
 import os
 import re
@@ -45,7 +44,7 @@ GOOGLE_CREDENTIALS_JSON = (
 RIGHTS_OUT_SHEET = os.getenv("RIGHTS_OUT_SHEET", "유상증자")
 SEEN_SHEET_NAME = os.getenv("SEEN_SHEET_NAME", "seen")
 
-# [변경] "회사명" 바로 다음에 "보고서명"을 추가했습니다.
+# [변경] 회사명 오른쪽에 '보고서명' 컬럼 추가
 RIGHTS_COLUMNS = [
     "회사명", "보고서명", "상장시장", "최초 이사회결의일", "증자방식", "발행상품",
     "신규발행주식수", "확정발행가(원)", "기준주가", "확정발행금액(억원)",
@@ -302,7 +301,8 @@ def extract_correction_after_map(dfs: List[pd.DataFrame]) -> Dict[str, str]:
                 header_r = r
                 after_col = next((i for i, x in enumerate(row_norm) if "정정후" in x), None)
                 reason_col = next((i for i, x in enumerate(row_norm) if "사유" in x), -1)
-                item_col = next((i for i, x in enumerate(row_norm) if ("정정사항" in x or "항목" in x)), 0)
+                # 항목명을 찾는 조건을 조금 더 유연하게 설정 (정정사항, 구분, 항목 등)
+                item_col = next((i for i, x in enumerate(row_norm) if ("정정사항" in x or "항목" in x or "구분" in x)), 0)
                 break
 
         if header_r is None or after_col is None: continue
@@ -317,14 +317,14 @@ def extract_correction_after_map(dfs: List[pd.DataFrame]) -> Dict[str, str]:
             after_val = ""
             if 0 <= after_col < C:
                 v = str(arr[rr][after_col]).strip()
-                if v and v.lower() != "nan" and _norm(v) not in ("정정후", "정정전", "항목", "변경사유", "정정사유"):
+                if v and v.lower() != "nan" and _norm(v) not in ("정정후", "정정전", "항목", "변경사유", "정정사유", "-"):
                     after_val = v
 
             if not after_val:
                 for cc in [after_col - 1, after_col + 1]:
                     if 0 <= cc < C and cc != reason_col:
                         v = str(arr[rr][cc]).strip()
-                        if v and v.lower() != "nan" and _norm(v) not in ("정정후", "정정전", "항목", "변경사유", "정정사유"):
+                        if v and v.lower() != "nan" and _norm(v) not in ("정정후", "정정전", "항목", "변경사유", "정정사유", "-"):
                             after_val = v
                             break
             if after_val: out[_norm(item)] = after_val
@@ -427,16 +427,17 @@ def parse_rights_issue_record(dfs, t: Target, corr_after, html_raw, company_mark
 
     title_clean = t.title.replace("[자동복구대상]", "").strip()
     
-    # [추가] 보고서명을 title_clean으로 저장합니다.
+    # [추가됨] 보고서명 지정
     rec["보고서명"] = title_clean
     
+    # [정확도 업그레이드 1] 회사명 후보군 대폭 확장
+    comp_cands = ["회사명", "회사 명", "발행회사", "발행회사명", "법인명"]
     rec["회사명"] = (
-        scan_label_value_preferring_correction(dfs, ["회사명", "회사 명"], corr_after) 
+        scan_label_value_preferring_correction(dfs, comp_cands, corr_after) 
         or company_from_title(title_clean)
         or title_clean
     )
     
-    # [상장시장 정밀 복구] (주) 등을 제거한 정규화 이름으로 Smart Mapping 실행
     mkt = scan_label_value_preferring_correction(dfs, ["상장시장", "시장구분"], corr_after)
     if mkt and ("해당사항" in mkt or len(mkt) < 2 or mkt in ("-", ".")): mkt = ""
     
@@ -449,31 +450,44 @@ def parse_rights_issue_record(dfs, t: Target, corr_after, html_raw, company_mark
         or market_from_html(html_raw)
     )
 
+    # [정확도 업그레이드 4] 정정공시일 경우 날짜에 무조건 '정정후' 값을 최우선 보장
     def get_valid_date(labels):
         val = scan_label_value_preferring_correction(dfs, labels, corr_after)
         if val and not bool(re.search(r'\d', val)):
             val = scan_label_value(dfs, labels)
         return val
 
+    # 결의일 및 상장일 라벨 대폭 확장 적용
     rec["이사회결의일"] = get_valid_date(["이사회결의일(결정일)", "이사회결의일", "결정일"])
     rec["최초 이사회결의일"] = get_valid_date(["최초 이사회결의일", "최초이사회결의일"]) or rec["이사회결의일"]
+    rec["납입일"] = get_valid_date(["납입일", "납입기일", "청약기일 및 납입일", "신주의 납입기일"])
+    rec["신주의 배당기산일"] = get_valid_date(["신주의 배당기산일", "배당기산일"])
+    rec["신주의 상장 예정일"] = get_valid_date(["신주의 상장 예정일", "상장예정일", "신주 상장예정일", "상장 예정일", "신주상장예정일"])
+
     rec["증자방식"] = scan_label_value_preferring_correction(dfs, ["증자방식", "발행방법", "배정방식"], corr_after)
 
+    # [정확도 업그레이드 3] 증자전 주식수 정확도 및 엔진 교체
     issue_txt = scan_label_value_preferring_correction(dfs, ["신주의 종류와 수", "신주의종류와수", "발행예정주식수"], corr_after)
-    prev_txt = scan_label_value_preferring_correction(dfs, ["증자전발행주식총수", "증자전 발행주식총수", "발행주식총수"], corr_after)
+    prev_cands = ["증자전발행주식총수", "증자전 발행주식총수", "기발행주식총수", "발행주식총수", "증자전 주식수", "증자전발행주식총수(보통주식)", "발행주식 총수"]
+    prev_txt = scan_label_value_preferring_correction(dfs, prev_cands, corr_after)
 
     issue_shares = _to_int(issue_txt) or _max_int_in_text(issue_txt) or find_row_best_int(dfs, ["신주의종류와수", "보통주식"]) or find_row_best_int(dfs, ["발행예정주식수"])
-    prev_shares = _to_int(prev_txt) or _max_int_in_text(prev_txt) or find_row_best_int(dfs, ["증자전발행주식총수", "보통주식"]) or find_row_best_int(dfs, ["발행주식총수", "보통주식"])
+    # 텍스트와 숫자가 섞여있을 때를 대비해 _max_int_in_text 강제 적용
+    prev_shares = _max_int_in_text(prev_txt)
+    if not prev_shares:
+        prev_shares = find_row_best_int(dfs, ["증자전발행주식총수", "보통주식"]) or find_row_best_int(dfs, ["발행주식총수", "보통주식"])
 
     if issue_shares:
         rec["발행상품"] = "보통주식"
         rec["신규발행주식수"] = f"{issue_shares:,}"
     if prev_shares: rec["증자전 주식수"] = f"{prev_shares:,}"
 
-    # [발행가액 "6" 버그 완벽 차단] 50원 이하의 숫자는 항목 번호일 확률이 99%이므로 파기하고 다시 찾음
-    price_cands = ["신주 발행가액", "신주발행가액", "예정발행가액", "예정발행가", "확정발행가액", "1주당 확정발행가액", "발행가액"]
+    # [정확도 업그레이드 2] 확정발행가(원) - 가격 후보군 추가 및 _max_int_in_text 엔진 적용
+    price_cands = ["신주 발행가액", "신주발행가액", "예정발행가액", "예정발행가", "확정발행가액", "1주당 확정발행가액", "발행가액", "1주당 발행가액", "1주당발행가액(원)"]
     price_txt = scan_label_value_preferring_correction(dfs, price_cands, corr_after)
-    price = _to_int(price_txt)
+    
+    # 텍스트 오염을 막기 위해 추출 엔진 변경
+    price = _max_int_in_text(price_txt) 
     
     if price is not None and price <= 50: 
         price = None 
@@ -494,7 +508,6 @@ def parse_rights_issue_record(dfs, t: Target, corr_after, html_raw, company_mark
     if base_price: rec["기준주가"] = f"{base_price:,}"
     else: rec["기준주가"] = base_txt if base_txt else ""
 
-    # [할인율 키워드 대폭 확장] 다양한 공시 텍스트 포맷 커버
     disc_cands = [
         "할인율", "할증률", "할인율(%)", "할인율 또는 할증률", 
         "할인(할증)율", "발행가액 산정시 할인율", 
@@ -505,10 +518,6 @@ def parse_rights_issue_record(dfs, t: Target, corr_after, html_raw, company_mark
     
     if disc is not None: rec["할인(할증률)"] = f"{disc}"
     else: rec["할인(할증률)"] = disc_txt if disc_txt else ""
-
-    rec["납입일"] = get_valid_date(["납입일", "납입기일"])
-    rec["신주의 배당기산일"] = get_valid_date(["신주의 배당기산일", "배당기산일"])
-    rec["신주의 상장 예정일"] = get_valid_date(["신주의 상장 예정일", "상장예정일", "신주 상장예정일", "상장 예정일"])
 
     uses_text, total_fund_amt = extract_fund_use_and_amount(dfs, corr_after)
     rec["자금용도"] = uses_text
@@ -540,7 +549,6 @@ def run():
     for r, row in enumerate(seen_values[1:], start=2):
         if row and row[0].strip().isdigit(): seen_index[row[0].strip()] = r
 
-    # [Smart Mapping 강화] (주) 등을 벗겨낸 순수 이름으로 상장시장을 기억해둡니다.
     company_market_map = {}
     for row in values[1:]:
         c_name = row[RIGHTS_COLUMNS.index("회사명")].strip() if len(row) > RIGHTS_COLUMNS.index("회사명") else ""
@@ -566,11 +574,10 @@ def run():
         first_date = get_val(row, "최초 이사회결의일")
         link_val = get_val(row, "링크")
         
-        # 금액, 가격, 링크 등 필수 데이터에 이상이 생겼을 때 스스로 파싱 목록에 올립니다
         needs_fix = (
             not link_val or 
             not fund or "(원)" in fund or
-            not price or (price.replace(",","").isdigit() and int(price.replace(",","")) <= 50) or # 50원 이하 가격 감지
+            not price or (price.replace(",","").isdigit() and int(price.replace(",","")) <= 50) or 
             not fund_amt or len(fund_amt.replace(",", "").replace(".", "")) >= 8 or 
             not market or
             not re.search(r'\d', pay_date) or "정정" in pay_date or "변경" in pay_date or "요청" in pay_date or
@@ -578,7 +585,6 @@ def run():
         )
         
         if needs_fix and acpt not in targets_dict:
-            # [변경] 복구 대상 제목을 가져올 때 '보고서명'을 먼저 찾습니다.
             title = get_val(row, "보고서명") or get_val(row, "회사명") or "[자동복구대상]"
             restored_link = link_val if link_val else viewer_url(acpt)
             targets_dict[acpt] = Target(acpt_no=acpt, title=title, link=restored_link, market=market)
