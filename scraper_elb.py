@@ -1,9 +1,9 @@
 # ==========================================================
-# #주식연계채권_코드V10.1_Ultimate_Targeting (자금용도 라벨 전용판)
-# 1. [수정] 자금용도: 금액(원)을 제외하고 해당되는 라벨만 추출 (예: "운영자금, 채무상환자금")
-# 2. Put/Call Option: 정규식을 이용해 해당 제목부터 다음 목차 전까지 완벽하게 블록 추출
-# 3. 발행상품: '사채의 종류' 셀의 우측/하단 데이터를 찾고 불필요한 '회차' 텍스트 제거
-# 4. 기존 V9.2의 0.0% 보존, 정정공시 덮어쓰기, 텍스트 한 줄 정렬 로직 완벽 유지
+# #주식연계채권_코드_최종 (원본 엔진 100% 유지 + 4대 컬럼 정밀 타격)
+# 1. [유지] 유상증자 890라인급 코어 엔진, 정정공시 덮어쓰기, 문법 에러 픽스 완벽 보존
+# 2. [변경] Put/Call Option: 해당 제목부터 다음 목차 전까지 정규식으로 완벽히 블록 추출
+# 3. [변경] 자금용도: 금액(원)을 제외하고 "운영자금, 채무상환자금" 등 라벨만 추출
+# 4. [변경] 발행상품: 섞여 들어오는 '회차', '종류' 텍스트를 칼같이 잘라내고 상품명만 추출
 # ==========================================================
 import os
 import re
@@ -22,7 +22,7 @@ from gspread.utils import rowcol_to_a1
 from playwright.sync_api import sync_playwright
 
 # ==========================================================
-# 1. 설정 (ENV)
+# 1. 설정 (ENV) - 원본 유지
 # ==========================================================
 BASE = "https://kind.krx.co.kr"
 DEFAULT_RSS = "http://kind.krx.co.kr:80/disclosure/rsstodaydistribute.do?method=searchRssTodayDistribute&mktTpCd=0&currentPageSize=100"
@@ -58,7 +58,7 @@ class Target:
     market: str = ""
 
 # ==========================================================
-# 2. 강력한 유틸리티
+# 2. 강력한 유틸리티 - 원본 유지
 # ==========================================================
 def _norm(s: str) -> str:
     return re.sub(r"\s+", "", str(s or "")).replace(":", "")
@@ -135,7 +135,7 @@ def make_event_key(company: str, first_board_date: str, bond_type: str) -> str:
     return f"{_norm(company)}|{_norm_date(first_board_date)}|{_norm(bond_type)}"
 
 # ==========================================================
-# 3. 무결성 보장 HTML 파서
+# 3. HTML 파서 및 크롤러 - 원본 유지
 # ==========================================================
 def parse_html_table_to_df(tbl_soup) -> Optional[pd.DataFrame]:
     rows = tbl_soup.find_all('tr')
@@ -219,7 +219,7 @@ def scrape_one(context, acpt_no: str) -> Tuple[List[pd.DataFrame], str, str]:
         except: pass
 
 # ==========================================================
-# 4. 정정사항 엔진 및 기본 스캔
+# 4. 정정사항 엔진 - 원본 유지
 # ==========================================================
 def extract_correction_after_map(dfs: List[pd.DataFrame]) -> Dict[str, str]:
     out: Dict[str, str] = {}
@@ -307,36 +307,46 @@ def find_row_best_float(dfs, must_contain) -> Optional[float]:
     return None
 
 # ==========================================================
-# 5. 핵심 컬럼 전용 추출기
+# 5. 핵심 4대 컬럼 전용 추출기 [이 부분만 변경됨]
 # ==========================================================
 
+# 1) 발행상품 완벽 추출
 def extract_product_type(dfs: List[pd.DataFrame], corr_after: Dict) -> str:
-    """[발행상품 완벽 추출] '사채의 종류'를 찾아 우측/하단 내용 스캔 및 쓰레기값(회차 등) 정제"""
     val = scan_label_value_preferring_correction(dfs, ["1. 사채의 종류", "사채의 종류", "사채종류", "종류", "사태의 종류"], corr_after)
     
-    def clean_product(text):
-        text = re.sub(r'(회차|제)\s*\d+\s*(회|차)?', ' ', text)
-        text = re.sub(r'(^종류|종류$)', ' ', text).strip()
-        m = re.search(r'([가-힣a-zA-Z\s]*(?:무기명|기명|보증|무보증|사모|공모|분리|이권)[가-힣a-zA-Z\s]*(?:전환사채|교환사채|신주인수권부사채|사채))', text)
-        if m: return _single_line(m.group(1))
-        return _single_line(text)
+    def clean_product(text: str) -> str:
+        if not text: return ""
+        t = re.sub(r'\s+', ' ', text).strip()
+        t = re.sub(r'(회차|제)\s*\d+\s*(회|차)?', '', t)
+        t = re.sub(r'(1\.\s*사채의\s*종류|사채의\s*종류|사체의\s*종류|사태의\s*종류|사케의\s*종류|종류)', '', t)
+        t = t.replace("발행결정", "").strip()
+        
+        m = re.search(r'([가-힣a-zA-Z\s]+(?:전환사채|교환사채|신주인수권부사채|사채))', t)
+        if m: 
+            res = m.group(1).strip()
+            if "무기명" in res: res = res[res.find("무기명"):]
+            elif "기명" in res: res = res[res.find("기명"):]
+            elif "사모" in res: res = res[res.find("사모"):]
+            elif "공모" in res: res = res[res.find("공모"):]
+            return res
+        return t.strip()
 
     if val and "사채" in val: return clean_product(val)
     
     for df in dfs:
         arr = df.astype(str).values
-        for r in range(min(5, arr.shape[0])): 
-            row_str = " ".join(arr[r])
-            if "사채" in row_str and any(kw in row_str for kw in ["무보증", "무기명", "사모", "공모", "이권부"]):
-                return clean_product(row_str)
+        for r in range(min(8, arr.shape[0])): 
+            row_str = " ".join([str(x) for x in arr[r] if str(x).lower() != 'nan'])
+            if "사채" in row_str and any(kw in row_str for kw in ["무기명", "사모", "공모", "보증", "이권부"]):
+                cleaned = clean_product(row_str)
+                if cleaned and len(cleaned) > 3: return cleaned
     return ""
 
+# 2) 자금용도 라벨 전용 추출
 def extract_fund_usage(dfs: List[pd.DataFrame], corr_after: Dict) -> str:
-    """[자금용도 라벨 전용 추출] 금액(원) 없이 '운영자금, 채무상환자금' 형태의 라벨만 추출"""
     target_keys = ["시설자금", "영업양수자금", "운영자금", "채무상환자금", "타법인 증권 취득자금", "타법인증권취득자금", "기타자금"]
     found_funds = {}
     
-    # 1. 표 내부 탐색
     for df in dfs:
         arr = df.astype(str).values
         R, C = arr.shape
@@ -357,7 +367,6 @@ def extract_fund_usage(dfs: List[pd.DataFrame], corr_after: Dict) -> str:
                             std_key = "타법인 증권 취득자금" if "타법인" in tk else tk
                             found_funds[std_key] = max(found_funds.get(std_key, 0), amt)
 
-    # 2. 정정공시 반영
     if corr_after:
         for k, v in corr_after.items():
             for tk in target_keys:
@@ -367,7 +376,6 @@ def extract_fund_usage(dfs: List[pd.DataFrame], corr_after: Dict) -> str:
                         std_key = "타법인 증권 취득자금" if "타법인" in tk else tk
                         found_funds[std_key] = amt
 
-    # 3. 라벨만 조립 (요청사항 반영)
     if found_funds:
         result = [k for k, v in sorted(found_funds.items(), key=lambda x: x[1], reverse=True)]
         return _single_line(", ".join(result))
@@ -375,16 +383,16 @@ def extract_fund_usage(dfs: List[pd.DataFrame], corr_after: Dict) -> str:
     val = scan_label_value_preferring_correction(dfs, ["조달자금의 구체적 사용 목적", "자금용도"], corr_after)
     return _single_line(val)
 
+# 3) Put / Call Option 정규식 본문 절단기
 def extract_option_details(html_raw: str, option_type: str) -> str:
-    """[Put/Call Option 완벽 절단기] 본문에서 '제목'부터 '다음 목차 전'까지 블록 통째로 추출"""
     soup = BeautifulSoup(html_raw, 'lxml')
     for br in soup.find_all("br"): br.replace_with("\n")
     text = soup.get_text(separator='\n', strip=True) 
     
     if option_type == 'put':
-        pattern = r'(?:\[?\s*조기상환청구권\s*\([^)]*Put[^)]*\)[^\]\n]*\]?)(.*?)(?=\n\s*(?:\[?\s*매도청구권|1[0-9]\.\s*|2[0-9]\.\s*|【\s*특정인에|기타\s*투자판단))'
+        pattern = r'(?:\[?\s*조기상환청구권\s*\([^)]*Put[^)]*\)[^\]\n]*\]?|조기상환청구권\s*에\s*관한\s*사항)(.*?)(?=\n\s*(?:\[?\s*매도청구권|1[0-9]\.\s*|2[0-9]\.\s*|【\s*특정인에|기타\s*투자판단))'
     else:
-        pattern = r'(?:\[?\s*매도청구권\s*\([^)]*Call[^)]*\)[^\]\n]*\]?)(.*?)(?=\n\s*(?:1[0-9]\.\s*|2[0-9]\.\s*|【\s*특정인에|기타\s*투자판단))'
+        pattern = r'(?:\[?\s*매도청구권\s*\([^)]*Call[^)]*\)[^\]\n]*\]?|매도청구권\s*에\s*관한\s*사항)(.*?)(?=\n\s*(?:1[0-9]\.\s*|2[0-9]\.\s*|【\s*특정인에|기타\s*투자판단))'
         
     match = re.search(pattern, text, re.IGNORECASE | re.DOTALL)
     if match:
@@ -462,7 +470,7 @@ def extract_investors(dfs: List[pd.DataFrame], corr_after: Dict[str, str]) -> st
     return _single_line(", ".join(investors[:12]))
 
 # ==========================================================
-# 6. 레코드 파싱 매핑
+# 6. 레코드 파싱 매핑 - 원본 유지
 # ==========================================================
 def parse_bond_record(dfs, t: Target, corr_after, html_raw, company_market_map) -> dict:
     rec = {k: "" for k in BOND_COLUMNS}
@@ -491,8 +499,6 @@ def parse_bond_record(dfs, t: Target, corr_after, html_raw, company_market_map) 
     rec["만기"] = _format_date(scan_label_value_preferring_correction(dfs, ["사채만기일", "만기일", "상환기일"], corr_after))
     
     rec["모집방식"] = scan_label_value_preferring_correction(dfs, ["사채발행방법", "모집방법", "발행방법"], corr_after)
-    
-    # [호출] 1. 발행상품
     rec["발행상품"] = extract_product_type(dfs, corr_after)
 
     def get_corr_num(labels, fallback_keys=[], min_val=-1, as_float=False):
@@ -521,7 +527,6 @@ def parse_bond_record(dfs, t: Target, corr_after, html_raw, company_market_map) 
     s_date, e_date = extract_period_dates(dfs, corr_after, ["전환청구기간", "교환청구기간", "권리행사기간"])
     rec["전환청구 시작"], rec["전환청구 종료"] = s_date, e_date
 
-    # [호출] 2. Put / Call Option
     rec["Put Option"] = extract_option_details(html_raw, 'put')
     rec["Call Option"] = extract_option_details(html_raw, 'call')
     
@@ -530,14 +535,12 @@ def parse_bond_record(dfs, t: Target, corr_after, html_raw, company_market_map) 
     rec["YTC"] = ytc
 
     rec["투자자"] = extract_investors(dfs, corr_after)
-    
-    # [호출] 3. 자금용도 (라벨만)
     rec["자금용도"] = extract_fund_usage(dfs, corr_after)
 
     return rec
 
 # ==========================================================
-# 7. 구글 시트 연동
+# 7. 구글 시트 연동 및 덮어쓰기 로직 - 원본 유지
 # ==========================================================
 def gs_open():
     if not GOOGLE_SHEET_ID or not GOOGLE_CREDENTIALS_JSON: raise RuntimeError("구글 시트 연동 정보 누락")
@@ -571,7 +574,7 @@ def build_indices(values: List[List[str]], headers: List[str]):
     return r_idx, e_idx
 
 # ==========================================================
-# 8. 메인 실행
+# 8. 메인 실행 루프 - 원본 유지
 # ==========================================================
 def run():
     sh, bond_ws, seen_ws = gs_open()
