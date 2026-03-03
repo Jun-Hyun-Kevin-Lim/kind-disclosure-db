@@ -1,8 +1,8 @@
 # ==========================================================
-# #유상증자_코드V4.6 (상장시장 빈칸 완벽 복구판)
-# - 시트 내 동일 회사(동료 데이터)의 시장 정보를 찾아와서 빈칸을 채우는 Smart Mapping 추가
-# - KIND 뷰어 프레임 렌더링 대기 시간 연장 및 상장시장 HTML 스캔 정규식 초강화
-# - 기타 Squash 버그, 링크 증발, 날짜 텍스트 오류 방지 로직 유지
+# #유상증자_코드V4.7 (파싱 디테일 극강화 & 완전 복구판)
+# - 상장시장: (주), 주식회사 등 접두/접미사 제거 후 정밀 Smart Mapping
+# - 발행가액: 50원 이하 숫자는 항목 인덱스(오류)로 간주하여 원천 차단 ("6" 버그 픽스)
+# - 할인율: 표기 변형(할증률, 산정시 할인율 등) 키워드 스캔 후보 대폭 추가
 # ==========================================================
 import os
 import re
@@ -72,6 +72,12 @@ def _clean_label(s: str) -> str:
     s = _norm(s)
     return re.sub(r"^([①-⑩]|\(\d+\)|\d+\.)+", "", s)
 
+def norm_company_name(name: str) -> str:
+    """Smart Mapping을 위해 '주식회사', '(주)' 등을 제거한 핵심 이름 추출"""
+    if not name: return ""
+    n = name.replace("주식회사", "").replace("(주)", "").strip()
+    return _norm(n)
+
 def _norm_date(s: str) -> str:
     return re.sub(r"[^\d]", "", (s or "").strip())
 
@@ -118,16 +124,13 @@ def market_from_html(html: str) -> str:
     if not html: return ""
     html_lower = html.lower()
     
-    # 1. 헤더 프레임의 마크업 이미지 파일명 스캔 (가장 확실함)
     if "mark_kosdaq" in html_lower: return "코스닥"
     if "mark_kospi" in html_lower: return "유가증권"
     if "mark_konex" in html_lower: return "코넥스"
     
-    # 2. 이미지의 alt 속성 스캔
     m = re.search(r'alt=["\']?(코스닥|유가증권|코넥스)["\']?', html)
     if m: return m.group(1)
     
-    # 3. HTML 텍스트 전체에서 시장 키워드 강제 탐색
     if "코스닥" in html: return "코스닥"
     if "유가증권" in html: return "유가증권"
     if "코넥스" in html: return "코넥스"
@@ -204,12 +207,8 @@ def scrape_one(context, acpt_no: str) -> Tuple[List[pd.DataFrame], str, str]:
     page = context.new_page()
     try:
         page.goto(url, wait_until="networkidle", timeout=60000)
-        # 상단 헤더 프레임이 완전히 로드될 수 있도록 대기 시간을 살짝 늘립니다.
         page.wait_for_timeout(2500) 
-        
-        # 문서(DOM) 구조 전체와 하위 프레임을 모두 합쳐서 풀 스캔용으로 반환
         all_frames_html = page.content() + " " + " ".join([fr.content() for fr in page.frames])
-        
         best_html = pick_best_frame_html(page) or ""
         if best_html.lower().count("<table") == 0: raise RuntimeError("table 못 찾음")
         return extract_tables_from_html_robust(best_html), url, all_frames_html
@@ -343,7 +342,6 @@ def scan_label_value(dfs, label_candidates) -> str:
                         v_norm = _norm(v)
                         if _clean_label(v) in cand_clean: continue
                         if re.fullmatch(r"([①-⑩]|\(\d+\)|\d+\.)", v_norm): continue
-                        if v_norm.isdigit() and int(v_norm) <= 30: continue
                         return v
     return ""
 
@@ -432,16 +430,16 @@ def parse_rights_issue_record(dfs, t: Target, corr_after, html_raw, company_mark
         or title_clean
     )
     
+    # [상장시장 정밀 복구] (주) 등을 제거한 정규화 이름으로 Smart Mapping 실행
     mkt = scan_label_value_preferring_correction(dfs, ["상장시장", "시장구분"], corr_after)
     if mkt and ("해당사항" in mkt or len(mkt) < 2 or mkt in ("-", ".")): mkt = ""
     
-    # [Smart Mapping] 구글 시트에 같은 이름의 회사가 상장시장을 가지고 있다면 즉각 빌려옵니다.
     rec["상장시장"] = (
         mkt 
         or market_from_title(title_clean) 
         or t.market 
-        or company_market_map.get(rec["회사명"])
-        or company_market_map.get(title_clean)
+        or company_market_map.get(norm_company_name(rec["회사명"]))
+        or company_market_map.get(norm_company_name(title_clean))
         or market_from_html(html_raw)
     )
 
@@ -466,20 +464,41 @@ def parse_rights_issue_record(dfs, t: Target, corr_after, html_raw, company_mark
         rec["신규발행주식수"] = f"{issue_shares:,}"
     if prev_shares: rec["증자전 주식수"] = f"{prev_shares:,}"
 
-    price_txt = scan_label_value_preferring_correction(dfs, ["신주 발행가액", "신주발행가액", "예정발행가액", "예정발행가", "확정발행가액"], corr_after)
-    price = _to_int(price_txt) or find_row_best_int(dfs, ["신주발행가액", "보통주식"]) or find_row_best_int(dfs, ["예정발행가액", "보통주식"])
+    # [발행가액 "6" 버그 완벽 차단] 50원 이하의 숫자는 항목 번호일 확률이 99%이므로 파기하고 다시 찾음
+    price_cands = ["신주 발행가액", "신주발행가액", "예정발행가액", "예정발행가", "확정발행가액", "1주당 확정발행가액", "발행가액"]
+    price_txt = scan_label_value_preferring_correction(dfs, price_cands, corr_after)
+    price = _to_int(price_txt)
+    
+    if price is not None and price <= 50: 
+        price = None 
+        
+    if not price:
+        price = (find_row_best_int(dfs, ["신주발행가액", "보통주식"]) or 
+                 find_row_best_int(dfs, ["예정발행가액"]) or 
+                 find_row_best_int(dfs, ["발행가액", "원"]))
+        
     if price: rec["확정발행가(원)"] = f"{price:,}"
-    else: rec["확정발행가(원)"] = price_txt
+    else: rec["확정발행가(원)"] = price_txt if price_txt else ""
 
-    base_txt = scan_label_value_preferring_correction(dfs, ["기준주가"], corr_after)
-    base_price = _to_int(base_txt) or find_row_best_int(dfs, ["기준주가", "보통주식"]) or find_row_best_int(dfs, ["기준주가"])
+    base_txt = scan_label_value_preferring_correction(dfs, ["기준주가", "기준 주가", "기준발행가액"], corr_after)
+    base_price = _to_int(base_txt)
+    if base_price is not None and base_price <= 50: base_price = None
+    if not base_price:
+        base_price = find_row_best_int(dfs, ["기준주가", "보통주식"]) or find_row_best_int(dfs, ["기준주가"])
     if base_price: rec["기준주가"] = f"{base_price:,}"
-    else: rec["기준주가"] = base_txt
+    else: rec["기준주가"] = base_txt if base_txt else ""
 
-    disc_txt = scan_label_value_preferring_correction(dfs, ["할인율", "할인율(%)", "기준주가에 대한 할인율 또는 할증율 (%)"], corr_after)
+    # [할인율 키워드 대폭 확장] 다양한 공시 텍스트 포맷 커버
+    disc_cands = [
+        "할인율", "할증률", "할인율(%)", "할인율 또는 할증률", 
+        "할인(할증)율", "발행가액 산정시 할인율", 
+        "기준주가에 대한 할인율 또는 할증율 (%)", "기준주가에대한할인율"
+    ]
+    disc_txt = scan_label_value_preferring_correction(dfs, disc_cands, corr_after)
     disc = _to_float(disc_txt) or find_row_best_float(dfs, ["기준주가에대한할인율또는할증율"]) or find_row_best_float(dfs, ["할인율"])
+    
     if disc is not None: rec["할인(할증률)"] = f"{disc}"
-    else: rec["할인(할증률)"] = disc_txt
+    else: rec["할인(할증률)"] = disc_txt if disc_txt else ""
 
     rec["납입일"] = get_valid_date(["납입일", "납입기일"])
     rec["신주의 배당기산일"] = get_valid_date(["신주의 배당기산일", "배당기산일"])
@@ -515,13 +534,13 @@ def run():
     for r, row in enumerate(seen_values[1:], start=2):
         if row and row[0].strip().isdigit(): seen_index[row[0].strip()] = r
 
-    # [Smart Mapping 사전 준비] 시트에 있는 모든 회사의 상장시장을 맵으로 묶어둡니다.
+    # [Smart Mapping 강화] (주) 등을 벗겨낸 순수 이름으로 상장시장을 기억해둡니다.
     company_market_map = {}
     for row in values[1:]:
         c_name = row[RIGHTS_COLUMNS.index("회사명")].strip() if len(row) > RIGHTS_COLUMNS.index("회사명") else ""
         c_mkt = row[RIGHTS_COLUMNS.index("상장시장")].strip() if len(row) > RIGHTS_COLUMNS.index("상장시장") else ""
         if c_name and c_mkt in ["코스닥", "유가증권", "코넥스"]:
-            company_market_map[c_name] = c_mkt
+            company_market_map[norm_company_name(c_name)] = c_mkt
 
     targets_dict = {t.acpt_no: t for t in parse_rss_targets()}
 
@@ -541,11 +560,12 @@ def run():
         first_date = get_val(row, "최초 이사회결의일")
         link_val = get_val(row, "링크")
         
+        # 금액, 가격, 링크 등 필수 데이터에 이상이 생겼을 때 스스로 파싱 목록에 올립니다
         needs_fix = (
             not link_val or 
             not fund or "(원)" in fund or
-            not price or (price.isdigit() and len(price) <= 2) or
-            len(fund_amt.replace(",", "").replace(".", "")) >= 8 or 
+            not price or (price.replace(",","").isdigit() and int(price.replace(",","")) <= 50) or # 50원 이하 가격 감지
+            not fund_amt or len(fund_amt.replace(",", "").replace(".", "")) >= 8 or 
             not market or
             not re.search(r'\d', pay_date) or "정정" in pay_date or "변경" in pay_date or "요청" in pay_date or
             not first_date
@@ -555,7 +575,7 @@ def run():
             title = get_val(row, "회사명") or "[자동복구대상]"
             restored_link = link_val if link_val else viewer_url(acpt)
             targets_dict[acpt] = Target(acpt_no=acpt, title=title, link=restored_link, market=market)
-            print(f"[INFO] 빵꾸/오류 감지됨: {title} ({acpt}) -> 강제 재파싱 대기열 추가")
+            print(f"[INFO] 빈칸/오류 감지됨: {title} ({acpt}) -> 강제 재파싱 대기열 추가")
 
     if RUN_ONE_ACPTNO:
         targets = [Target(acpt_no=RUN_ONE_ACPTNO, title=f"[MANUAL]{RUN_ONE_ACPTNO}", link="")]
