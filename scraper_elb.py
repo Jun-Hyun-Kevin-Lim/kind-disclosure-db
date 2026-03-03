@@ -1,6 +1,6 @@
 # ==========================================================
-# #주식연계채권_코드V10.2_Product_Master (발행상품 초정밀 타격판)
-# 1. [완벽수정] 발행상품: '회차', '종류' 등 셀 병합으로 섞여 들어오는 쓰레기값을 100% 절단하여 "무기명식~사채" 부분만 추출
+# #주식연계채권_코드V10.3_DART_Quality (발행상품 초정밀 정제판)
+# 1. [완벽수정] 발행상품: KIND 특유의 '회차 5', '종류' 등 뭉쳐진 쓰레기 텍스트를 칼같이 도려내고 DART와 동일한 순수 명칭만 추출
 # 2. [유지] 자금용도: 금액(원) 제외하고 "운영자금, 채무상환자금" 등 라벨만 추출
 # 3. [유지] Put/Call Option: 해당 제목부터 다음 목차 전까지 정규식으로 완벽히 블록 추출
 # 4. [유지] 정정공시(Table 3) 삼중 덮어쓰기 시스템 및 0.0% 오인 방지 로직 완벽 보존
@@ -306,65 +306,59 @@ def find_row_best_float(dfs, must_contain) -> Optional[float]:
                 if vals: return max(vals, key=lambda z: abs(z))
     return None
 
-
 # ==========================================================
-# 5. 핵심 4대 컬럼 초정밀 타격기 (V10.2 로직)
+# 5. 핵심 4대 컬럼 전용 추출기 [발행상품 완벽 세탁기 탑재]
 # ==========================================================
 
-# 1) 발행상품 완벽 추출기 (쓰레기 텍스트 완전 배제)
 def extract_product_type(dfs: List[pd.DataFrame], corr_after: Dict) -> str:
+    """[V10.3 발행상품 완벽 필터] DART와 100% 동일한 깨끗한 사채명만 추출"""
     labels = ["1. 사채의 종류", "1.사채의종류", "사채의 종류", "사체의 종류", "사태의 종류", "사케의 종류", "사채종류", "종류"]
     
     def clean_product(text: str) -> str:
         if not text: return ""
+        # 1. 1차 노이즈 제거
         t = re.sub(r'\s+', ' ', text).strip()
+        t = re.sub(r'(?:1\.\s*)?(?:사채|사체|사태|사케)의\s*종류', '', t)
+        t = re.sub(r'회차\s*\d+', '', t)
+        t = re.sub(r'제\s*\d+\s*회차?', '', t)
+        t = re.sub(r'^종류|종류$', '', t)
+        t = t.replace('발행결정', '')
         
-        # '무기명', '기명', '이권', '무보증' 등으로 시작하여 '사채'로 끝나는 의미 있는 구문만 캡처
-        pattern = r'((?:무기명|기명|이권|무이권|보증|무보증|사모|공모|비분리|분리)[가-힣a-zA-Z\s]*(?:전환사채|교환사채|신주인수권부사채|사채))'
+        # 2. 사채의 핵심 구성요소만 정규식으로 핀셋 캡처
+        pattern = r'((?:무기명식|기명식|무기명|기명)?\s*(?:이권부|무이권부)?\s*(?:무보증|보증)?\s*(?:비분리형|분리형)?\s*(?:사모|공모)?\s*(?:전환사채|교환사채|신주인수권부사채|사채))'
         m = re.search(pattern, t)
-        
         if m:
             res = m.group(1).strip()
-        else:
-            # 접두사가 생략된 경우 (예: "전환사채"만 있을 때)
-            m2 = re.search(r'([가-힣a-zA-Z\s]*(?:전환사채|교환사채|신주인수권부사채))', t)
-            if m2: res = m2.group(1).strip()
-            else: return ""
+            if len(res) > 4: return re.sub(r'\s+', ' ', res)
             
-        # 캡처된 문자열 안에 섞여 있을 수 있는 쓰레기값 한 번 더 제거
-        res = re.sub(r'(회차|제)\s*\d+\s*(회|차)?', '', res)
-        res = re.sub(r'(1\.\s*사채의\s*종류|사채의\s*종류|사체의\s*종류|사태의\s*종류|사케의\s*종류|종류)', '', res)
-        return _single_line(res)
+        return _single_line(t)
 
-    # 1. 정정공시 최우선 탐색
+    # 1. 정정공시 최우선
     if corr_after:
         for k, v in corr_after.items():
             if any(_norm(lb) in _norm(k) for lb in labels):
                 cleaned = clean_product(v)
                 if cleaned: return cleaned
 
-    # 2. 표 스캔 (행 전체를 텍스트로 합쳐서 검색 - 가장 강력함)
+    # 2. 표 스캔 (우측/하단)
+    val = scan_label_value_preferring_correction(dfs, labels, {})
+    if val and "사채" in val:
+        cleaned = clean_product(val)
+        if cleaned: return cleaned
+        
+    # 3. 최상단 직접 탐색 (셀이 다 터져버린 경우 대비)
     for df in dfs:
         arr = df.astype(str).values
-        R, C = arr.shape
-        for r in range(min(15, R)): # 표 상단 15줄 스캔
-            row_str = " ".join([x for x in arr[r] if x.lower() != 'nan'])
-            
-            # 라벨이 있거나 "사채"라는 단어가 포함된 행이면 무조건 정규식 가위질
-            if any(_norm(lb) in _norm(row_str) for lb in labels) or "사채" in row_str:
+        for r in range(min(8, arr.shape[0])): 
+            row_str = " ".join([str(x) for x in arr[r] if str(x).lower() != 'nan'])
+            if "사채" in row_str and any(kw in row_str for kw in ["무기명", "사모", "공모", "보증", "이권부"]):
                 cleaned = clean_product(row_str)
                 if cleaned: return cleaned
                 
-                # 라벨과 값이 위/아래로 쪼개진 경우 다음 행 스캔
-                if r + 1 < R:
-                    next_row_str = " ".join([x for x in arr[r+1] if x.lower() != 'nan'])
-                    cleaned_next = clean_product(next_row_str)
-                    if cleaned_next: return cleaned_next
-                    
     return ""
 
-# 2) 자금용도 라벨 전용 추출기
 def extract_fund_usage(dfs: List[pd.DataFrame], corr_after: Dict) -> str:
+    """[V10.3 자금용도 라벨 전용] 금액(원) 없이 '운영자금, 채무상환자금' 형태의 라벨만 추출"""
     target_keys = ["시설자금", "영업양수자금", "운영자금", "채무상환자금", "타법인 증권 취득자금", "타법인증권취득자금", "기타자금"]
     found_funds = {}
     
@@ -404,8 +398,8 @@ def extract_fund_usage(dfs: List[pd.DataFrame], corr_after: Dict) -> str:
     val = scan_label_value_preferring_correction(dfs, ["조달자금의 구체적 사용 목적", "자금용도"], corr_after)
     return _single_line(val)
 
-# 3) Put / Call Option 정규식 본문 절단기
 def extract_option_details(html_raw: str, option_type: str) -> str:
+    """[V10.3 Put/Call Option 절단기] 해당 제목부터 다음 목차 번호 전까지 블록 통째로 추출"""
     soup = BeautifulSoup(html_raw, 'lxml')
     for br in soup.find_all("br"): br.replace_with("\n")
     text = soup.get_text(separator='\n', strip=True) 
@@ -521,7 +515,7 @@ def parse_bond_record(dfs, t: Target, corr_after, html_raw, company_market_map) 
     
     rec["모집방식"] = scan_label_value_preferring_correction(dfs, ["사채발행방법", "모집방법", "발행방법"], corr_after)
     
-    # [호출] 1. V10.2 발행상품
+    # [호출] 1. V10.3 발행상품
     rec["발행상품"] = extract_product_type(dfs, corr_after)
 
     def get_corr_num(labels, fallback_keys=[], min_val=-1, as_float=False):
@@ -625,6 +619,7 @@ def run():
 
     targets_dict = {t.acpt_no: t for t in parse_rss_targets()}
 
+    # [복구 시스템] 빈칸/오류 감지 시 강제 재파싱
     for row in values[1:]:
         acpt = row[BOND_COLUMNS.index("접수번호")] if len(row) > BOND_COLUMNS.index("접수번호") else ""
         if not acpt.isdigit(): continue
