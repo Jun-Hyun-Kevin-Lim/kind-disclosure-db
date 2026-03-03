@@ -1,8 +1,7 @@
 # ==========================================================
-# #유상증자_코드V4 (Self-Healing 통합판)
-# - RSS 새 공시 수집 + 기존 시트의 누락/오류 데이터 자동 감지 및 재파싱
-# - 자금용도 6종 중 값이 있는 항목만 콤마로 묶어 표기 & 합계 계산
-# - 정렬용 번호(1., ① 등) 매칭 버그 수정 및 예정발행가/일반공모 포맷 지원
+# #유상증자_코드V4.1 (Self-Healing 초강화판)
+# - 노란색(오류/누락) 셀 강제 재파싱 조건 대폭 강화
+# - 일반공모 '납입기일' 키워드 및 '상장시장' HTML 스캔 Fallback 추가
 # ==========================================================
 import os
 import re
@@ -65,9 +64,7 @@ class Target:
 # ==========================================================
 def _norm(s: str) -> str:
     s = (s or "").strip()
-    s = re.sub(r"\s+", "", s)
-    s = s.replace(":", "")
-    return s
+    return re.sub(r"\s+", "", s).replace(":", "")
 
 def _clean_label(s: str) -> str:
     s = _norm(s)
@@ -78,16 +75,14 @@ def _norm_date(s: str) -> str:
 
 def _to_int(s: str) -> Optional[int]:
     if s is None: return None
-    t = str(s).replace(",", "")
-    t = re.sub(r"[^\d\-]", "", t)
+    t = re.sub(r"[^\d\-]", "", str(s).replace(",", ""))
     if t in ("", "-"): return None
     try: return int(t)
     except Exception: return None
 
 def _to_float(s: str) -> Optional[float]:
     if s is None: return None
-    t = str(s).replace(",", "")
-    t = re.sub(r"[^\d\.\-]", "", t)
+    t = re.sub(r"[^\d\.\-]", "", str(s).replace(",", ""))
     if t in ("", "-", "."): return None
     try: return float(t)
     except Exception: return None
@@ -95,10 +90,7 @@ def _to_float(s: str) -> Optional[float]:
 def _max_int_in_text(s: str) -> Optional[int]:
     if not s: return None
     nums = re.findall(r"\d[\d,]*", str(s))
-    vals = []
-    for x in nums:
-        v = _to_int(x)
-        if v is not None: vals.append(v)
+    vals = [_to_int(x) for x in nums if _to_int(x) is not None]
     return max(vals) if vals else None
 
 def extract_acpt_no(text: str) -> Optional[str]:
@@ -116,6 +108,13 @@ def market_from_title(title: str) -> str:
     if "[넥]" in title or "[코넥]" in title: return "코넥스"
     return ""
 
+def market_from_html(html: str) -> str:
+    if not html: return ""
+    if "코스닥" in html: return "코스닥"
+    if "유가증권" in html: return "유가증권"
+    if "코넥스" in html: return "코넥스"
+    return ""
+
 def viewer_url(acpt_no: str, docno: str = "") -> str:
     return f"{BASE}/common/disclsviewer.do?method=searchInitInfo&acptNo={acpt_no}&docno={docno}"
 
@@ -129,7 +128,7 @@ def make_event_key(company: str, first_board_date: str, method: str) -> str:
     return f"{_norm(company)}|{_norm_date(first_board_date)}|{_norm(method)}"
 
 # ==========================================================
-# RSS 추출
+# RSS / Playwright 추출
 # ==========================================================
 def parse_rss_targets() -> List[Target]:
     feed = feedparser.parse(RSS_URL)
@@ -140,13 +139,8 @@ def parse_rss_targets() -> List[Target]:
         if not match_keyword(title): continue
         acpt_no = extract_acpt_no(link) or extract_acpt_no(getattr(it, "guid", ""))
         if acpt_no: targets.append(Target(acpt_no=acpt_no, title=title, link=link))
+    return list({t.acpt_no: t for t in targets}.values())
 
-    uniq = {t.acpt_no: t for t in targets}
-    return list(uniq.values())
-
-# ==========================================================
-# Playwright 표 추출
-# ==========================================================
 def pick_best_frame_html(page) -> str:
     best_html, best_score = "", -1
     for fr in page.frames:
@@ -167,8 +161,7 @@ def pick_best_frame_html(page) -> str:
 def extract_tables_from_html_robust(html: str) -> List[pd.DataFrame]:
     html = (html or "").replace("\x00", "")
     try:
-        dfs = pd.read_html(html, header=None)
-        return [df.where(pd.notnull(df), "") for df in dfs]
+        return [df.where(pd.notnull(df), "") for df in pd.read_html(html, header=None)]
     except Exception: pass
 
     soup = BeautifulSoup(html, "lxml")
@@ -188,7 +181,7 @@ def extract_tables_from_html_robust(html: str) -> List[pd.DataFrame]:
     if not results: raise ValueError("표 파싱 실패")
     return results
 
-def scrape_one(context, acpt_no: str) -> Tuple[List[pd.DataFrame], str]:
+def scrape_one(context, acpt_no: str) -> Tuple[List[pd.DataFrame], str, str]:
     url = viewer_url(acpt_no)
     page = context.new_page()
     try:
@@ -196,7 +189,7 @@ def scrape_one(context, acpt_no: str) -> Tuple[List[pd.DataFrame], str]:
         page.wait_for_timeout(1500)
         html = pick_best_frame_html(page) or ""
         if html.lower().count("<table") == 0: raise RuntimeError("table 못 찾음")
-        return extract_tables_from_html_robust(html), url
+        return extract_tables_from_html_robust(html), url, html
     finally:
         try: page.close()
         except Exception: pass
@@ -392,13 +385,20 @@ def extract_fund_use_and_amount(dfs, corr_after) -> Tuple[str, float]:
 # ==========================================================
 # 레코드 파싱
 # ==========================================================
-def parse_rights_issue_record(dfs, title, acpt_no, link, corr_after) -> dict:
+def parse_rights_issue_record(dfs, title, acpt_no, link, corr_after, html_raw) -> dict:
     rec = {k: "" for k in RIGHTS_COLUMNS}
     rec["접수번호"] = acpt_no
     rec["링크"] = link
 
     rec["회사명"] = scan_label_value_preferring_correction(dfs, ["회사명", "회사 명"], corr_after) or company_from_title(title)
-    rec["상장시장"] = scan_label_value_preferring_correction(dfs, ["상장시장", "시장구분"], corr_after) or market_from_title(title)
+    
+    # 상장시장 로직 강화: 표 스캔 -> 제목 스캔 -> HTML 원문 스캔
+    rec["상장시장"] = (
+        scan_label_value_preferring_correction(dfs, ["상장시장", "시장구분"], corr_after) 
+        or market_from_title(title) 
+        or market_from_html(html_raw)
+    )
+    
     rec["이사회결의일"] = scan_label_value_preferring_correction(dfs, ["이사회결의일(결정일)", "이사회결의일", "결정일"], corr_after)
     rec["최초 이사회결의일"] = scan_label_value_preferring_correction(dfs, ["최초 이사회결의일", "최초이사회결의일"], corr_after) or rec["이사회결의일"]
     rec["증자방식"] = scan_label_value_preferring_correction(dfs, ["증자방식", "발행방법", "배정방식"], corr_after)
@@ -429,9 +429,10 @@ def parse_rights_issue_record(dfs, title, acpt_no, link, corr_after) -> dict:
     if disc is not None: rec["할인(할증률)"] = f"{disc}"
     else: rec["할인(할증률)"] = disc_txt
 
-    rec["납입일"] = scan_label_value_preferring_correction(dfs, ["납입일"], corr_after)
+    # 일반공모 대비 '납입기일', '상장 예정일' 등 라벨 대응 대폭 추가
+    rec["납입일"] = scan_label_value_preferring_correction(dfs, ["납입일", "납입기일"], corr_after)
     rec["신주의 배당기산일"] = scan_label_value_preferring_correction(dfs, ["신주의 배당기산일", "배당기산일"], corr_after)
-    rec["신주의 상장 예정일"] = scan_label_value_preferring_correction(dfs, ["신주의 상장 예정일", "상장예정일"], corr_after)
+    rec["신주의 상장 예정일"] = scan_label_value_preferring_correction(dfs, ["신주의 상장 예정일", "상장예정일", "신주 상장예정일", "상장 예정일"], corr_after)
 
     uses_text, total_fund_amt = extract_fund_use_and_amount(dfs, corr_after)
     rec["자금용도"] = uses_text
@@ -466,25 +467,34 @@ def run():
     # 1. 오늘자 RSS 타겟 수집
     targets_dict = {t.acpt_no: t for t in parse_rss_targets()}
 
-    # 2. [셀프 힐링] 시트를 스캔하여 빵꾸난 과거 데이터 강제 수집
-    col_acpt = RIGHTS_COLUMNS.index("접수번호")
-    col_fund = RIGHTS_COLUMNS.index("자금용도")
-    col_price = RIGHTS_COLUMNS.index("확정발행가(원)")
-    col_title = RIGHTS_COLUMNS.index("회사명")
+    # 2. [셀프 힐링 초강화] 시트를 스캔하여 빵꾸난 과거 데이터 강제 수집
+    def get_val(row_data, col_name):
+        idx = RIGHTS_COLUMNS.index(col_name)
+        return row_data[idx].strip() if len(row_data) > idx else ""
 
     for row in values[1:]:
-        acpt = row[col_acpt].strip() if col_acpt < len(row) else ""
-        if acpt.isdigit():
-            fund = row[col_fund].strip() if col_fund < len(row) else ""
-            price = row[col_price].strip() if col_price < len(row) else ""
+        acpt = get_val(row, "접수번호")
+        if not acpt.isdigit(): continue
             
-            # 오류/누락 감지 조건: 자금용도가 비어있거나, 확정발행가액이 너무 짧은 경우(예: '6')
-            needs_fix = not fund or (price.isdigit() and len(price) <= 2)
-            
-            if needs_fix and acpt not in targets_dict:
-                title = row[col_title].strip() if col_title < len(row) else f"[자동복구대상]"
-                targets_dict[acpt] = Target(acpt_no=acpt, title=title, link="")
-                print(f"[INFO] 빵꾸 감지됨: {title} ({acpt}) -> 파싱 대기열에 추가")
+        fund = get_val(row, "자금용도")
+        price = get_val(row, "확정발행가(원)")
+        market = get_val(row, "상장시장")
+        pay_date = get_val(row, "납입일")
+        first_date = get_val(row, "최초 이사회결의일")
+        
+        # 감지 조건 대폭 추가: "(원)"이 들어있거나, 날짜가 이상하거나, 상장시장이 없으면 싹 다 재파싱
+        needs_fix = (
+            not fund or "(원)" in fund or
+            not price or (price.isdigit() and len(price) <= 2) or
+            not market or
+            "정정" in pay_date or "변경" in pay_date or "요청" in pay_date or
+            not first_date
+        )
+        
+        if needs_fix and acpt not in targets_dict:
+            title = get_val(row, "회사명") or "[자동복구대상]"
+            targets_dict[acpt] = Target(acpt_no=acpt, title=title, link="")
+            print(f"[INFO] 빵꾸/오류 감지됨: {title} ({acpt}) -> 강제 재파싱 대기열 추가")
 
     if RUN_ONE_ACPTNO:
         targets = [Target(acpt_no=RUN_ONE_ACPTNO, title=f"[MANUAL]{RUN_ONE_ACPTNO}", link="")]
@@ -503,10 +513,10 @@ def run():
         ok = 0
         for t in targets:
             try:
-                dfs, src = scrape_one(context, t.acpt_no)
+                dfs, src, html_raw = scrape_one(context, t.acpt_no)
 
                 corr_after = extract_correction_after_map(dfs) if is_correction_title(t.title) else None
-                rec = parse_rights_issue_record(dfs, title=t.title, acpt_no=t.acpt_no, link=src, corr_after=corr_after)
+                rec = parse_rights_issue_record(dfs, title=t.title, acpt_no=t.acpt_no, link=src, corr_after=corr_after, html_raw=html_raw)
 
                 evk = make_event_key(
                     rec.get("회사명", ""),
@@ -517,7 +527,6 @@ def run():
                 mode = "APPEND"
                 row = -1
                 
-                # 정정/일반 관계없이, 시트에 접수번호나 이벤트키가 있으면 Update 덮어쓰기
                 if evk in event_index:
                     row, old_acpt = event_index[evk]
                     mode = "UPDATE"
