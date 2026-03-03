@@ -1,8 +1,9 @@
 # ==========================================================
-# #주식연계채권_코드V9.3_Product_Master (발행상품 초정밀 추출판)
-# 1. [강화] 발행상품: '사태의 종류', '사케의 종류' 등 공시 원문의 황당한 오타 완벽 대응
-# 2. [강화] 발행상품: '회차 5 종류 무기명식...' 처럼 섞인 문장에서 사채 명칭만 정교하게 오려내는 정규식 엔진 탑재
-# 3. [유지] V9.2의 0.0% 증발 방지, Put/Call Option 본문 절단기, 삼중 덮어쓰기 시스템 100% 유지
+# #주식연계채권_코드V10.1_Ultimate_Targeting (자금용도 라벨 전용판)
+# 1. [수정] 자금용도: 금액(원)을 제외하고 해당되는 라벨만 추출 (예: "운영자금, 채무상환자금")
+# 2. Put/Call Option: 정규식을 이용해 해당 제목부터 다음 목차 전까지 완벽하게 블록 추출
+# 3. 발행상품: '사채의 종류' 셀의 우측/하단 데이터를 찾고 불필요한 '회차' 텍스트 제거
+# 4. 기존 V9.2의 0.0% 보존, 정정공시 덮어쓰기, 텍스트 한 줄 정렬 로직 완벽 유지
 # ==========================================================
 import os
 import re
@@ -218,7 +219,7 @@ def scrape_one(context, acpt_no: str) -> Tuple[List[pd.DataFrame], str, str]:
         except: pass
 
 # ==========================================================
-# 4. 정정사항 엔진 및 텍스트 그물망
+# 4. 정정사항 엔진 및 기본 스캔
 # ==========================================================
 def extract_correction_after_map(dfs: List[pd.DataFrame]) -> Dict[str, str]:
     out: Dict[str, str] = {}
@@ -306,84 +307,106 @@ def find_row_best_float(dfs, must_contain) -> Optional[float]:
     return None
 
 # ==========================================================
-# 5. 핵심 컬럼 전용 추출기 (발행상품 정밀 타격 엔진)
+# 5. 핵심 컬럼 전용 추출기
 # ==========================================================
+
 def extract_product_type(dfs: List[pd.DataFrame], corr_after: Dict) -> str:
-    """[핵심] 공시 시스템의 황당한 오타(사태, 사체, 사케) 및 쓰레기 문자열 완벽 제어"""
-    labels = ["1. 사채의 종류", "사채의 종류", "사체의 종류", "사태의 종류", "사케의 종류", "사채종류", "종류"]
+    """[발행상품 완벽 추출] '사채의 종류'를 찾아 우측/하단 내용 스캔 및 쓰레기값(회차 등) 정제"""
+    val = scan_label_value_preferring_correction(dfs, ["1. 사채의 종류", "사채의 종류", "사채종류", "종류", "사태의 종류"], corr_after)
     
-    def _clean_product(text: str) -> str:
-        # 표 분해 시 섞여 들어오는 "회차 5", "종류" 등의 쓰레기 텍스트 제거
+    def clean_product(text):
         text = re.sub(r'(회차|제)\s*\d+\s*(회|차)?', ' ', text)
         text = re.sub(r'(^종류|종류$)', ' ', text).strip()
-        # [수식어] + [사채명] 패턴만 정교하게 오려냄
-        m = re.search(r'([가-힣a-zA-Z\s]*(?:무기명|무기병|기명|보증|사모|공모|분리|이권)[가-힣a-zA-Z\s]*(?:전환사채|교환사채|신주인수권부사채|사채))', text)
+        m = re.search(r'([가-힣a-zA-Z\s]*(?:무기명|기명|보증|무보증|사모|공모|분리|이권)[가-힣a-zA-Z\s]*(?:전환사채|교환사채|신주인수권부사채|사채))', text)
         if m: return _single_line(m.group(1))
         return _single_line(text)
 
-    # 1. 정정공시 최우선 탐색
-    if corr_after:
-        for k, v in corr_after.items():
-            if any(_norm(lb) in _norm(k) for lb in labels):
-                return _clean_product(v)
-
-    # 2. 표 레이블 기반 탐색 (우측/하단 스캔)
-    val = scan_label_value_preferring_correction(dfs, labels, {})
-    if val and "사채" in val:
-        cleaned = _clean_product(val)
-        if len(cleaned) >= 5: return cleaned
-
-    # 3. 레이블이 완전히 깨진 경우: 표 상단 10줄을 하나로 합쳐서 패턴 포획
+    if val and "사채" in val: return clean_product(val)
+    
     for df in dfs:
         arr = df.astype(str).values
-        for r in range(min(10, arr.shape[0])):
-            row_str = " ".join([x for x in arr[r] if x.lower() != 'nan'])
-            if "사채" in row_str and any(kw in row_str for kw in ["무보증", "무기명", "무기병", "사모", "공모", "분리", "이권"]):
-                cleaned = _clean_product(row_str)
-                if len(cleaned) >= 5: return cleaned
+        for r in range(min(5, arr.shape[0])): 
+            row_str = " ".join(arr[r])
+            if "사채" in row_str and any(kw in row_str for kw in ["무보증", "무기명", "사모", "공모", "이권부"]):
+                return clean_product(row_str)
     return ""
 
-def extract_option_details(dfs: List[pd.DataFrame], html_raw: str, option_type: str, corr_after: Dict) -> str:
-    kws = ["조기상환청구권(Put", "조기상환청구권 (Put", "조기상환청구권(put", "조기상환청구권"] if option_type == 'put' else ["매도청구권(Call", "매도청구권 (Call", "매수청구권", "매도청구권"]
-    result_text = ""
+def extract_fund_usage(dfs: List[pd.DataFrame], corr_after: Dict) -> str:
+    """[자금용도 라벨 전용 추출] 금액(원) 없이 '운영자금, 채무상환자금' 형태의 라벨만 추출"""
+    target_keys = ["시설자금", "영업양수자금", "운영자금", "채무상환자금", "타법인 증권 취득자금", "타법인증권취득자금", "기타자금"]
+    found_funds = {}
     
+    # 1. 표 내부 탐색
+    for df in dfs:
+        arr = df.astype(str).values
+        R, C = arr.shape
+        for r in range(R):
+            for c in range(C):
+                cell_norm = _norm(str(arr[r][c]))
+                for tk in target_keys:
+                    if _norm(tk) in cell_norm:
+                        amt = 0
+                        for cc in range(c + 1, min(C, c + 3)):
+                            a = _max_int_in_text(arr[r][cc])
+                            if a and a > 100: amt = max(amt, a)
+                        if amt == 0 and r + 1 < R:
+                            a = _max_int_in_text(arr[r+1][c])
+                            if a and a > 100: amt = max(amt, a)
+                        
+                        if amt > 0:
+                            std_key = "타법인 증권 취득자금" if "타법인" in tk else tk
+                            found_funds[std_key] = max(found_funds.get(std_key, 0), amt)
+
+    # 2. 정정공시 반영
     if corr_after:
         for k, v in corr_after.items():
-            if any(_norm(kw) in _norm(k) for kw in kws):
-                result_text = v
-                break
-    
-    if len(result_text) < 20:
-        for df in dfs:
-            arr = df.astype(str).values
-            for r in range(arr.shape[0]):
-                for c in range(arr.shape[1]):
-                    if any(_norm(kw) in _norm(arr[r][c]) for kw in kws):
-                        right_text = " ".join([str(arr[r][cc]).strip() for cc in range(c+1, arr.shape[1]) if str(arr[r][cc]).lower() != 'nan'])
-                        bottom_text = " ".join([str(arr[rr][c]).strip() for rr in range(r+1, min(r+5, arr.shape[0])) if str(arr[rr][c]).lower() != 'nan'])
-                        cand = right_text if len(right_text) > len(bottom_text) else bottom_text
-                        if len(cand) > len(result_text): result_text = cand
+            for tk in target_keys:
+                if _norm(tk) in _norm(k):
+                    amt = _max_int_in_text(v)
+                    if amt and amt > 100:
+                        std_key = "타법인 증권 취득자금" if "타법인" in tk else tk
+                        found_funds[std_key] = amt
 
-    soup = BeautifulSoup(html_raw, 'lxml')
-    text = soup.get_text(separator=' \n ', strip=True) 
+    # 3. 라벨만 조립 (요청사항 반영)
+    if found_funds:
+        result = [k for k, v in sorted(found_funds.items(), key=lambda x: x[1], reverse=True)]
+        return _single_line(", ".join(result))
     
+    val = scan_label_value_preferring_correction(dfs, ["조달자금의 구체적 사용 목적", "자금용도"], corr_after)
+    return _single_line(val)
+
+def extract_option_details(html_raw: str, option_type: str) -> str:
+    """[Put/Call Option 완벽 절단기] 본문에서 '제목'부터 '다음 목차 전'까지 블록 통째로 추출"""
+    soup = BeautifulSoup(html_raw, 'lxml')
+    for br in soup.find_all("br"): br.replace_with("\n")
+    text = soup.get_text(separator='\n', strip=True) 
+    
+    if option_type == 'put':
+        pattern = r'(?:\[?\s*조기상환청구권\s*\([^)]*Put[^)]*\)[^\]\n]*\]?)(.*?)(?=\n\s*(?:\[?\s*매도청구권|1[0-9]\.\s*|2[0-9]\.\s*|【\s*특정인에|기타\s*투자판단))'
+    else:
+        pattern = r'(?:\[?\s*매도청구권\s*\([^)]*Call[^)]*\)[^\]\n]*\]?)(.*?)(?=\n\s*(?:1[0-9]\.\s*|2[0-9]\.\s*|【\s*특정인에|기타\s*투자판단))'
+        
+    match = re.search(pattern, text, re.IGNORECASE | re.DOTALL)
+    if match:
+        result = match.group(1).strip()
+        if len(result) > 10: return _single_line(result)
+        
+    kws = ["조기상환청구권(Put", "조기상환청구권"] if option_type == 'put' else ["매도청구권(Call", "매도청구권"]
     idx = -1
     for kw in kws:
         idx = text.find(kw)
         if idx != -1: break
-        
     if idx != -1:
-        snippet = text[idx:idx+3500]
-        match = re.search(r'\n\s*(?:【특정인|2[0-9]\.\s*기타|1[0-9]\.\s*신주)', snippet[50:])
-        if match: snippet = snippet[:50+match.start()]
-        if len(snippet) > len(result_text): result_text = snippet
-
-    return _single_line(result_text)
+        snippet = text[idx:idx+4000]
+        m = re.search(r'\n\s*(?:【특정인|2[0-9]\.\s*기타|1[0-9]\.\s*신주)', snippet[50:])
+        if m: snippet = snippet[:50+m.start()]
+        return _single_line(snippet)
+        
+    return ""
 
 def extract_call_ratio_and_ytc(call_text: str) -> Tuple[str, str]:
     if not call_text: return "", ""
     ratio, ytc = "", ""
-    
     r_match = re.findall(r'(\d{1,3}(?:\.\d+)?)\s*(?:%|/\s*100|퍼센트)', call_text)
     if r_match:
         vals = [float(v) for v in r_match if 0 < float(v) <= 100]
@@ -397,7 +420,6 @@ def extract_call_ratio_and_ytc(call_text: str) -> Tuple[str, str]:
         y_match2 = re.findall(r'(\d+(?:\.\d+)?)\s*(?:%|퍼센트)', call_text)
         vals = [float(v) for v in y_match2 if 0 <= float(v) <= 20 and f"{float(v):g}%" != ratio]
         if vals: ytc = f"{vals[0]:g}%"
-            
     return ratio, ytc
 
 def extract_period_dates(dfs, corr_after, period_kws) -> Tuple[str, str]:
@@ -439,19 +461,6 @@ def extract_investors(dfs: List[pd.DataFrame], corr_after: Dict[str, str]) -> st
                     
     return _single_line(", ".join(investors[:12]))
 
-def extract_fund_usage(dfs: List[pd.DataFrame], corr_after) -> str:
-    uses_map = {"시설자금":0, "영업양수자금":0, "운영자금":0, "채무상환자금":0, "타법인증권":0, "기타자금":0}
-    for df in dfs:
-        text = _norm(df.to_string())
-        if "자금조달의목적" in text:
-            for k in uses_map.keys():
-                m = re.search(f"{k}.*?([\d,]{{4,}})", text)
-                if m: uses_map[k] += int(m.group(1).replace(",", ""))
-    result = [f"{k} {v:,}원" for k, v in sorted(uses_map.items(), key=lambda x: x[1], reverse=True) if v > 0]
-    if result: return _single_line(", ".join(result))
-    val = scan_label_value_preferring_correction(dfs, ["조달자금의 구체적 사용 목적", "자금용도"], corr_after)
-    return _single_line(val)
-
 # ==========================================================
 # 6. 레코드 파싱 매핑
 # ==========================================================
@@ -483,7 +492,7 @@ def parse_bond_record(dfs, t: Target, corr_after, html_raw, company_market_map) 
     
     rec["모집방식"] = scan_label_value_preferring_correction(dfs, ["사채발행방법", "모집방법", "발행방법"], corr_after)
     
-    # [강화] 완벽 적용된 발행상품
+    # [호출] 1. 발행상품
     rec["발행상품"] = extract_product_type(dfs, corr_after)
 
     def get_corr_num(labels, fallback_keys=[], min_val=-1, as_float=False):
@@ -512,14 +521,17 @@ def parse_bond_record(dfs, t: Target, corr_after, html_raw, company_market_map) 
     s_date, e_date = extract_period_dates(dfs, corr_after, ["전환청구기간", "교환청구기간", "권리행사기간"])
     rec["전환청구 시작"], rec["전환청구 종료"] = s_date, e_date
 
-    rec["Put Option"] = extract_option_details(dfs, html_raw, 'put', corr_after)
-    rec["Call Option"] = extract_option_details(dfs, html_raw, 'call', corr_after)
+    # [호출] 2. Put / Call Option
+    rec["Put Option"] = extract_option_details(html_raw, 'put')
+    rec["Call Option"] = extract_option_details(html_raw, 'call')
     
     ratio, ytc = extract_call_ratio_and_ytc(rec["Call Option"])
     rec["Call 비율"] = ratio
     rec["YTC"] = ytc
 
     rec["투자자"] = extract_investors(dfs, corr_after)
+    
+    # [호출] 3. 자금용도 (라벨만)
     rec["자금용도"] = extract_fund_usage(dfs, corr_after)
 
     return rec
@@ -625,7 +637,6 @@ def run():
                 mode = "APPEND"
                 row = -1
                 
-                # 유상증자의 UPDATE 판별 로직 완전 동일 적용
                 if evk in event_index:
                     row, old_acpt = event_index[evk]
                     mode = "UPDATE"
