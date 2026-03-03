@@ -1,8 +1,7 @@
 # ==========================================================
-# #유상증자_코드V4.2 (상장시장 Deep Scan & Self-Healing 최종판)
-# - 상장시장 누락 방지: KIND 뷰어의 모든 프레임(헤더/푸터 포함) 텍스트 풀 스캔
-# - 기존 데이터 보호: 백필 시 기존 시트에 적혀있던 상장시장은 보존 처리
-# - 노란색(오류/누락) 셀 강제 재파싱 조건 대폭 강화 유지
+# #유상증자_코드V4.1 (Self-Healing 초강화판)
+# - 노란색(오류/누락) 셀 강제 재파싱 조건 대폭 강화
+# - 일반공모 '납입기일' 키워드 및 '상장시장' HTML 스캔 Fallback 추가
 # ==========================================================
 import os
 import re
@@ -59,7 +58,6 @@ class Target:
     acpt_no: str
     title: str
     link: str
-    market: str = ""  # 추가됨: 백필 시 기존 상장시장을 보존하기 위함
 
 # ==========================================================
 # 유틸
@@ -105,27 +103,16 @@ def company_from_title(title: str) -> str:
 
 def market_from_title(title: str) -> str:
     if not title: return ""
-    if "[코]" in title or "코스닥" in title: return "코스닥"
-    if "[유]" in title or "유가증권" in title: return "유가증권"
-    if "[넥]" in title or "[코넥]" in title or "코넥스" in title: return "코넥스"
+    if "[코]" in title: return "코스닥"
+    if "[유]" in title: return "유가증권"
+    if "[넥]" in title or "[코넥]" in title: return "코넥스"
     return ""
 
 def market_from_html(html: str) -> str:
-    """뷰어의 모든 텍스트를 스캔하여 상장시장을 100% 잡아냅니다."""
     if not html: return ""
-    
-    # 1. 헤더/푸터의 명시적 태그 매칭
-    m = re.search(r'alt="(코스닥|유가증권|코넥스)"', html)
-    if m: return m.group(1)
-    
-    m = re.search(r'(코스닥|유가증권|코넥스)시장\s*본부', html)
-    if m: return m.group(1)
-    
-    # 2. 본문 텍스트 내 키워드 스캔 (우선순위 부여)
-    if "코넥스" in html or "KONEX" in html: return "코넥스"
-    if "코스닥" in html or "KOSDAQ" in html: return "코스닥"
-    if "유가증권" in html or "KOSPI" in html: return "유가증권"
-    
+    if "코스닥" in html: return "코스닥"
+    if "유가증권" in html: return "유가증권"
+    if "코넥스" in html: return "코넥스"
     return ""
 
 def viewer_url(acpt_no: str, docno: str = "") -> str:
@@ -200,19 +187,15 @@ def scrape_one(context, acpt_no: str) -> Tuple[List[pd.DataFrame], str, str]:
     try:
         page.goto(url, wait_until="networkidle", timeout=60000)
         page.wait_for_timeout(1500)
-        
-        # [핵심] 모든 프레임의 텍스트를 합쳐서 상장시장 등 전역 텍스트 스캔용으로 반환
-        all_frames_html = " ".join([fr.content() for fr in page.frames])
-        
-        best_html = pick_best_frame_html(page) or ""
-        if best_html.lower().count("<table") == 0: raise RuntimeError("table 못 찾음")
-        return extract_tables_from_html_robust(best_html), url, all_frames_html
+        html = pick_best_frame_html(page) or ""
+        if html.lower().count("<table") == 0: raise RuntimeError("table 못 찾음")
+        return extract_tables_from_html_robust(html), url, html
     finally:
         try: page.close()
         except Exception: pass
 
 # ==========================================================
-# Google Sheets 연동
+# Google Sheets
 # ==========================================================
 def gs_open():
     if not GOOGLE_SHEET_ID or not GOOGLE_CREDENTIALS_JSON: raise RuntimeError("구글 시트 연동 정보 누락")
@@ -400,27 +383,20 @@ def extract_fund_use_and_amount(dfs, corr_after) -> Tuple[str, float]:
     return ", ".join(uses), total_sum
 
 # ==========================================================
-# 레코드 파싱 로직 
+# 레코드 파싱
 # ==========================================================
-def parse_rights_issue_record(dfs, t: Target, corr_after, html_raw) -> dict:
+def parse_rights_issue_record(dfs, title, acpt_no, link, corr_after, html_raw) -> dict:
     rec = {k: "" for k in RIGHTS_COLUMNS}
-    rec["접수번호"] = t.acpt_no
-    rec["링크"] = t.link
+    rec["접수번호"] = acpt_no
+    rec["링크"] = link
 
-    # 회사명
-    title_clean = t.title.replace("[자동복구대상]", "").strip()
-    rec["회사명"] = (
-        scan_label_value_preferring_correction(dfs, ["회사명", "회사 명"], corr_after) 
-        or company_from_title(title_clean)
-        or title_clean
-    )
+    rec["회사명"] = scan_label_value_preferring_correction(dfs, ["회사명", "회사 명"], corr_after) or company_from_title(title)
     
-    # [핵심 변경] 상장시장: 표 스캔 -> 제목 스캔 -> 기존 시트 값 보존 -> 전체 HTML 스캔
+    # 상장시장 로직 강화: 표 스캔 -> 제목 스캔 -> HTML 원문 스캔
     rec["상장시장"] = (
         scan_label_value_preferring_correction(dfs, ["상장시장", "시장구분"], corr_after) 
-        or market_from_title(title_clean) 
-        or t.market   # 만약 기존 구글 시트에 코스닥이라고 잘 적혀있었다면 그대로 씁니다.
-        or market_from_html(html_raw) # 그래도 없다면 문서 전체를 샅샅이 뒤집니다.
+        or market_from_title(title) 
+        or market_from_html(html_raw)
     )
     
     rec["이사회결의일"] = scan_label_value_preferring_correction(dfs, ["이사회결의일(결정일)", "이사회결의일", "결정일"], corr_after)
@@ -453,6 +429,7 @@ def parse_rights_issue_record(dfs, t: Target, corr_after, html_raw) -> dict:
     if disc is not None: rec["할인(할증률)"] = f"{disc}"
     else: rec["할인(할증률)"] = disc_txt
 
+    # 일반공모 대비 '납입기일', '상장 예정일' 등 라벨 대응 대폭 추가
     rec["납입일"] = scan_label_value_preferring_correction(dfs, ["납입일", "납입기일"], corr_after)
     rec["신주의 배당기산일"] = scan_label_value_preferring_correction(dfs, ["신주의 배당기산일", "배당기산일"], corr_after)
     rec["신주의 상장 예정일"] = scan_label_value_preferring_correction(dfs, ["신주의 상장 예정일", "상장예정일", "신주 상장예정일", "상장 예정일"], corr_after)
@@ -490,7 +467,7 @@ def run():
     # 1. 오늘자 RSS 타겟 수집
     targets_dict = {t.acpt_no: t for t in parse_rss_targets()}
 
-    # 2. [셀프 힐링] 시트를 스캔하여 빵꾸난 과거 데이터 강제 수집
+    # 2. [셀프 힐링 초강화] 시트를 스캔하여 빵꾸난 과거 데이터 강제 수집
     def get_val(row_data, col_name):
         idx = RIGHTS_COLUMNS.index(col_name)
         return row_data[idx].strip() if len(row_data) > idx else ""
@@ -505,6 +482,7 @@ def run():
         pay_date = get_val(row, "납입일")
         first_date = get_val(row, "최초 이사회결의일")
         
+        # 감지 조건 대폭 추가: "(원)"이 들어있거나, 날짜가 이상하거나, 상장시장이 없으면 싹 다 재파싱
         needs_fix = (
             not fund or "(원)" in fund or
             not price or (price.isdigit() and len(price) <= 2) or
@@ -515,7 +493,7 @@ def run():
         
         if needs_fix and acpt not in targets_dict:
             title = get_val(row, "회사명") or "[자동복구대상]"
-            targets_dict[acpt] = Target(acpt_no=acpt, title=title, link="", market=market)
+            targets_dict[acpt] = Target(acpt_no=acpt, title=title, link="")
             print(f"[INFO] 빵꾸/오류 감지됨: {title} ({acpt}) -> 강제 재파싱 대기열 추가")
 
     if RUN_ONE_ACPTNO:
@@ -535,11 +513,10 @@ def run():
         ok = 0
         for t in targets:
             try:
-                # 뷰어 전체 HTML 긁어오기
                 dfs, src, html_raw = scrape_one(context, t.acpt_no)
 
                 corr_after = extract_correction_after_map(dfs) if is_correction_title(t.title) else None
-                rec = parse_rights_issue_record(dfs, t, corr_after, html_raw)
+                rec = parse_rights_issue_record(dfs, title=t.title, acpt_no=t.acpt_no, link=src, corr_after=corr_after, html_raw=html_raw)
 
                 evk = make_event_key(
                     rec.get("회사명", ""),
