@@ -1,8 +1,7 @@
 # ==========================================================
-# #유상증자_코드V4.4 (Squash Bug & Self-Healing 완전판)
-# - 확정발행금액 1,200경 단위 숫자 오류 완벽 수정 (문자열 병합 차단)
-# - 과거 비정상 금액(자리수 초과) 강제 재파싱 조건 추가
-# - 날짜 텍스트 오류 및 발행가 "6" 오류 방지 포함
+# #유상증자_코드V4.5 (Self-Healing 링크 증발 버그 픽스)
+# - 과거 데이터 재파싱 시 기존 링크(URL)가 삭제되는 현상 완벽 수정
+# - 빈칸이 된 링크도 접수번호를 기반으로 자동 생성하여 복구
 # ==========================================================
 import os
 import re
@@ -90,7 +89,6 @@ def _to_float(s: str) -> Optional[float]:
     except Exception: return None
 
 def _max_int_in_text(s: str) -> Optional[int]:
-    """텍스트 내에서 독립된 숫자 덩어리들을 찾아 그중 최댓값을 반환 (병합 차단)"""
     if not s: return None
     nums = re.findall(r"\d[\d,]*", str(s))
     vals = []
@@ -332,10 +330,7 @@ def scan_label_value(dfs, label_candidates) -> str:
                         v_norm = _norm(v)
                         if _clean_label(v) in cand_clean: continue
                         if re.fullmatch(r"([①-⑩]|\(\d+\)|\d+\.)", v_norm): continue
-                        
-                        # 인덱스 번호 오류 방지
                         if v_norm.isdigit() and int(v_norm) <= 30: continue
-                            
                         return v
     return ""
 
@@ -356,7 +351,6 @@ def find_row_best_int(dfs, must_contain) -> Optional[int]:
         for r in range(arr.shape[0]):
             row = [str(x).strip() for x in arr[r].tolist()]
             if all(k in _norm("".join(row)) for k in keys):
-                # 각 셀마다 _max_int_in_text를 적용하여 Squash(병합) 버그 방지
                 row_max = 0
                 for cell in row:
                     amt = _max_int_in_text(cell)
@@ -396,7 +390,6 @@ def extract_fund_use_and_amount(dfs, corr_after) -> Tuple[str, float]:
             row_joined = _norm("".join(row))
             for k, std_name in keys_map.items():
                 if _norm(k) in row_joined:
-                    # 전체 행을 합치지 않고 개별 '셀' 단위로 금액 추출
                     row_max = 0
                     for cell in row:
                         amt = _max_int_in_text(cell)
@@ -416,7 +409,9 @@ def extract_fund_use_and_amount(dfs, corr_after) -> Tuple[str, float]:
 def parse_rights_issue_record(dfs, t: Target, corr_after, html_raw) -> dict:
     rec = {k: "" for k in RIGHTS_COLUMNS}
     rec["접수번호"] = t.acpt_no
-    rec["링크"] = t.link
+    
+    # [핵심] 수집된 링크가 있다면 사용하고, 없다면 뷰어 URL 강제 생성
+    rec["링크"] = t.link if t.link else viewer_url(t.acpt_no)
 
     title_clean = t.title.replace("[자동복구대상]", "").strip()
     rec["회사명"] = (
@@ -522,8 +517,11 @@ def run():
         pay_date = get_val(row, "납입일")
         first_date = get_val(row, "최초 이사회결의일")
         
-        # 금액 자리수가 비정상적으로 길면 무조건 재파싱하도록 추가!
+        # [링크 복구 조건 추가] 시트에 링크가 없으면 강제로 재파싱 대기열에 추가!
+        link_val = get_val(row, "링크")
+        
         needs_fix = (
+            not link_val or 
             not fund or "(원)" in fund or
             not price or (price.isdigit() and len(price) <= 2) or
             len(fund_amt.replace(",", "").replace(".", "")) >= 8 or 
@@ -534,7 +532,9 @@ def run():
         
         if needs_fix and acpt not in targets_dict:
             title = get_val(row, "회사명") or "[자동복구대상]"
-            targets_dict[acpt] = Target(acpt_no=acpt, title=title, link="", market=market)
+            # [핵심] 기존에 링크가 있었다면 살리고, 없었다면 url을 새로 만들어 Target에 넘김
+            restored_link = link_val if link_val else viewer_url(acpt)
+            targets_dict[acpt] = Target(acpt_no=acpt, title=title, link=restored_link, market=market)
             print(f"[INFO] 빵꾸/오류 감지됨: {title} ({acpt}) -> 강제 재파싱 대기열 추가")
 
     if RUN_ONE_ACPTNO:
