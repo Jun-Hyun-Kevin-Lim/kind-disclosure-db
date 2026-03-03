@@ -1,9 +1,9 @@
 # ==========================================================
-# #주식연계채권_코드V5.9_Ultra (정확도 극대화 & 한줄 텍스트 렌더링)
-# - 타겟 필터링 완벽화: 정확히 '사채권발행결정' 3종만 캡처 (기타 공시 원천 차단)
+# #주식연계채권_코드V5.91_Ultra (정확도 극대화 & 한줄 텍스트 렌더링)
+# - 누락 함수 복구 (extract_acpt_no 추가)
+# - 타겟 필터링 완벽화: 정확히 '사채권발행결정' 3종만 캡처
 # - 텍스트 한줄 처리: 줄바꿈(\n)을 띄어쓰기로 변환하여 시트 가독성 최적화
 # - 정정공시 덮어쓰기: '정정후' 데이터를 기존 접수번호 혹은 일치하는 이벤트 행에 UPDATE
-# - 데이터 정제: 날짜(YYYY-MM-DD) 규격화, 표 순번(1,2,3..) 오인 방지 로직 강화
 # ==========================================================
 import os
 import re
@@ -121,6 +121,11 @@ def make_event_key(company: str, first_board_date: str, bond_type: str) -> str:
 def _norm_date(s: str) -> str:
     return re.sub(r"[^\d]", "", str(s or ""))
 
+# [복구된 함수] 접수번호 추출
+def extract_acpt_no(text: str) -> Optional[str]:
+    m = re.search(r"acptNo=(\d{14})", text or "")
+    return m.group(1) if m else None
+
 # [타겟 필터링 완벽화] 띄어쓰기를 무시하고 오직 3가지 키워드만 타겟팅
 def match_strict_keyword(title: str) -> bool:
     if not title: return False
@@ -160,7 +165,7 @@ def parse_rss_targets() -> List[Target]:
         title = getattr(it, "title", "") or ""
         link = getattr(it, "link", "") or ""
         
-        if not match_strict_keyword(title): continue # 철통 필터링 적용
+        if not match_strict_keyword(title): continue 
         
         acpt_no = extract_acpt_no(link) or extract_acpt_no(getattr(it, "guid", ""))
         if acpt_no: targets.append(Target(acpt_no=acpt_no, title=title, link=link))
@@ -229,7 +234,7 @@ def extract_correction_after_map(dfs: List[pd.DataFrame]) -> Dict[str, str]:
             if 0 <= after_col < C:
                 v = str(arr[rr][after_col]).strip()
                 if v and v.lower() != "nan" and _norm(v) not in ("정정후", "정정전", "항목", "변경사유", "-"):
-                    after_val = _single_line(v) # 정정값도 한줄로
+                    after_val = _single_line(v) 
             if after_val: 
                 out[_norm(item)] = after_val
                 out[_clean_label(item)] = after_val
@@ -260,9 +265,8 @@ def scan_label_value_preferring_correction(dfs, label_candidates, corr_after) ->
     return ""
 
 def extract_option_details(html_raw: str, option_type: str) -> str:
-    """본문에서 옵션 내용 추출 후 완벽한 한줄 텍스트로 반환"""
     soup = BeautifulSoup(html_raw, 'lxml')
-    text = soup.get_text(separator=' ', strip=True) # 줄바꿈을 공백으로 치환하며 가져옴
+    text = soup.get_text(separator=' ', strip=True) 
     
     kws = ["조기상환청구권", "Put Option", "PutOption"] if option_type == 'put' else ["매도청구권", "Call Option", "CallOption"]
     idx = -1
@@ -272,7 +276,6 @@ def extract_option_details(html_raw: str, option_type: str) -> str:
         
     if idx != -1:
         snippet = text[idx:idx+1500]
-        # 다음 목차 번호(예: 10., 11., 20.)가 나오면 자름
         match = re.search(r'\s(1[0-9]|2[0-9])\.\s', snippet[50:])
         if match:
             snippet = snippet[:50+match.start()]
@@ -305,7 +308,6 @@ def extract_period_dates(dfs, corr_after, period_kws) -> Tuple[str, str]:
     return s_date, e_date
 
 def extract_investors(dfs: List[pd.DataFrame], corr_after: Dict[str, str]) -> str:
-    """투자자 리스트를 한 줄(A, B, C)로 추출"""
     investors = []
     blacklist = ["관계", "지분", "%", "배정", "비고", "합계", "소계", "명", "출자자"]
     def is_valid(sn):
@@ -328,10 +330,9 @@ def extract_investors(dfs: List[pd.DataFrame], corr_after: Dict[str, str]) -> st
                     name = arr[r][0].split('\n')[0].strip()
                     if is_valid(name) and name not in investors: investors.append(name)
                     
-    return _single_line(", ".join(investors[:15])) # 한 줄로 결합
+    return _single_line(", ".join(investors[:15])) 
 
 def extract_fund_usage(dfs: List[pd.DataFrame], corr_after) -> str:
-    """자금조달 목적을 한 줄(운영자금 50억, 시설자금 10억)로 추출"""
     uses_map = {"시설자금":0, "영업양수자금":0, "운영자금":0, "채무상환자금":0, "타법인증권":0, "기타자금":0}
     for df in dfs:
         text = _norm(df.to_string())
@@ -376,7 +377,7 @@ def parse_bond_record(dfs, t: Target, corr_after, html_raw, company_market_map) 
         val = scan_label_value_preferring_correction(dfs, labels, corr_after)
         if as_float: return str(_to_float(val)) if _to_float(val) is not None else ""
         amt = _to_int(val)
-        return f"{amt:,}" if amt and amt > 50 else "" # 항목번호(1,2,3) 오인 방지 (50 초과만 허용)
+        return f"{amt:,}" if amt and amt > 50 else "" 
 
     rec["권면총액(원)"] = get_corr_num(["사채의권면(전자등록)총액(원)", "권면(전자등록)총액(원)", "사채의 권면총액", "사채의 총액", "발행총액"])
     rec["Coupon"] = get_corr_num(["표면이자율(%)", "표면이자율", "표면금리"], as_float=True)
@@ -433,7 +434,6 @@ def build_indices(values: List[List[str]], headers: List[str]):
         first = row[col_first].strip() if col_first < len(row) else ""
         bond_type = row[col_type].strip() if col_type < len(row) else ""
         
-        # [덮어쓰기 기준키] 회사명 | 결의일 | CB/EB/BW
         k = make_event_key(comp, first, bond_type)
         if k.strip("|") and k not in e_idx: e_idx[k] = (r, acpt)
     return r_idx, e_idx
@@ -464,7 +464,6 @@ def run():
 
     targets_dict = {t.acpt_no: t for t in parse_rss_targets()}
 
-    # [복구 시스템] 빈칸/오류 감지 시 강제 재파싱
     for row in values[1:]:
         acpt = row[BOND_COLUMNS.index("접수번호")] if len(row) > BOND_COLUMNS.index("접수번호") else ""
         if not acpt.isdigit(): continue
