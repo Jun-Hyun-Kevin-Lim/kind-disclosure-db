@@ -1,9 +1,8 @@
 # ==========================================================
-# #유상증자_코드V5.4_Ultimate (투자자 추출 철벽 방어 & 완벽 복구판)
+# #유상증자_코드V5.5_Ultimate (투자자 블랙리스트 극강화판)
 # - [유지] '회사명' 옆에 '보고서명' 컬럼 추가 및 기존 정확도 로직 100% 유지
-# - [개선1] 투자자 추출 시 "지분(%)", "정정전", 주식수(숫자) 등 쓰레기값 완벽 필터링
-# - [개선2] 추출된 문자열을 쪼개어 진짜 '이름(법인명)'만 선별해서 콤마(,)로 연결
-# - [개선3] 시트에 이미 적힌 "지분" 등의 쓰레기값을 감지해 자동 재파싱하도록 트리거 추가
+# - [개선] 투자자 추출 시 "출자자수 (명)", "본점소재지" 등 악성 쓰레기값 필터링 추가
+# - [개선] 시트에 남아있는 오답(출자자수 등) 감지 시 자동 재파싱(Self-Healing) 작동
 # ==========================================================
 import os
 import re
@@ -152,7 +151,7 @@ def make_event_key(company: str, first_board_date: str, method: str) -> str:
     return f"{_norm(company)}|{_norm_date(first_board_date)}|{_norm(method)}"
 
 # ==========================================================
-# 커스텀 HTML 표 파서 (칸 밀림 방지용)
+# 커스텀 HTML 표 파서
 # ==========================================================
 def parse_html_table_to_df(tbl_soup) -> Optional[pd.DataFrame]:
     rows = tbl_soup.find_all('tr')
@@ -453,19 +452,24 @@ def extract_fund_use_and_amount(dfs, corr_after) -> Tuple[str, float]:
     return ", ".join(uses), total_sum
 
 # ==========================================================
-# [핵심] 투자자 추출 철벽 방어 함수
+# [개선] 투자자 추출 블랙리스트 & 정밀 필터링 함수
 # ==========================================================
 def extract_investors(dfs: List[pd.DataFrame], corr_after: Dict[str, str]) -> str:
     investors = []
     
-    # 이 단어가 포함된 문자열은 절대 투자자 이름이 아님 (초강력 필터)
-    blacklist = ["관계", "지분", "%", "주식", "배정", "선정", "경위", "비고", "해당사항", "정정전", "정정후", "정정", "변경", "합계", "소계", "총계", "발행", "납입", "예정", "목적", "주1", "주2", "주)", "기타", "참고"]
+    # [핵심] 여기에 있는 단어가 포함된 칸은 무조건 "이름이 아니다"라고 판단하고 버림
+    blacklist = [
+        "관계", "지분", "%", "주식", "배정", "선정", "경위", "비고", "해당사항", 
+        "정정전", "정정후", "정정", "변경", "합계", "소계", "총계", "발행", "납입", 
+        "예정", "목적", "주1", "주2", "주)", "기타", "참고", 
+        "출자자수", "본점", "소재지", "(명)", "명"
+    ]
 
     def is_valid_name(s: str) -> bool:
         sn = s.strip()
-        if not sn or sn in ("-", ".", ",", "(", ")"): return False
-        if len(sn) > 40: return False # 너무 긴 문장은 이름이 아님
-        # 999,999 처럼 숫자/콤마/공백으로만 이루어진 데이터는 무조건 버림
+        if not sn or sn in ("-", ".", ",", "(", ")", "0", "1"): return False
+        if len(sn) > 40: return False
+        # 숫자로만 이루어진 텍스트(예: 999,999, 6)는 무조건 버림
         if re.fullmatch(r'[\d,\.\s]+', sn): return False 
         
         sn_norm = _norm(sn)
@@ -473,7 +477,6 @@ def extract_investors(dfs: List[pd.DataFrame], corr_after: Dict[str, str]) -> st
             if bw in sn_norm: return False
         return True
 
-    # 1. 수직 스캔 (표에서 대상자 열을 찾아 아래로만 긁음)
     for df in dfs:
         arr = df.astype(str).values
         R, C = arr.shape
@@ -496,11 +499,9 @@ def extract_investors(dfs: List[pd.DataFrame], corr_after: Dict[str, str]) -> st
                 val = str(arr[rr][target_col]).strip()
                 val_norm = _norm(val)
                 
-                # 표가 끝났음을 알리는 텍스트 감지 시 즉각 중단
                 if "합계" in val_norm or "소계" in val_norm or "기타투자" in val_norm or val_norm.startswith("주1)"):
                     break
                     
-                # 하나의 셀에 여러 이름이 줄바꿈으로 적힌 경우 쪼개서 검증
                 chunks = [x.strip() for x in val.split('\n')]
                 for chunk in chunks:
                     if is_valid_name(chunk) and chunk not in investors:
@@ -509,10 +510,8 @@ def extract_investors(dfs: List[pd.DataFrame], corr_after: Dict[str, str]) -> st
             if investors:
                 return ", ".join(investors)
 
-    # 2. 수평 스캔 (수직 스캔 실패 시 최후의 보루, 필터링 철저히 적용)
     val = scan_label_value_preferring_correction(dfs, ["제3자배정대상자", "배정대상자", "투자자", "성명(법인명)"], corr_after)
     if val:
-        # 콤마 단위로 뭉쳐있을 경우 분리
         chunks = re.split(r'[\n,]', val)
         valid_chunks = []
         for chunk in chunks:
@@ -651,7 +650,7 @@ def parse_rights_issue_record(dfs, t: Target, corr_after, html_raw, company_mark
     uses_text, total_fund_amt = extract_fund_use_and_amount(dfs, corr_after)
     rec["자금용도"] = uses_text
     
-    # [핵심] 철벽 방어 엔진 적용
+    # [핵심] 개선된 블랙리스트가 적용된 투자자 추출 로직
     rec["투자자"] = extract_investors(dfs, corr_after)
 
     sh = _to_int(rec["신규발행주식수"])
@@ -708,8 +707,8 @@ def run():
         comp_name = get_val(row, "회사명")
         prev_shares = get_val(row, "증자전 주식수")
         
-        # [자동 복구 강력 트리거] 투자자에 지분, %, 숫자가 섞여있으면 무조건 재파싱
-        bad_inv_kws = ["관계", "최대주주", "지분", "%", "정정", "주1", "합계", "소계"]
+        # [감지 트리거] 투자자 컬럼에 "출자자수", "소재지" 등의 쓰레기 데이터가 있으면 무조건 재파싱
+        bad_inv_kws = ["관계", "최대주주", "지분", "%", "정정", "주1", "합계", "소계", "출자자", "소재지", "명"]
         investor_needs_fix = any(k in investor_val for k in bad_inv_kws) or bool(re.search(r'\d{4,}', investor_val))
         
         needs_fix = (
