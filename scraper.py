@@ -1,10 +1,8 @@
 # ==========================================================
-# #유상증자_코드V5.2_Ultimate (정확도 극강화 및 전 컬럼 정정후 우선 적용판)
-# - [유지] '회사명' 옆에 '보고서명' 컬럼 유지
-# - [개선1] 날짜 외 모든 컬럼(가격, 주식수 등)도 '정정후' 표를 0순위로 강제 적용
-# - [개선2] "정정사유" 등 쓰레기 텍스트 추출 원천 차단 필터 적용
-# - [개선3] 항목번호(1., 3. 등) 사전 제거 필터 적용 (주식수 "3" 오류 완벽 해결)
-# - [개선4] 표 셀 병합(Rowspan/Colspan) 밀림 방지 커스텀 그리드 파서 내장
+# #유상증자_코드V5.3_Ultimate (투자자 추출 수직스캔 정밀화)
+# - [유지] V5.2의 모든 핵심 로직 유지 (보고서명, 1200경 방지, 날짜 100% 우선적용 등)
+# - [개선] 투자자 추출 시 '제3자배정대상자' 컬럼을 특정하여 수직으로만 스캔
+# - [개선] 옆 칸의 '회사 또는 최대주주와의 관계', '지분(%)' 등 쓰레기값 혼입 원천 차단
 # ==========================================================
 import os
 import re
@@ -99,7 +97,6 @@ def _to_float(s: str) -> Optional[float]:
 
 def _max_int_in_text(s: str) -> Optional[int]:
     if not s: return None
-    # [개선] 1., 3. 같은 항목 번호 패턴을 강제로 지워버려 숫자로 둔갑하는 것 방지
     s_clean = re.sub(r'(^|\s)[\(①-⑩]?\s*\d+\s*[\.\)]\s+', ' ', str(s))
     nums = re.findall(r"\d[\d,]*", s_clean)
     vals = []
@@ -157,7 +154,6 @@ def make_event_key(company: str, first_board_date: str, method: str) -> str:
 # 커스텀 HTML 표 파서 (칸 밀림 방지용)
 # ==========================================================
 def parse_html_table_to_df(tbl_soup) -> Optional[pd.DataFrame]:
-    """정정사항 표처럼 셀이 복잡하게 병합된 경우 칸이 밀리는 현상을 막기 위한 구조화 엔진"""
     rows = tbl_soup.find_all('tr')
     grid = []
     for r in rows: grid.append([])
@@ -337,7 +333,6 @@ def extract_correction_after_map(dfs: List[pd.DataFrame]) -> Dict[str, str]:
         R, C = arr.shape
         header_r = after_col = item_col = None
 
-        # 정정사항 표의 헤더를 완벽하게 탐색합니다.
         for r in range(R):
             row_norm = [_norm(x) for x in arr[r].tolist()]
             has_before = any(w in x for w in ["정정전", "변경전"] for x in row_norm)
@@ -358,13 +353,11 @@ def extract_correction_after_map(dfs: List[pd.DataFrame]) -> Dict[str, str]:
             if not item: continue
             last_item = item
 
-            # 정정후 칸의 데이터 가져오기 (정정사유 등 쓰레기값 완벽 차단)
             after_val = ""
             if 0 <= after_col < C:
                 v = str(arr[rr][after_col]).strip()
                 if v and v.lower() != "nan" and _norm(v) not in ("정정후", "정정전", "항목", "변경사유", "정정사유", "-"):
                     after_val = v
-
             if after_val: 
                 out[_norm(item)] = after_val
                 out[_clean_label(item)] = after_val
@@ -458,47 +451,62 @@ def extract_fund_use_and_amount(dfs, corr_after) -> Tuple[str, float]:
     total_sum = sum(found_amts.get(name, 0) for name in uses)
     return ", ".join(uses), total_sum
 
+# ==========================================================
+# [핵심 픽스] 투자자 전용 수직 스캔 함수 (가로 스캔 완전 배제)
+# ==========================================================
 def extract_investors(dfs: List[pd.DataFrame], corr_after: Dict[str, str]) -> str:
     investors = []
-    blacklist = ["회사또는최대주주와의관계", "최대주주와의관계", "회사와의관계", "관계", "배정주식수", "선정경위", "비고", "-", "해당사항없음", "성명", "법인명"]
-    
-    if corr_after:
-        for k, v in corr_after.items():
-            if any(x in _norm(k) for x in ["대상자", "성명", "법인명", "투자자"]):
-                val_norm = _norm(v)
-                if v and str(v).lower() != 'nan' and val_norm not in blacklist and "관계" not in val_norm:
-                    return str(v).strip()
+    # 이름이 될 수 없는 쓰레기값들 
+    blacklist = ["-", "해당사항없음", "해당사항 없음", "합계", "소계", "총계", "정정전", "정정후"]
+    header_cands = ["제3자배정대상자", "배정대상자", "성명(법인명)", "성명", "법인명", "출자자", "투자자", "성명또는법인명"]
 
     for df in dfs:
         arr = df.astype(str).values
         R, C = arr.shape
+        target_col = -1
+        start_row = -1
+
+        # 1. 표 안에서 투자자 이름이 적힌 '정확한 열(Column)' 인덱스를 찾습니다.
         for r in range(R):
-            row_vals = [_norm(x) for x in arr[r].tolist()]
-            row_str = "".join(row_vals)
-            
-            if any(x in row_str for x in ["성명(법인명)", "배정대상자", "제3자배정대상자", "출자자"]):
-                name_col = -1
-                for c in range(C):
-                    cell = row_vals[c]
-                    if any(x in cell for x in ["성명", "법인명", "대상자", "투자자", "출자자"]) and "관계" not in cell and "주식" not in cell:
-                        name_col = c
-                        break
-                
-                if name_col != -1:
-                    for rr in range(r + 1, R):
-                        val = str(arr[rr][name_col]).strip()
-                        val_norm = _norm(val)
-                        if re.match(r"^\d+\.", val) or "기타투자판단" in val_norm or "합계" in val_norm:
-                            break
-                        if val and val.lower() != "nan" and val_norm not in blacklist and "관계" not in val_norm and "주식수" not in val_norm:
-                            if len(val) < 50 and val not in investors:
-                                investors.append(val)
-    
-    if investors: return ", ".join(investors)
-        
-    val = scan_label_value_preferring_correction(dfs, ["제3자배정대상자", "제3자배정 대상자", "투자자", "성명(법인명)"], corr_after)
-    if val and "관계" not in _norm(val): return val
-        
+            for c in range(C):
+                cell_norm = _norm(str(arr[r][c]))
+                if cell_norm in header_cands:
+                    target_col = c
+                    start_row = r
+                    break
+            if target_col != -1:
+                break
+
+        # 2. 열을 찾았다면, 그 열을 타고 수직으로만 내려가며 이름을 수집합니다. (옆 칸의 관계, 지분율 등 완전 배제)
+        if target_col != -1:
+            for rr in range(start_row + 1, R):
+                val = str(arr[rr][target_col]).strip()
+                val_norm = _norm(val)
+
+                # 표가 끝났음을 알리는 키워드가 나오면 즉시 정지
+                if "합계" in val_norm or "소계" in val_norm or val_norm.startswith("주1)") or "기타투자판단" in val_norm:
+                    break
+
+                if not val or val.lower() == "nan" or val_norm in blacklist:
+                    continue
+
+                # 병합셀로 인해 헤더가 다시 나오면 무시
+                if val_norm in header_cands:
+                    continue
+
+                clean_val = val.split('\n')[0].strip()
+                if clean_val and len(clean_val) < 50 and clean_val not in investors:
+                    investors.append(clean_val)
+
+            # 성공적으로 찾았으면 바로 반환
+            if investors:
+                return ", ".join(investors)
+
+    # 3. 만약 위에서 못 찾았다면 최후의 보루로 기존 스캔 사용 (단, '관계'라는 글자가 있으면 무조건 버림)
+    val = scan_label_value_preferring_correction(dfs, ["제3자배정대상자", "배정대상자", "투자자", "성명(법인명)"], corr_after)
+    if val and "관계" not in _norm(val) and len(val) < 50:
+        return val
+
     return ""
 
 # ==========================================================
@@ -537,11 +545,8 @@ def parse_rights_issue_record(dfs, t: Target, corr_after, html_raw, company_mark
         company_market_map[norm_company_name(rec["회사명"])] = rec["상장시장"]
         company_market_map[norm_company_name(title_clean)] = rec["상장시장"]
 
-    # [개선1] 모든 날짜 컬럼에 정정후 값 완벽 적용을 위한 강력 필터 
     def get_valid_date(labels):
         cand_clean = {_clean_label(x) for x in labels}
-        
-        # 1. 정정후 딕셔너리에서 우선 강제 매칭
         if corr_after:
             for k, v in corr_after.items():
                 if any(c in k for c in cand_clean):
@@ -549,7 +554,6 @@ def parse_rights_issue_record(dfs, t: Target, corr_after, html_raw, company_mark
                     if re.search(r'\d', val) and not any(b in val for b in ["정정", "변경", "요청", "사유", "기재", "오기"]):
                         return val
 
-        # 2. 본문 표 전체에서 스캔하되 오른쪽에 있는 정답을 픽업
         for df in dfs:
             arr = df.astype(str).values
             R, C = arr.shape
@@ -560,16 +564,12 @@ def parse_rights_issue_record(dfs, t: Target, corr_after, html_raw, company_mark
                     for v in row_vals:
                         if _clean_label(v) in cand_clean: continue
                         if re.fullmatch(r"([①-⑩]|\(\d+\)|\d+\.)", _norm(v)): continue
-                        # 쓰레기 텍스트 가차없이 버림
                         if any(b in v for b in ["정정", "변경", "요청", "사유", "기재", "오기"]): continue
                         
                         if re.search(r'\d', v) and any(sep in v for sep in ["년", "월", "일", "-", ".", "/"]):
                             possible_dates.append(v)
-                    
-                    if possible_dates:
-                        return possible_dates[-1] 
+                    if possible_dates: return possible_dates[-1] 
                         
-        # 3. 최후의 보루
         val = scan_label_value(dfs, labels)
         if val and re.search(r'\d', val) and not any(b in val for b in ["정정", "변경", "요청", "사유", "기재", "오기"]):
             return val
@@ -583,7 +583,6 @@ def parse_rights_issue_record(dfs, t: Target, corr_after, html_raw, company_mark
 
     rec["증자방식"] = scan_label_value_preferring_correction(dfs, ["증자방식", "발행방법", "배정방식"], corr_after)
 
-    # [개선] 숫자를 스캔할 때 무조건 정정후 맵부터 완벽하게 뒤짐
     def get_corr_num(labels, min_val=0, as_float=False):
         if not corr_after: return None
         cand_clean = {_clean_label(x) for x in labels}
@@ -595,7 +594,6 @@ def parse_rights_issue_record(dfs, t: Target, corr_after, html_raw, company_mark
                     if amt is not None and amt > min_val: return amt
         return None
 
-    # 주식수 & 가격에 get_corr_num 100% 반영
     issue_shares = get_corr_num(["신주의 종류와 수", "신주의종류와수", "발행예정주식수"])
     if not issue_shares:
         issue_shares = _max_int_in_text(scan_label_value(dfs, ["신주의 종류와 수", "신주의종류와수", "발행예정주식수"]))
@@ -637,6 +635,8 @@ def parse_rights_issue_record(dfs, t: Target, corr_after, html_raw, company_mark
 
     uses_text, total_fund_amt = extract_fund_use_and_amount(dfs, corr_after)
     rec["자금용도"] = uses_text
+    
+    # [핵심] 새로 강화된 투자자 추출 로직 적용
     rec["투자자"] = extract_investors(dfs, corr_after)
 
     sh = _to_int(rec["신규발행주식수"])
@@ -693,6 +693,7 @@ def run():
         comp_name = get_val(row, "회사명")
         prev_shares = get_val(row, "증자전 주식수")
         
+        # "관계"라는 오답이 있으면 강제 재파싱
         needs_fix = (
             not link_val or 
             not fund or "(원)" in fund or
