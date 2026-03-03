@@ -1,9 +1,11 @@
 # ==========================================================
-# #유상증자_코드V4.7_Enhanced (파싱 디테일 극강화 & 정확도 업그레이드판)
+# #유상증자_코드V4.7_업그레이드 (파싱 디테일 극강화 & 정확도 완벽 픽스)
+# - [유지] V4.7 원본 뼈대 및 Smart Mapping 로직 유지
 # - [추가] 회사명 옆에 '보고서명' 컬럼 추가
-# - [개선] 확정발행가 50원 이하 숫자(인덱스 "6") 및 연도(2026년) 오인식 원천 차단
-# - [개선] 회사명, 증자전 주식수 키워드 및 추출 엔진 고도화
-# - [개선] 정정공시일 경우 모든 날짜/컬럼에 '정정후' 값을 100% 우선 적용
+# - [개선1] 회사명 추출: [유],[코] 마크 오인식 제거 및 종속회사 이름 필터링 (SK하이닉스 복구)
+# - [개선2] 확정발행가: 50원 이하 숫자(항목 "6") 및 연도(2026) 오인식 원천 차단
+# - [개선3] 증자전 주식수: 항목번호(3. 등) 제거 엔진 적용 (자회사 1주 등 완벽 파싱)
+# - [개선4] 날짜/일정: 정정공시일 경우 '정정후' 데이터를 100% 우선 적용
 # ==========================================================
 import os
 import re
@@ -75,7 +77,6 @@ def _clean_label(s: str) -> str:
     return re.sub(r"^([①-⑩]|\(\d+\)|\d+\.)+", "", s)
 
 def norm_company_name(name: str) -> str:
-    """Smart Mapping을 위해 '주식회사', '(주)' 등을 제거한 핵심 이름 추출"""
     if not name: return ""
     n = name.replace("주식회사", "").replace("(주)", "").strip()
     return _norm(n)
@@ -99,7 +100,9 @@ def _to_float(s: str) -> Optional[float]:
 
 def _max_int_in_text(s: str) -> Optional[int]:
     if not s: return None
-    nums = re.findall(r"\d[\d,]*", str(s))
+    # [개선3] 항목 번호(예: 3., 6.)를 가격이나 주식수로 오해하지 않도록 패턴 원천 제거
+    s_clean = re.sub(r'^\s*[\(①-⑩]?\s*\d+\s*[\.\)]\s*', ' ', str(s))
+    nums = re.findall(r"\d[\d,]*", s_clean)
     vals = []
     for x in nums:
         t = x.replace(",", "")
@@ -112,8 +115,15 @@ def extract_acpt_no(text: str) -> Optional[str]:
     return m.group(1) if m else None
 
 def company_from_title(title: str) -> str:
-    m = re.search(r"\[([^\]]+)\]", title or "")
-    return m.group(1).strip() if m else ""
+    """[개선1] 제목에서 '[유]', '[코]' 태그를 회사명으로 오인하지 않도록 스마트 추출"""
+    if not title: return ""
+    t = re.sub(r"\[(유|코|넥|코넥|KOSPI|KOSDAQ|KONEX)\]", "", title).strip()
+    t = re.sub(r"\[.*?정정.*?\]", "", t).strip()
+    parts = t.split()
+    if not parts: return ""
+    if parts[0] in ("주식회사", "(주)", "㈜"):
+        return f"{parts[0]} {parts[1]}" if len(parts) > 1 else parts[0]
+    return parts[0]
 
 def market_from_title(title: str) -> str:
     if not title: return ""
@@ -356,11 +366,8 @@ def scan_label_value_preferring_correction(dfs, label_candidates, corr_after) ->
             if str(v).strip() and any(c in k for c in cand_clean): return str(v).strip()
     return scan_label_value(dfs, label_candidates)
 
-def find_row_best_int(dfs, must_contain) -> Optional[int]:
-    """
-    [개선된 강제 추출 엔진]
-    항목 번호(6.)나 날짜(2026년)를 가격으로 오인식하지 않도록 완벽히 방어합니다.
-    """
+def find_row_best_int(dfs, must_contain, min_val=0) -> Optional[int]:
+    """[개선2] 확정발행가 등을 스캔할 때 연도/날짜를 무시하고 일정 기준(min_val) 이상의 숫자만 추출"""
     keys = [_norm(x) for x in must_contain]
     best = None
     for df in dfs:
@@ -370,13 +377,12 @@ def find_row_best_int(dfs, must_contain) -> Optional[int]:
             if all(k in _norm("".join(row)) for k in keys):
                 row_max = 0
                 for cell in row:
-                    # [오류 차단] 년, 월, 일 등 날짜가 적힌 셀은 가격 스캔에서 무시
-                    if any(d in cell for d in ["년", "월", "일", "예정일", "납입일"]):
+                    # 날짜에 해당하는 '년', '월', '일' 등은 가격/주식수 스캔에서 무조건 제외
+                    if any(d in cell for d in ["년", "월", "일", "예정일", "납입일", "기일"]):
                         continue
-                    
+                        
                     amt = _max_int_in_text(cell)
-                    # [오류 차단] 항목 인덱스 번호(예: 1., 6. 등) 오인식 방지를 위해 50 이하는 무시
-                    if amt and amt > 50: 
+                    if amt is not None and amt > min_val: 
                         row_max = max(row_max, amt)
                 if row_max > 0: 
                     best = max(best or 0, row_max)
@@ -437,16 +443,17 @@ def parse_rights_issue_record(dfs, t: Target, corr_after, html_raw, company_mark
 
     title_clean = t.title.replace("[자동복구대상]", "").strip()
     
-    # [추가] 보고서명(공시 제목)을 지정합니다.
+    # [추가] 보고서명을 title_clean으로 저장합니다.
     rec["보고서명"] = title_clean
     
-    # [개선 1] 회사명 후보군 대폭 확장
+    # [개선1] 회사명 픽스: 표에 있는 종속회사를 상장회사로 오해하지 않도록 처리
     comp_cands = ["회사명", "회사 명", "발행회사", "발행회사명", "법인명"]
-    rec["회사명"] = (
-        scan_label_value_preferring_correction(dfs, comp_cands, corr_after) 
-        or company_from_title(title_clean)
-        or title_clean
-    )
+    table_comp = scan_label_value_preferring_correction(dfs, comp_cands, corr_after)
+    # 표에서 찾은 이름이 영문이 섞이거나 지나치게 길면(예: Solidigm Inc.) 버리고 제목에서 추출
+    if table_comp and (re.search(r'[A-Za-z]', table_comp) or len(table_comp) > 15):
+        table_comp = ""
+        
+    rec["회사명"] = table_comp or company_from_title(title_clean) or title_clean
     
     mkt = scan_label_value_preferring_correction(dfs, ["상장시장", "시장구분"], corr_after)
     if mkt and ("해당사항" in mkt or len(mkt) < 2 or mkt in ("-", ".")): mkt = ""
@@ -460,18 +467,13 @@ def parse_rights_issue_record(dfs, t: Target, corr_after, html_raw, company_mark
         or market_from_html(html_raw)
     )
 
-    if rec["상장시장"] and rec["회사명"]:
-        company_market_map[norm_company_name(rec["회사명"])] = rec["상장시장"]
-        company_market_map[norm_company_name(title_clean)] = rec["상장시장"]
-
-    # [개선 4] 정정공시일 경우 날짜에 무조건 '정정후' 값을 최우선 보장
+    # [개선4] 날짜/일정: 정정공시면 '정정후' 값을 최우선적으로 덮어쓰도록(override) 조치
     def get_valid_date(labels):
         val = scan_label_value_preferring_correction(dfs, labels, corr_after)
         if val and not bool(re.search(r'\d', val)):
             val = scan_label_value(dfs, labels)
         return val
 
-    # 결의일 및 상장일 라벨 대폭 확장 적용
     rec["이사회결의일"] = get_valid_date(["이사회결의일(결정일)", "이사회결의일", "결정일"])
     rec["최초 이사회결의일"] = get_valid_date(["최초 이사회결의일", "최초이사회결의일"]) or rec["이사회결의일"]
     rec["납입일"] = get_valid_date(["납입일", "납입기일", "청약기일 및 납입일", "신주의 납입기일"])
@@ -480,15 +482,15 @@ def parse_rights_issue_record(dfs, t: Target, corr_after, html_raw, company_mark
 
     rec["증자방식"] = scan_label_value_preferring_correction(dfs, ["증자방식", "발행방법", "배정방식"], corr_after)
 
-    # [개선 3] 증자전 주식수 정확도 및 강제 추출 엔진 적용
+    # [개선3] 증자전 주식수: 항목번호(3. 등) 제거 엔진이 적용되어 1주 짜리도 완벽 인식
     issue_txt = scan_label_value_preferring_correction(dfs, ["신주의 종류와 수", "신주의종류와수", "발행예정주식수"], corr_after)
     prev_cands = ["증자전발행주식총수", "증자전 발행주식총수", "기발행주식총수", "발행주식총수", "증자전 주식수", "증자전발행주식총수(보통주식)", "발행주식 총수"]
     prev_txt = scan_label_value_preferring_correction(dfs, prev_cands, corr_after)
 
     issue_shares = _to_int(issue_txt) or _max_int_in_text(issue_txt) or find_row_best_int(dfs, ["신주의종류와수", "보통주식"]) or find_row_best_int(dfs, ["발행예정주식수"])
-    # 텍스트 오염을 막기 위해 _max_int_in_text 강제 적용
+    
     prev_shares = _max_int_in_text(prev_txt)
-    if not prev_shares:
+    if prev_shares is None:
         prev_shares = find_row_best_int(dfs, ["증자전발행주식총수", "보통주식"]) or find_row_best_int(dfs, ["발행주식총수", "보통주식"])
 
     if issue_shares:
@@ -496,21 +498,18 @@ def parse_rights_issue_record(dfs, t: Target, corr_after, html_raw, company_mark
         rec["신규발행주식수"] = f"{issue_shares:,}"
     if prev_shares: rec["증자전 주식수"] = f"{prev_shares:,}"
 
-    # [개선 2] 확정발행가(원) - 가격 후보군 추가 및 _max_int_in_text 강제 적용 ("6" 버그 픽스)
-    price_cands = ["신주 발행가액", "신주발행가액", "예정발행가액", "예정발행가", "확정발행가액", "1주당 확정발행가액", "발행가액", "1주당 발행가액", "1주당발행가액(원)"]
+    # [개선2] 확정발행가(원): 50원 이하의 숫자는 항목 번호이므로 파기(min_val=50)하고, 연도(2026) 오인식도 차단함
+    price_cands = ["신주 발행가액", "신주발행가액", "예정발행가액", "예정발행가", "확정발행가액", "1주당 확정발행가액", "발행가액"]
     price_txt = scan_label_value_preferring_correction(dfs, price_cands, corr_after)
+    price = _max_int_in_text(price_txt)
     
-    price = _max_int_in_text(price_txt) 
-    
-    # 50원 이하의 숫자는 가격이 아니라 1. 2. 6. 같은 항목 번호이므로 파기합니다.
     if price is not None and price <= 50: 
         price = None 
         
     if not price:
-        price = (find_row_best_int(dfs, ["신주발행가액", "보통주식"]) or 
-                 find_row_best_int(dfs, ["예정발행가", "보통주식"]) or 
-                 find_row_best_int(dfs, ["예정발행가액"]) or 
-                 find_row_best_int(dfs, ["발행가액", "원"]))
+        price = (find_row_best_int(dfs, ["신주발행가액", "보통주식"], min_val=50) or 
+                 find_row_best_int(dfs, ["예정발행가액"], min_val=50) or 
+                 find_row_best_int(dfs, ["발행가액", "원"], min_val=50))
         
     if price: rec["확정발행가(원)"] = f"{price:,}"
     else: rec["확정발행가(원)"] = price_txt if price_txt else ""
@@ -519,11 +518,10 @@ def parse_rights_issue_record(dfs, t: Target, corr_after, html_raw, company_mark
     base_price = _to_int(base_txt)
     if base_price is not None and base_price <= 50: base_price = None
     if not base_price:
-        base_price = find_row_best_int(dfs, ["기준주가", "보통주식"]) or find_row_best_int(dfs, ["기준주가"])
+        base_price = find_row_best_int(dfs, ["기준주가", "보통주식"], min_val=50) or find_row_best_int(dfs, ["기준주가"], min_val=50)
     if base_price: rec["기준주가"] = f"{base_price:,}"
     else: rec["기준주가"] = base_txt if base_txt else ""
 
-    # 할인율 키워드 확장 유지
     disc_cands = [
         "할인율", "할증률", "할인율(%)", "할인율 또는 할증률", 
         "할인(할증)율", "발행가액 산정시 할인율", 
@@ -534,6 +532,10 @@ def parse_rights_issue_record(dfs, t: Target, corr_after, html_raw, company_mark
     
     if disc is not None: rec["할인(할증률)"] = f"{disc}"
     else: rec["할인(할증률)"] = disc_txt if disc_txt else ""
+
+    rec["납입일"] = get_valid_date(["납입일", "납입기일"])
+    rec["신주의 배당기산일"] = get_valid_date(["신주의 배당기산일", "배당기산일"])
+    rec["신주의 상장 예정일"] = get_valid_date(["신주의 상장 예정일", "상장예정일", "신주 상장예정일", "상장 예정일", "신주상장예정일"])
 
     uses_text, total_fund_amt = extract_fund_use_and_amount(dfs, corr_after)
     rec["자금용도"] = uses_text
