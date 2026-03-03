@@ -1,8 +1,9 @@
 # ==========================================================
-# #유상증자_코드V5.3_Ultimate (투자자 추출 수직스캔 정밀화)
-# - [유지] V5.2의 모든 핵심 로직 유지 (보고서명, 1200경 방지, 날짜 100% 우선적용 등)
-# - [개선] 투자자 추출 시 '제3자배정대상자' 컬럼을 특정하여 수직으로만 스캔
-# - [개선] 옆 칸의 '회사 또는 최대주주와의 관계', '지분(%)' 등 쓰레기값 혼입 원천 차단
+# #유상증자_코드V5.4_Ultimate (투자자 추출 철벽 방어 & 완벽 복구판)
+# - [유지] '회사명' 옆에 '보고서명' 컬럼 추가 및 기존 정확도 로직 100% 유지
+# - [개선1] 투자자 추출 시 "지분(%)", "정정전", 주식수(숫자) 등 쓰레기값 완벽 필터링
+# - [개선2] 추출된 문자열을 쪼개어 진짜 '이름(법인명)'만 선별해서 콤마(,)로 연결
+# - [개선3] 시트에 이미 적힌 "지분" 등의 쓰레기값을 감지해 자동 재파싱하도록 트리거 추가
 # ==========================================================
 import os
 import re
@@ -452,60 +453,74 @@ def extract_fund_use_and_amount(dfs, corr_after) -> Tuple[str, float]:
     return ", ".join(uses), total_sum
 
 # ==========================================================
-# [핵심 픽스] 투자자 전용 수직 스캔 함수 (가로 스캔 완전 배제)
+# [핵심] 투자자 추출 철벽 방어 함수
 # ==========================================================
 def extract_investors(dfs: List[pd.DataFrame], corr_after: Dict[str, str]) -> str:
     investors = []
-    # 이름이 될 수 없는 쓰레기값들 
-    blacklist = ["-", "해당사항없음", "해당사항 없음", "합계", "소계", "총계", "정정전", "정정후"]
-    header_cands = ["제3자배정대상자", "배정대상자", "성명(법인명)", "성명", "법인명", "출자자", "투자자", "성명또는법인명"]
+    
+    # 이 단어가 포함된 문자열은 절대 투자자 이름이 아님 (초강력 필터)
+    blacklist = ["관계", "지분", "%", "주식", "배정", "선정", "경위", "비고", "해당사항", "정정전", "정정후", "정정", "변경", "합계", "소계", "총계", "발행", "납입", "예정", "목적", "주1", "주2", "주)", "기타", "참고"]
 
+    def is_valid_name(s: str) -> bool:
+        sn = s.strip()
+        if not sn or sn in ("-", ".", ",", "(", ")"): return False
+        if len(sn) > 40: return False # 너무 긴 문장은 이름이 아님
+        # 999,999 처럼 숫자/콤마/공백으로만 이루어진 데이터는 무조건 버림
+        if re.fullmatch(r'[\d,\.\s]+', sn): return False 
+        
+        sn_norm = _norm(sn)
+        for bw in blacklist:
+            if bw in sn_norm: return False
+        return True
+
+    # 1. 수직 스캔 (표에서 대상자 열을 찾아 아래로만 긁음)
     for df in dfs:
         arr = df.astype(str).values
         R, C = arr.shape
         target_col = -1
         start_row = -1
-
-        # 1. 표 안에서 투자자 이름이 적힌 '정확한 열(Column)' 인덱스를 찾습니다.
+        
         for r in range(R):
-            for c in range(C):
-                cell_norm = _norm(str(arr[r][c]))
-                if cell_norm in header_cands:
-                    target_col = c
-                    start_row = r
-                    break
-            if target_col != -1:
-                break
-
-        # 2. 열을 찾았다면, 그 열을 타고 수직으로만 내려가며 이름을 수집합니다. (옆 칸의 관계, 지분율 등 완전 배제)
+            row_str = "".join([_norm(str(x)) for x in arr[r]])
+            if any(kw in row_str for kw in ["제3자배정대상자", "배정대상자", "성명(법인명)", "출자자"]):
+                for c in range(C):
+                    cell_norm = _norm(str(arr[r][c]))
+                    if any(kw in cell_norm for kw in ["성명", "법인명", "대상자", "출자자", "투자자"]) and "관계" not in cell_norm and "주식" not in cell_norm:
+                        target_col = c
+                        start_row = r
+                        break
+            if target_col != -1: break
+        
         if target_col != -1:
             for rr in range(start_row + 1, R):
                 val = str(arr[rr][target_col]).strip()
                 val_norm = _norm(val)
-
-                # 표가 끝났음을 알리는 키워드가 나오면 즉시 정지
-                if "합계" in val_norm or "소계" in val_norm or val_norm.startswith("주1)") or "기타투자판단" in val_norm:
+                
+                # 표가 끝났음을 알리는 텍스트 감지 시 즉각 중단
+                if "합계" in val_norm or "소계" in val_norm or "기타투자" in val_norm or val_norm.startswith("주1)"):
                     break
-
-                if not val or val.lower() == "nan" or val_norm in blacklist:
-                    continue
-
-                # 병합셀로 인해 헤더가 다시 나오면 무시
-                if val_norm in header_cands:
-                    continue
-
-                clean_val = val.split('\n')[0].strip()
-                if clean_val and len(clean_val) < 50 and clean_val not in investors:
-                    investors.append(clean_val)
-
-            # 성공적으로 찾았으면 바로 반환
+                    
+                # 하나의 셀에 여러 이름이 줄바꿈으로 적힌 경우 쪼개서 검증
+                chunks = [x.strip() for x in val.split('\n')]
+                for chunk in chunks:
+                    if is_valid_name(chunk) and chunk not in investors:
+                        investors.append(chunk)
+            
             if investors:
                 return ", ".join(investors)
 
-    # 3. 만약 위에서 못 찾았다면 최후의 보루로 기존 스캔 사용 (단, '관계'라는 글자가 있으면 무조건 버림)
+    # 2. 수평 스캔 (수직 스캔 실패 시 최후의 보루, 필터링 철저히 적용)
     val = scan_label_value_preferring_correction(dfs, ["제3자배정대상자", "배정대상자", "투자자", "성명(법인명)"], corr_after)
-    if val and "관계" not in _norm(val) and len(val) < 50:
-        return val
+    if val:
+        # 콤마 단위로 뭉쳐있을 경우 분리
+        chunks = re.split(r'[\n,]', val)
+        valid_chunks = []
+        for chunk in chunks:
+            chunk = chunk.strip()
+            if is_valid_name(chunk) and chunk not in valid_chunks:
+                valid_chunks.append(chunk)
+        if valid_chunks:
+            return ", ".join(valid_chunks)
 
     return ""
 
@@ -577,7 +592,7 @@ def parse_rights_issue_record(dfs, t: Target, corr_after, html_raw, company_mark
 
     rec["이사회결의일"] = get_valid_date(["이사회결의일(결정일)", "이사회결의일", "결정일"])
     rec["최초 이사회결의일"] = get_valid_date(["최초 이사회결의일", "최초이사회결의일"]) or rec["이사회결의일"]
-    rec["납입일"] = get_valid_date(["납입일", "납입기일", "청약기일 및 납입일", "신주의 납입기일"])
+    rec["납입일"] = get_valid_date(["납입일", "납입기일", "청약기일 및 납입일", "신주의 납입기일", "신주납입기일"])
     rec["신주의 배당기산일"] = get_valid_date(["신주의 배당기산일", "배당기산일"])
     rec["신주의 상장 예정일"] = get_valid_date(["신주의 상장 예정일", "상장예정일", "신주 상장예정일", "상장 예정일", "신주상장예정일"])
 
@@ -636,7 +651,7 @@ def parse_rights_issue_record(dfs, t: Target, corr_after, html_raw, company_mark
     uses_text, total_fund_amt = extract_fund_use_and_amount(dfs, corr_after)
     rec["자금용도"] = uses_text
     
-    # [핵심] 새로 강화된 투자자 추출 로직 적용
+    # [핵심] 철벽 방어 엔진 적용
     rec["투자자"] = extract_investors(dfs, corr_after)
 
     sh = _to_int(rec["신규발행주식수"])
@@ -693,7 +708,10 @@ def run():
         comp_name = get_val(row, "회사명")
         prev_shares = get_val(row, "증자전 주식수")
         
-        # "관계"라는 오답이 있으면 강제 재파싱
+        # [자동 복구 강력 트리거] 투자자에 지분, %, 숫자가 섞여있으면 무조건 재파싱
+        bad_inv_kws = ["관계", "최대주주", "지분", "%", "정정", "주1", "합계", "소계"]
+        investor_needs_fix = any(k in investor_val for k in bad_inv_kws) or bool(re.search(r'\d{4,}', investor_val))
+        
         needs_fix = (
             not link_val or 
             not fund or "(원)" in fund or
@@ -702,7 +720,7 @@ def run():
             not market or
             not re.search(r'\d', pay_date) or "정정" in pay_date or "변경" in pay_date or "요청" in pay_date or
             not first_date or
-            "관계" in investor_val or "최대주주" in investor_val or
+            investor_needs_fix or
             not comp_name or comp_name in ["유", "코", "넥"] or
             prev_shares == "3" 
         )
