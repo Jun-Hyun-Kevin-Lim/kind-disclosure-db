@@ -1,9 +1,8 @@
 # ==========================================================
-# #유상증자_코드V5.7_Ultimate (발행상품 빈칸 픽스 & 종류 자동 판별 엔진)
-# - [복구] 실수로 누락되었던 '발행상품' 컬럼 값 입력 로직 복구
-# - [개선] 무조건 '보통주식'으로 적지 않고, 표를 읽어 '우선주', '종류주식' 등을 정확히 판별
-# - [유지] V5.6의 투자자 철벽 방어, 날짜 100% 덮어쓰기, 보고서명 유지
-# - [트리거] 발행상품이 빈칸인 행을 자동 감지하여 일괄 복구 진행
+# #유상증자_코드V5.8_Ultimate (타겟 키워드 '유상증자결정' 정밀화)
+# - [변경] 타겟 키워드를 "유상증자" -> "유상증자결정"으로 변경하여 정확도 향상
+# - [유지] V5.7의 발행상품 종류 식별 엔진, 투자자 수직 스캔 로직 완벽 유지
+# - [유지] 정정공시 날짜 100% 덮어쓰기, 보고서명 추가 등 모든 정확도 향상 로직 유지
 # ==========================================================
 import os
 import re
@@ -30,8 +29,10 @@ DEFAULT_RSS = (
     "http://kind.krx.co.kr:80/disclosure/rsstodaydistribute.do"
     "?method=searchRssTodayDistribute&mktTpCd=0&currentPageSize=100"
 )
+
 RSS_URL = os.getenv("RSS_URL", DEFAULT_RSS)
-KEYWORDS = [x.strip() for x in os.getenv("KEYWORDS", "유상증자").split(",") if x.strip()]
+# [요청 반영] 키워드를 "유상증자"에서 "유상증자결정"으로 변경했습니다.
+KEYWORDS = [x.strip() for x in os.getenv("KEYWORDS", "유상증자결정").split(",") if x.strip()]
 
 HEADLESS = os.getenv("HEADLESS", "true").lower() == "true"
 LIMIT = int(os.getenv("LIMIT", "0"))
@@ -518,14 +519,10 @@ def extract_investors(dfs: List[pd.DataFrame], corr_after: Dict[str, str]) -> st
 
     return ""
 
-# ==========================================================
-# [신규 추가] 발행상품(종류/우선주 등) 자동 식별 정밀 엔진
-# ==========================================================
 def extract_issue_shares_and_type(dfs: List[pd.DataFrame], corr_after: Dict[str, str]) -> Tuple[Optional[int], str]:
     stock_type = "보통주식"
     best_amt = 0
     
-    # 1. 정정후 텍스트에서 힌트 먼저 수집
     if corr_after:
         for k, v in corr_after.items():
             if any(c in _norm(k) for c in ["신주의종류와수", "발행예정주식수"]):
@@ -541,7 +538,6 @@ def extract_issue_shares_and_type(dfs: List[pd.DataFrame], corr_after: Dict[str,
     if best_amt > 0:
         return best_amt, stock_type
 
-    # 2. 표 내부 세밀 스캔 (보통주식 vs 종류주식 중 숫자가 있는 쪽을 추적)
     for df in dfs:
         arr = df.astype(str).values
         R, C = arr.shape
@@ -644,9 +640,7 @@ def parse_rights_issue_record(dfs, t: Target, corr_after, html_raw, company_mark
 
     rec["증자방식"] = scan_label_value_preferring_correction(dfs, ["증자방식", "발행방법", "배정방식"], corr_after)
 
-    # [핵심] 누락됐던 발행상품 입력 및 정밀 추적기 적용
     issue_shares, stock_type = extract_issue_shares_and_type(dfs, corr_after)
-    
     if issue_shares:
         rec["신규발행주식수"] = f"{issue_shares:,}"
         rec["발행상품"] = stock_type
@@ -765,7 +759,6 @@ def run():
             any(k in board_date for k in bad_date_kws)
         )
         
-        # [트리거 강화] 발행상품 빈칸 및 쓰레기 투자자 정보 감지 시 자동 복구 진행
         bad_inv_kws = ["관계", "최대주주", "지분", "%", "정정", "주1", "합계", "소계", "출자자", "소재지", "명"]
         investor_needs_fix = any(k in investor_val for k in bad_inv_kws) or bool(re.search(r'\d{4,}', investor_val))
         
