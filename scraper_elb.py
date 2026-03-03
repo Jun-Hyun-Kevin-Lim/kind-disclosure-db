@@ -1,9 +1,8 @@
 # ==========================================================
-# #주식연계채권_코드V9.2_Final_Stable (유상증자 V5.8 완벽 복제 & 안정화)
-# 1. 유상증자 890라인급 코어 엔진(HTML 파서, 다중 방어선, 덮어쓰기) 100% 유지
-# 2. 문법 에러(SyntaxError) 완벽 해결: f-string 내부 백슬래시(\) 제거
-# 3. 0.0% 증발 방지 및 정정공시 최우선 반영(Table 3) 로직 탑재
-# 4. 타겟 정밀 필터링: 사채권발행결정 3종만 정확히 타겟팅
+# #주식연계채권_코드V9.3_Product_Master (발행상품 초정밀 추출판)
+# 1. [강화] 발행상품: '사태의 종류', '사케의 종류' 등 공시 원문의 황당한 오타 완벽 대응
+# 2. [강화] 발행상품: '회차 5 종류 무기명식...' 처럼 섞인 문장에서 사채 명칭만 정교하게 오려내는 정규식 엔진 탑재
+# 3. [유지] V9.2의 0.0% 증발 방지, Put/Call Option 본문 절단기, 삼중 덮어쓰기 시스템 100% 유지
 # ==========================================================
 import os
 import re
@@ -28,7 +27,6 @@ BASE = "https://kind.krx.co.kr"
 DEFAULT_RSS = "http://kind.krx.co.kr:80/disclosure/rsstodaydistribute.do?method=searchRssTodayDistribute&mktTpCd=0&currentPageSize=100"
 RSS_URL = os.getenv("RSS_URL", DEFAULT_RSS)
 
-# 타겟 키워드 3종 완벽 고정
 TARGET_KWS = "전환사채권발행결정,교환사채권발행결정,신주인수권부사채권발행결정"
 KEYWORDS = [x.strip() for x in os.getenv("KEYWORDS", TARGET_KWS).split(",") if x.strip()]
 
@@ -68,7 +66,6 @@ def _clean_label(s: str) -> str:
     return re.sub(r"^([①-⑩]|\(\d+\)|\d+\.)+", "", _norm(s))
 
 def _single_line(s: str) -> str:
-    """줄바꿈과 탭을 띄어쓰기로 변환하여 구글시트 가독성 최적화"""
     if not s: return ""
     return re.sub(r'\s+', ' ', str(s)).strip()
 
@@ -123,7 +120,6 @@ def viewer_url(acpt_no: str, docno: str = "") -> str:
     return f"{BASE}/common/disclsviewer.do?method=searchInitInfo&acptNo={acpt_no}&docno={docno}"
 
 def match_strict_keyword(title: str) -> bool:
-    """오직 3가지 사채권발행결정만 100% 필터링"""
     if not title: return False
     t_no_space = title.replace(" ", "")
     return any(kw in t_no_space for kw in ["전환사채권발행결정", "교환사채권발행결정", "신주인수권부사채권발행결정"])
@@ -132,15 +128,13 @@ def is_correction_title(title: str) -> bool:
     return "정정" in (title or "")
 
 def _norm_date(s: str) -> str:
-    """날짜에서 숫자만 추출 (SyntaxError 방지용 유틸)"""
     return re.sub(r"[^\d]", "", str(s or ""))
 
 def make_event_key(company: str, first_board_date: str, bond_type: str) -> str:
-    """덮어쓰기(UPDATE) 판별용 이벤트 키 (백슬래시 이슈 완벽 해결)"""
     return f"{_norm(company)}|{_norm_date(first_board_date)}|{_norm(bond_type)}"
 
 # ==========================================================
-# 3. 무결성 보장 HTML 파서 (유상증자 원본 병합셀 엔진)
+# 3. 무결성 보장 HTML 파서
 # ==========================================================
 def parse_html_table_to_df(tbl_soup) -> Optional[pd.DataFrame]:
     rows = tbl_soup.find_all('tr')
@@ -224,7 +218,7 @@ def scrape_one(context, acpt_no: str) -> Tuple[List[pd.DataFrame], str, str]:
         except: pass
 
 # ==========================================================
-# 4. 정정사항 1순위 엔진 및 텍스트 그물망
+# 4. 정정사항 엔진 및 텍스트 그물망
 # ==========================================================
 def extract_correction_after_map(dfs: List[pd.DataFrame]) -> Dict[str, str]:
     out: Dict[str, str] = {}
@@ -261,7 +255,6 @@ def extract_correction_after_map(dfs: List[pd.DataFrame]) -> Dict[str, str]:
     return out
 
 def scan_label_value_preferring_correction(dfs, label_candidates, corr_after) -> str:
-    """정정후 데이터를 최우선으로 찾고, 표의 우측/하단 셀을 광범위하게 스캔"""
     if corr_after:
         cand_clean = {_clean_label(x) for x in label_candidates}
         for c in cand_clean:
@@ -313,20 +306,41 @@ def find_row_best_float(dfs, must_contain) -> Optional[float]:
     return None
 
 # ==========================================================
-# 5. 핵심 컬럼 전용 추출기 (0.0% 보존 완벽화)
+# 5. 핵심 컬럼 전용 추출기 (발행상품 정밀 타격 엔진)
 # ==========================================================
 def extract_product_type(dfs: List[pd.DataFrame], corr_after: Dict) -> str:
-    val = scan_label_value_preferring_correction(dfs, ["1. 사채의 종류", "사채의 종류", "사채종류", "종류"], corr_after)
-    if val and len(val) > 4 and "사채" in val: return _single_line(val)
+    """[핵심] 공시 시스템의 황당한 오타(사태, 사체, 사케) 및 쓰레기 문자열 완벽 제어"""
+    labels = ["1. 사채의 종류", "사채의 종류", "사체의 종류", "사태의 종류", "사케의 종류", "사채종류", "종류"]
     
+    def _clean_product(text: str) -> str:
+        # 표 분해 시 섞여 들어오는 "회차 5", "종류" 등의 쓰레기 텍스트 제거
+        text = re.sub(r'(회차|제)\s*\d+\s*(회|차)?', ' ', text)
+        text = re.sub(r'(^종류|종류$)', ' ', text).strip()
+        # [수식어] + [사채명] 패턴만 정교하게 오려냄
+        m = re.search(r'([가-힣a-zA-Z\s]*(?:무기명|무기병|기명|보증|사모|공모|분리|이권)[가-힣a-zA-Z\s]*(?:전환사채|교환사채|신주인수권부사채|사채))', text)
+        if m: return _single_line(m.group(1))
+        return _single_line(text)
+
+    # 1. 정정공시 최우선 탐색
+    if corr_after:
+        for k, v in corr_after.items():
+            if any(_norm(lb) in _norm(k) for lb in labels):
+                return _clean_product(v)
+
+    # 2. 표 레이블 기반 탐색 (우측/하단 스캔)
+    val = scan_label_value_preferring_correction(dfs, labels, {})
+    if val and "사채" in val:
+        cleaned = _clean_product(val)
+        if len(cleaned) >= 5: return cleaned
+
+    # 3. 레이블이 완전히 깨진 경우: 표 상단 10줄을 하나로 합쳐서 패턴 포획
     for df in dfs:
         arr = df.astype(str).values
-        for r in range(min(6, arr.shape[0])): 
-            row_str = " ".join(arr[r])
-            if "사채" in row_str and any(kw in row_str for kw in ["무보증", "무기명", "사모", "공모", "이권부"]):
-                m = re.search(r'([^\s]*무기명.*사채|[^\s]*무보증.*사채)', row_str)
-                if m: return _single_line(m.group(1))
-                return _single_line(row_str)
+        for r in range(min(10, arr.shape[0])):
+            row_str = " ".join([x for x in arr[r] if x.lower() != 'nan'])
+            if "사채" in row_str and any(kw in row_str for kw in ["무보증", "무기명", "무기병", "사모", "공모", "분리", "이권"]):
+                cleaned = _clean_product(row_str)
+                if len(cleaned) >= 5: return cleaned
     return ""
 
 def extract_option_details(dfs: List[pd.DataFrame], html_raw: str, option_type: str, corr_after: Dict) -> str:
@@ -468,6 +482,8 @@ def parse_bond_record(dfs, t: Target, corr_after, html_raw, company_market_map) 
     rec["만기"] = _format_date(scan_label_value_preferring_correction(dfs, ["사채만기일", "만기일", "상환기일"], corr_after))
     
     rec["모집방식"] = scan_label_value_preferring_correction(dfs, ["사채발행방법", "모집방법", "발행방법"], corr_after)
+    
+    # [강화] 완벽 적용된 발행상품
     rec["발행상품"] = extract_product_type(dfs, corr_after)
 
     def get_corr_num(labels, fallback_keys=[], min_val=-1, as_float=False):
@@ -543,7 +559,7 @@ def build_indices(values: List[List[str]], headers: List[str]):
     return r_idx, e_idx
 
 # ==========================================================
-# 8. 메인 실행 (유상증자 원본 복구 및 덮어쓰기 로직 탑재)
+# 8. 메인 실행
 # ==========================================================
 def run():
     sh, bond_ws, seen_ws = gs_open()
