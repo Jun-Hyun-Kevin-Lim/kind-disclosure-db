@@ -1,5 +1,9 @@
 # ==========================================================
-# #유상증자_코드V5.6
+# #유상증자_코드V5.7_Ultimate (발행상품 빈칸 픽스 & 종류 자동 판별 엔진)
+# - [복구] 실수로 누락되었던 '발행상품' 컬럼 값 입력 로직 복구
+# - [개선] 무조건 '보통주식'으로 적지 않고, 표를 읽어 '우선주', '종류주식' 등을 정확히 판별
+# - [유지] V5.6의 투자자 철벽 방어, 날짜 100% 덮어쓰기, 보고서명 유지
+# - [트리거] 발행상품이 빈칸인 행을 자동 감지하여 일괄 복구 진행
 # ==========================================================
 import os
 import re
@@ -515,6 +519,54 @@ def extract_investors(dfs: List[pd.DataFrame], corr_after: Dict[str, str]) -> st
     return ""
 
 # ==========================================================
+# [신규 추가] 발행상품(종류/우선주 등) 자동 식별 정밀 엔진
+# ==========================================================
+def extract_issue_shares_and_type(dfs: List[pd.DataFrame], corr_after: Dict[str, str]) -> Tuple[Optional[int], str]:
+    stock_type = "보통주식"
+    best_amt = 0
+    
+    # 1. 정정후 텍스트에서 힌트 먼저 수집
+    if corr_after:
+        for k, v in corr_after.items():
+            if any(c in _norm(k) for c in ["신주의종류와수", "발행예정주식수"]):
+                amt = _max_int_in_text(v)
+                if amt and amt > best_amt:
+                    best_amt = amt
+                    if "상환전환우선주" in v: stock_type = "상환전환우선주"
+                    elif "전환우선주" in v: stock_type = "전환우선주"
+                    elif "우선주" in v: stock_type = "우선주식"
+                    elif "종류주" in v: stock_type = "종류주식"
+                    elif "기타주" in v: stock_type = "기타주식"
+
+    if best_amt > 0:
+        return best_amt, stock_type
+
+    # 2. 표 내부 세밀 스캔 (보통주식 vs 종류주식 중 숫자가 있는 쪽을 추적)
+    for df in dfs:
+        arr = df.astype(str).values
+        R, C = arr.shape
+        for r in range(R):
+            row_joined = _norm("".join(arr[r]))
+            
+            if any(kw in row_joined for kw in ["신주의종류", "발행예정주식", "보통주", "종류주", "우선주", "기타주"]):
+                if any(d in row_joined for d in ["년", "월", "일", "예정일", "기일"]): continue
+                
+                amt = _max_int_in_text(" ".join(arr[r]))
+                if amt and amt > best_amt:
+                    best_amt = amt
+                    if "상환전환우선주" in row_joined: stock_type = "상환전환우선주"
+                    elif "전환우선주" in row_joined: stock_type = "전환우선주"
+                    elif "우선주" in row_joined: stock_type = "우선주식"
+                    elif "종류주" in row_joined: stock_type = "종류주식"
+                    elif "기타주" in row_joined: stock_type = "기타주식"
+                    elif "보통주" in row_joined: stock_type = "보통주식"
+    
+    if best_amt > 0:
+        return best_amt, stock_type
+        
+    return None, ""
+
+# ==========================================================
 # 레코드 파싱 로직 
 # ==========================================================
 def parse_rights_issue_record(dfs, t: Target, corr_after, html_raw, company_market_map) -> dict:
@@ -550,19 +602,15 @@ def parse_rights_issue_record(dfs, t: Target, corr_after, html_raw, company_mark
         company_market_map[norm_company_name(rec["회사명"])] = rec["상장시장"]
         company_market_map[norm_company_name(title_clean)] = rec["상장시장"]
 
-    # [핵심] 날짜 추출 시 "추가상장", "상장주식총수", "교부예정일" 등의 표 헤더를 무조건 차단하는 철벽 필터
     def get_valid_date(labels):
         cand_clean = {_clean_label(x) for x in labels}
         
         def is_clean_date(v):
             v = str(v).strip()
             if not re.search(r'\d', v): return False
-            # 이 단어들이 있으면 날짜가 아니라 표 항목이거나 쓰레기값임
             bad_kws = ["정정", "변경", "요청", "사유", "기재", "오기", "추가상장", "상장주식", "총수", "교부예정일", "사항", "기준", "발행", "항목"]
             if any(b in v for b in bad_kws): return False
-            # 날짜라면 최소한 연도(4자리 숫자)나, 특수기호(년,월,일,-,.)를 포함해야 함
-            if not (re.search(r'\d{4}', v) or re.search(r'\d{2,4}[\.\-\/년]\s*\d{1,2}', v)):
-                return False
+            if not (re.search(r'\d{4}', v) or re.search(r'\d{2,4}[\.\-\/년]\s*\d{1,2}', v)): return False
             return True
 
         if corr_after:
@@ -580,9 +628,7 @@ def parse_rights_issue_record(dfs, t: Target, corr_after, html_raw, company_mark
                     for v in row_vals:
                         if _clean_label(v) in cand_clean: continue
                         if re.fullmatch(r"([①-⑩]|\(\d+\)|\d+\.)", _norm(v)): continue
-                        
-                        if is_clean_date(v):
-                            possible_dates.append(v)
+                        if is_clean_date(v): possible_dates.append(v)
                     if possible_dates: return possible_dates[-1] 
                         
         val = scan_label_value(dfs, labels)
@@ -598,6 +644,13 @@ def parse_rights_issue_record(dfs, t: Target, corr_after, html_raw, company_mark
 
     rec["증자방식"] = scan_label_value_preferring_correction(dfs, ["증자방식", "발행방법", "배정방식"], corr_after)
 
+    # [핵심] 누락됐던 발행상품 입력 및 정밀 추적기 적용
+    issue_shares, stock_type = extract_issue_shares_and_type(dfs, corr_after)
+    
+    if issue_shares:
+        rec["신규발행주식수"] = f"{issue_shares:,}"
+        rec["발행상품"] = stock_type
+
     def get_corr_num(labels, min_val=0, as_float=False):
         if not corr_after: return None
         cand_clean = {_clean_label(x) for x in labels}
@@ -609,19 +662,12 @@ def parse_rights_issue_record(dfs, t: Target, corr_after, html_raw, company_mark
                     if amt is not None and amt > min_val: return amt
         return None
 
-    issue_shares = get_corr_num(["신주의 종류와 수", "신주의종류와수", "발행예정주식수"])
-    if not issue_shares:
-        issue_shares = _max_int_in_text(scan_label_value(dfs, ["신주의 종류와 수", "신주의종류와수", "발행예정주식수"]))
-    if not issue_shares:
-        issue_shares = find_row_best_int(dfs, ["신주의종류와수", "보통주식"]) or find_row_best_int(dfs, ["발행예정주식수"])
-
     prev_shares = get_corr_num(["증자전발행주식총수", "기발행주식총수", "발행주식총수", "증자전 주식수", "증자전발행주식총수(보통주식)"])
     if not prev_shares:
         prev_shares = _max_int_in_text(scan_label_value(dfs, ["증자전발행주식총수", "기발행주식총수", "발행주식총수", "증자전 주식수", "증자전발행주식총수(보통주식)"]))
     if not prev_shares:
         prev_shares = find_row_best_int(dfs, ["증자전발행주식총수", "보통주식"]) or find_row_best_int(dfs, ["발행주식총수", "보통주식"])
 
-    if issue_shares: rec["신규발행주식수"] = f"{issue_shares:,}"
     if prev_shares: rec["증자전 주식수"] = f"{prev_shares:,}"
 
     price = get_corr_num(["신주 발행가액", "신주발행가액", "예정발행가액", "확정발행가액", "발행가액", "1주당 확정발행가액"], min_val=50)
@@ -650,6 +696,7 @@ def parse_rights_issue_record(dfs, t: Target, corr_after, html_raw, company_mark
 
     uses_text, total_fund_amt = extract_fund_use_and_amount(dfs, corr_after)
     rec["자금용도"] = uses_text
+    
     rec["투자자"] = extract_investors(dfs, corr_after)
 
     sh = _to_int(rec["신규발행주식수"])
@@ -705,8 +752,8 @@ def run():
         investor_val = get_val(row, "투자자")
         comp_name = get_val(row, "회사명")
         prev_shares = get_val(row, "증자전 주식수")
+        product_val = get_val(row, "발행상품")
         
-        # 날짜 컬럼들에 쓰레기값(표 항목명)이 들어갔는지 확인하는 감지기
         div_date = get_val(row, "신주의 배당기산일")
         list_date = get_val(row, "신주의 상장 예정일")
         board_date = get_val(row, "이사회결의일")
@@ -718,6 +765,7 @@ def run():
             any(k in board_date for k in bad_date_kws)
         )
         
+        # [트리거 강화] 발행상품 빈칸 및 쓰레기 투자자 정보 감지 시 자동 복구 진행
         bad_inv_kws = ["관계", "최대주주", "지분", "%", "정정", "주1", "합계", "소계", "출자자", "소재지", "명"]
         investor_needs_fix = any(k in investor_val for k in bad_inv_kws) or bool(re.search(r'\d{4,}', investor_val))
         
@@ -730,9 +778,10 @@ def run():
             not re.search(r'\d', pay_date) or "정정" in pay_date or "변경" in pay_date or "요청" in pay_date or
             not first_date or
             investor_needs_fix or
-            date_needs_fix or  # [추가] 날짜 컬럼 오작동 감지 시 강제 재파싱
+            date_needs_fix or  
             not comp_name or comp_name in ["유", "코", "넥"] or
-            prev_shares == "3" 
+            prev_shares == "3" or
+            not product_val 
         )
         
         if needs_fix and acpt not in targets_dict:
