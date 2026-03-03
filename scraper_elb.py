@@ -1,10 +1,9 @@
 # ==========================================================
-# #주식연계채권_코드V9.1_Absolute_Master (문법 에러 픽스 & 100% 추출)
-# 1. 문법 에러 해결: f-string 내 백슬래시(\) 사용 제거 (Python 3.11 이하 호환)
-# 2. 0.0% 증발 버그 픽스: 이자율 0.0%나 0원 등의 데이터를 False로 인식하지 않고 정확히 추출
-# 3. 옵션(Put/Call) 그물망 확장: HTML 본문에서 최대 3500자까지 긁어와 중간에 텍스트가 잘리는 현상 방지
-# 4. 정정공시(Table 3) 완벽 연동: 옵션과 발행상품 추출 시에도 '정정후' 데이터를 1순위로 스캔
-# 5. 텍스트 한 줄 처리: 모든 긴 문장을 시트에 보기 좋게 한 줄(Single-line)로 출력
+# #주식연계채권_코드V9.2_Final_Stable (유상증자 V5.8 완벽 복제 & 안정화)
+# 1. 유상증자 890라인급 코어 엔진(HTML 파서, 다중 방어선, 덮어쓰기) 100% 유지
+# 2. 문법 에러(SyntaxError) 완벽 해결: f-string 내부 백슬래시(\) 제거
+# 3. 0.0% 증발 방지 및 정정공시 최우선 반영(Table 3) 로직 탑재
+# 4. 타겟 정밀 필터링: 사채권발행결정 3종만 정확히 타겟팅
 # ==========================================================
 import os
 import re
@@ -29,7 +28,7 @@ BASE = "https://kind.krx.co.kr"
 DEFAULT_RSS = "http://kind.krx.co.kr:80/disclosure/rsstodaydistribute.do?method=searchRssTodayDistribute&mktTpCd=0&currentPageSize=100"
 RSS_URL = os.getenv("RSS_URL", DEFAULT_RSS)
 
-# [철통 방어] 타겟 키워드 3종
+# 타겟 키워드 3종 완벽 고정
 TARGET_KWS = "전환사채권발행결정,교환사채권발행결정,신주인수권부사채권발행결정"
 KEYWORDS = [x.strip() for x in os.getenv("KEYWORDS", TARGET_KWS).split(",") if x.strip()]
 
@@ -60,7 +59,7 @@ class Target:
     market: str = ""
 
 # ==========================================================
-# 2. 강력한 유틸리티 (에러 픽스 완료)
+# 2. 강력한 유틸리티
 # ==========================================================
 def _norm(s: str) -> str:
     return re.sub(r"\s+", "", str(s or "")).replace(":", "")
@@ -69,6 +68,7 @@ def _clean_label(s: str) -> str:
     return re.sub(r"^([①-⑩]|\(\d+\)|\d+\.)+", "", _norm(s))
 
 def _single_line(s: str) -> str:
+    """줄바꿈과 탭을 띄어쓰기로 변환하여 구글시트 가독성 최적화"""
     if not s: return ""
     return re.sub(r'\s+', ' ', str(s)).strip()
 
@@ -123,6 +123,7 @@ def viewer_url(acpt_no: str, docno: str = "") -> str:
     return f"{BASE}/common/disclsviewer.do?method=searchInitInfo&acptNo={acpt_no}&docno={docno}"
 
 def match_strict_keyword(title: str) -> bool:
+    """오직 3가지 사채권발행결정만 100% 필터링"""
     if not title: return False
     t_no_space = title.replace(" ", "")
     return any(kw in t_no_space for kw in ["전환사채권발행결정", "교환사채권발행결정", "신주인수권부사채권발행결정"])
@@ -131,14 +132,15 @@ def is_correction_title(title: str) -> bool:
     return "정정" in (title or "")
 
 def _norm_date(s: str) -> str:
+    """날짜에서 숫자만 추출 (SyntaxError 방지용 유틸)"""
     return re.sub(r"[^\d]", "", str(s or ""))
 
-# [에러 해결됨] f-string 내부에 백슬래시를 사용하지 않도록 수정 완료
 def make_event_key(company: str, first_board_date: str, bond_type: str) -> str:
+    """덮어쓰기(UPDATE) 판별용 이벤트 키 (백슬래시 이슈 완벽 해결)"""
     return f"{_norm(company)}|{_norm_date(first_board_date)}|{_norm(bond_type)}"
 
 # ==========================================================
-# 3. 무결성 보장 HTML 파서 (병합 표 완벽 분해)
+# 3. 무결성 보장 HTML 파서 (유상증자 원본 병합셀 엔진)
 # ==========================================================
 def parse_html_table_to_df(tbl_soup) -> Optional[pd.DataFrame]:
     rows = tbl_soup.find_all('tr')
@@ -222,7 +224,7 @@ def scrape_one(context, acpt_no: str) -> Tuple[List[pd.DataFrame], str, str]:
         except: pass
 
 # ==========================================================
-# 4. 정정사항 엔진 및 텍스트 그물망
+# 4. 정정사항 1순위 엔진 및 텍스트 그물망
 # ==========================================================
 def extract_correction_after_map(dfs: List[pd.DataFrame]) -> Dict[str, str]:
     out: Dict[str, str] = {}
@@ -259,6 +261,7 @@ def extract_correction_after_map(dfs: List[pd.DataFrame]) -> Dict[str, str]:
     return out
 
 def scan_label_value_preferring_correction(dfs, label_candidates, corr_after) -> str:
+    """정정후 데이터를 최우선으로 찾고, 표의 우측/하단 셀을 광범위하게 스캔"""
     if corr_after:
         cand_clean = {_clean_label(x) for x in label_candidates}
         for c in cand_clean:
@@ -310,7 +313,7 @@ def find_row_best_float(dfs, must_contain) -> Optional[float]:
     return None
 
 # ==========================================================
-# 5. 핵심 컬럼 전용 추출기 (버그 완전 수정)
+# 5. 핵심 컬럼 전용 추출기 (0.0% 보존 완벽화)
 # ==========================================================
 def extract_product_type(dfs: List[pd.DataFrame], corr_after: Dict) -> str:
     val = scan_label_value_preferring_correction(dfs, ["1. 사채의 종류", "사채의 종류", "사채종류", "종류"], corr_after)
@@ -436,7 +439,7 @@ def extract_fund_usage(dfs: List[pd.DataFrame], corr_after) -> str:
     return _single_line(val)
 
 # ==========================================================
-# 6. 레코드 파싱 매핑 (0.0% 철통 보존)
+# 6. 레코드 파싱 매핑
 # ==========================================================
 def parse_bond_record(dfs, t: Target, corr_after, html_raw, company_market_map) -> dict:
     rec = {k: "" for k in BOND_COLUMNS}
@@ -540,7 +543,7 @@ def build_indices(values: List[List[str]], headers: List[str]):
     return r_idx, e_idx
 
 # ==========================================================
-# 8. 메인 실행
+# 8. 메인 실행 (유상증자 원본 복구 및 덮어쓰기 로직 탑재)
 # ==========================================================
 def run():
     sh, bond_ws, seen_ws = gs_open()
@@ -606,6 +609,7 @@ def run():
                 mode = "APPEND"
                 row = -1
                 
+                # 유상증자의 UPDATE 판별 로직 완전 동일 적용
                 if evk in event_index:
                     row, old_acpt = event_index[evk]
                     mode = "UPDATE"
