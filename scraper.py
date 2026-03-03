@@ -1,14 +1,13 @@
 # ==========================================================
-# #유상증자_코드V4.9 (상장시장 100% 강제 추출 & Dynamic Mapping)
-# - 상장시장 누락 완벽 해결: urllib을 이용해 KIND 헤더 API를 직접 타격하여 추출
-# - Dynamic Smart Mapping: 파싱 도중 알아낸 시장 정보를 실시간으로 메모리에 업데이트하여 연속 복구
-# - 확정발행금액 1200경 억제, 링크 증발 방지, 발행가 6원 오류 차단 모두 유지
+# #유상증자_코드V4.7 (파싱 디테일 극강화 & 완전 복구판)
+# - 상장시장: (주), 주식회사 등 접두/접미사 제거 후 정밀 Smart Mapping
+# - 발행가액: 50원 이하 숫자는 항목 인덱스(오류)로 간주하여 원천 차단 ("6" 버그 픽스)
+# - 할인율: 표기 변형(할증률, 산정시 할인율 등) 키워드 스캔 후보 대폭 추가
 # ==========================================================
 import os
 import re
 import json
 import time
-import urllib.request  # 헤더 강제 추출용
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -74,6 +73,7 @@ def _clean_label(s: str) -> str:
     return re.sub(r"^([①-⑩]|\(\d+\)|\d+\.)+", "", s)
 
 def norm_company_name(name: str) -> str:
+    """Smart Mapping을 위해 '주식회사', '(주)' 등을 제거한 핵심 이름 추출"""
     if not name: return ""
     n = name.replace("주식회사", "").replace("(주)", "").strip()
     return _norm(n)
@@ -121,16 +121,16 @@ def market_from_title(title: str) -> str:
     return ""
 
 def market_from_html(html: str) -> str:
-    """HTML 소스에서 상장시장을 100% 잡아내는 강화된 함수"""
     if not html: return ""
-    h_low = html.lower()
+    html_lower = html.lower()
     
-    # 1. KIND 헤더 프레임의 고유 아이콘 및 alt 텍스트 스캔 (가장 정확)
-    if "icn_t_kosdaq" in h_low or "alt=\"코스닥\"" in h_low or "코스닥시장" in h_low: return "코스닥"
-    if "icn_t_kospi" in h_low or "alt=\"유가증권\"" in h_low or "유가증권시장" in h_low: return "유가증권"
-    if "icn_t_konex" in h_low or "alt=\"코넥스\"" in h_low or "코넥스시장" in h_low: return "코넥스"
+    if "mark_kosdaq" in html_lower: return "코스닥"
+    if "mark_kospi" in html_lower: return "유가증권"
+    if "mark_konex" in html_lower: return "코넥스"
     
-    # 2. 본문 텍스트 전체 강제 스캔
+    m = re.search(r'alt=["\']?(코스닥|유가증권|코넥스)["\']?', html)
+    if m: return m.group(1)
+    
     if "코스닥" in html: return "코스닥"
     if "유가증권" in html: return "유가증권"
     if "코넥스" in html: return "코넥스"
@@ -205,23 +205,10 @@ def extract_tables_from_html_robust(html: str) -> List[pd.DataFrame]:
 def scrape_one(context, acpt_no: str) -> Tuple[List[pd.DataFrame], str, str]:
     url = viewer_url(acpt_no)
     page = context.new_page()
-    header_html = ""
     try:
-        # [핵심] 브라우저 로딩을 기다리지 않고, urllib을 통해 KIND 헤더 API를 직접 타격해 HTML을 무조건 가져옵니다.
-        try:
-            header_url = f"{BASE}/common/disclsviewer.do?method=searchHeaderInfo&acptNo={acpt_no}"
-            req = urllib.request.Request(header_url, headers={'User-Agent': 'Mozilla/5.0'})
-            with urllib.request.urlopen(req, timeout=5) as response:
-                header_html = response.read().decode('utf-8', errors='ignore')
-        except Exception as e:
-            pass
-
         page.goto(url, wait_until="networkidle", timeout=60000)
-        page.wait_for_timeout(1500) 
-        
-        # 가져온 헤더 HTML과 페이지 내 프레임들을 모두 합쳐서 전역 스캔용 텍스트를 만듭니다.
-        all_frames_html = header_html + " " + page.content() + " " + " ".join([fr.content() for fr in page.frames])
-        
+        page.wait_for_timeout(2500) 
+        all_frames_html = page.content() + " " + " ".join([fr.content() for fr in page.frames])
         best_html = pick_best_frame_html(page) or ""
         if best_html.lower().count("<table") == 0: raise RuntimeError("table 못 찾음")
         return extract_tables_from_html_robust(best_html), url, all_frames_html
@@ -443,6 +430,7 @@ def parse_rights_issue_record(dfs, t: Target, corr_after, html_raw, company_mark
         or title_clean
     )
     
+    # [상장시장 정밀 복구] (주) 등을 제거한 정규화 이름으로 Smart Mapping 실행
     mkt = scan_label_value_preferring_correction(dfs, ["상장시장", "시장구분"], corr_after)
     if mkt and ("해당사항" in mkt or len(mkt) < 2 or mkt in ("-", ".")): mkt = ""
     
@@ -454,11 +442,6 @@ def parse_rights_issue_record(dfs, t: Target, corr_after, html_raw, company_mark
         or company_market_map.get(norm_company_name(title_clean))
         or market_from_html(html_raw)
     )
-
-    # [Dynamic Smart Mapping] 방금 찾아낸 상장시장을 메모리에 즉각 업데이트하여 다음 행에서 써먹음!
-    if rec["상장시장"] and rec["회사명"]:
-        company_market_map[norm_company_name(rec["회사명"])] = rec["상장시장"]
-        company_market_map[norm_company_name(title_clean)] = rec["상장시장"]
 
     def get_valid_date(labels):
         val = scan_label_value_preferring_correction(dfs, labels, corr_after)
@@ -481,6 +464,7 @@ def parse_rights_issue_record(dfs, t: Target, corr_after, html_raw, company_mark
         rec["신규발행주식수"] = f"{issue_shares:,}"
     if prev_shares: rec["증자전 주식수"] = f"{prev_shares:,}"
 
+    # [발행가액 "6" 버그 완벽 차단] 50원 이하의 숫자는 항목 번호일 확률이 99%이므로 파기하고 다시 찾음
     price_cands = ["신주 발행가액", "신주발행가액", "예정발행가액", "예정발행가", "확정발행가액", "1주당 확정발행가액", "발행가액"]
     price_txt = scan_label_value_preferring_correction(dfs, price_cands, corr_after)
     price = _to_int(price_txt)
@@ -504,6 +488,7 @@ def parse_rights_issue_record(dfs, t: Target, corr_after, html_raw, company_mark
     if base_price: rec["기준주가"] = f"{base_price:,}"
     else: rec["기준주가"] = base_txt if base_txt else ""
 
+    # [할인율 키워드 대폭 확장] 다양한 공시 텍스트 포맷 커버
     disc_cands = [
         "할인율", "할증률", "할인율(%)", "할인율 또는 할증률", 
         "할인(할증)율", "발행가액 산정시 할인율", 
@@ -549,6 +534,7 @@ def run():
     for r, row in enumerate(seen_values[1:], start=2):
         if row and row[0].strip().isdigit(): seen_index[row[0].strip()] = r
 
+    # [Smart Mapping 강화] (주) 등을 벗겨낸 순수 이름으로 상장시장을 기억해둡니다.
     company_market_map = {}
     for row in values[1:]:
         c_name = row[RIGHTS_COLUMNS.index("회사명")].strip() if len(row) > RIGHTS_COLUMNS.index("회사명") else ""
@@ -574,10 +560,11 @@ def run():
         first_date = get_val(row, "최초 이사회결의일")
         link_val = get_val(row, "링크")
         
+        # 금액, 가격, 링크 등 필수 데이터에 이상이 생겼을 때 스스로 파싱 목록에 올립니다
         needs_fix = (
             not link_val or 
             not fund or "(원)" in fund or
-            not price or (price.replace(",","").isdigit() and int(price.replace(",","")) <= 50) or 
+            not price or (price.replace(",","").isdigit() and int(price.replace(",","")) <= 50) or # 50원 이하 가격 감지
             not fund_amt or len(fund_amt.replace(",", "").replace(".", "")) >= 8 or 
             not market or
             not re.search(r'\d', pay_date) or "정정" in pay_date or "변경" in pay_date or "요청" in pay_date or
