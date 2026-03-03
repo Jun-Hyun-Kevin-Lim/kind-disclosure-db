@@ -1,9 +1,17 @@
 # ==========================================================
-# #유상증자_코드V2
+# #유상증자_코드V2 (파서 개선판)
 # - RSS에서 "유상증자" 공시 수집 → KIND 뷰어에서 표 파싱 → Google Sheets에 구조화 저장
 # - 정정 공시(제목 맨 앞 "정정")는 "정정사항" 표의 '정정후' 값을 우선 적용
 # - 정정 공시는 append가 아니라 기존 행을 찾아 update(덮어쓰기)
 # - seen은 더 이상 "스킵"에 쓰지 않음(지속 업데이트). 처리 로그용으로 ts만 갱신
+#
+# [이번 개선 포인트]
+# 1) "확정발행가(원)=6" 같은 문항번호 오인식 방지:
+#    - 가격/날짜 컬럼은 validator로 값 검증(가격 범위/날짜 형식) 후 채택
+# 2) "납입일 변경에 따른 정정" 같은 텍스트가 날짜 칸에 들어가는 문제 방지:
+#    - 날짜 컬럼은 날짜처럼 생긴 값만 채택
+# 3) 정정사항 표 키 매칭 강화:
+#    - 항목명 앞 번호 제거 + 키 정규화(특수문자 제거)로 매칭 안정화
 # ==========================================================
 
 import os
@@ -36,7 +44,7 @@ RSS_URL = os.getenv("RSS_URL", DEFAULT_RSS)
 KEYWORDS = [x.strip() for x in os.getenv("KEYWORDS", "유상증자").split(",") if x.strip()]
 
 HEADLESS = os.getenv("HEADLESS", "true").lower() == "true"
-LIMIT = int(os.getenv("LIMIT", "0"))
+LIMIT = int(os.getenv("LIMIT", "0"))  # 0이면 제한 없음
 RUN_ONE_ACPTNO = os.getenv("RUN_ONE_ACPTNO", "").strip()
 
 GOOGLE_SHEET_ID = os.environ.get("GOOGLE_SHEET_ID", "").strip()
@@ -48,7 +56,7 @@ GOOGLE_CREDENTIALS_JSON = (
 RIGHTS_OUT_SHEET = os.getenv("RIGHTS_OUT_SHEET", "유상증자")
 SEEN_SHEET_NAME = os.getenv("SEEN_SHEET_NAME", "seen")
 
-# 디버그 저장 (원하면 유지: 실패 시 out/debug에 저장)
+# 디버그 저장 (실패 시 out/debug에 저장)
 OUTDIR = Path(os.getenv("OUTDIR", "out"))
 DEBUGDIR = OUTDIR / "debug"
 
@@ -75,7 +83,7 @@ class Target:
 # 유틸
 # ==========================================================
 def _norm(s: str) -> str:
-    """공백/콜론 제거 등 라벨 매칭용 정규화"""
+    """공백/콜론 제거 등 라벨 매칭용 정규화(간단 버전)"""
     s = (s or "").strip()
     s = re.sub(r"\s+", "", s)
     s = s.replace(":", "")
@@ -122,6 +130,75 @@ def _max_int_in_text(s: str) -> Optional[int]:
         if v is not None:
             vals.append(v)
     return max(vals) if vals else None
+
+
+# ----------------------------------------------------------
+# 값 검증(validator)용 유틸
+# ----------------------------------------------------------
+def _strip_leading_item_no(s: str) -> str:
+    """
+    라벨/항목명 앞에 붙는 번호 제거:
+    - "15. ..." / "7-2. ..." / "1) ..." / "(1) ..." 등
+    """
+    if not s:
+        return ""
+    t = str(s).strip()
+
+    # (1) / [1] / 1) / 1. / 7-2. 같은 패턴 제거
+    t = re.sub(r"^\s*[\(\[]?\s*\d+(?:-\d+)?\s*[\)\].]?\s*", "", t)
+    return t.strip()
+
+def _norm_key(s: str) -> str:
+    """
+    라벨/항목 매칭을 더 안정화하기 위한 키 정규화
+    - 공백/특수문자 제거(한글/영문/숫자만 남김)
+    """
+    s = (s or "").strip()
+    return re.sub(r"[^0-9A-Za-z가-힣]", "", s)
+
+def _label_key_variants(label: str) -> Set[str]:
+    """
+    라벨 후보를 키로 만들 때:
+    - 원본(번호 포함) 키
+    - 번호 제거 버전 키
+    둘 다 넣어서 정정사항(번호 없는 항목) / 본문(번호 있는 라벨) 동시 대응
+    """
+    v = set()
+    v.add(_norm_key(label))
+    v.add(_norm_key(_strip_leading_item_no(label)))
+    return {x for x in v if x}
+
+def is_date_like(s: str) -> bool:
+    """
+    날짜처럼 생긴 문자열인지 판별
+    - 2026-03-27 / 2026.03.27 / 2026년 03월 27일 / 20260327 형태 지원
+    """
+    if not s:
+        return False
+    t = str(s).strip()
+
+    # YYYY년MM월DD일 / YYYY.MM.DD / YYYY-MM-DD / YYYY/MM/DD
+    if re.search(r"\d{4}\s*[년\.\-/]\s*\d{1,2}\s*[월\.\-/]\s*\d{1,2}", t):
+        return True
+
+    digits = re.sub(r"[^\d]", "", t)
+    return len(digits) == 8  # YYYYMMDD
+
+def _int_from_text(s: str) -> Optional[int]:
+    """텍스트에서 숫자 하나를 뽑아 int로 변환(여러 개면 최대값)"""
+    return _max_int_in_text(s) or _to_int(s)
+
+def is_price_like(s: str, min_v: int = 10, max_v: int = 2_000_000) -> bool:
+    """
+    발행가/기준주가 같은 '가격' 값 검증
+    - 6(문항번호) 같은 값 방지
+    - 주식수(수백만~수천만) 같은 큰 값 방지
+    """
+    v = _int_from_text(s)
+    if v is None:
+        return False
+    return (min_v <= v <= max_v)
+
 
 def extract_acpt_no(text: str) -> Optional[str]:
     m = re.search(r"acptNo=(\d{14})", text or "")
@@ -461,13 +538,16 @@ def touch_seen(seen_ws, seen_headers: List[str], seen_index: Dict[str, int], acp
 # ==========================================================
 # 유상증자 파서 보조 함수들
 # ==========================================================
-def scan_label_value(dfs: List[pd.DataFrame], label_candidates: List[str]) -> str:
+def scan_label_value(dfs: List[pd.DataFrame], label_candidates: List[str], validator=None) -> str:
     """
     라벨 매칭 후 값 후보 탐색:
     - 오른쪽/두칸오른쪽/아래/아래오른쪽
     - 같은 행의 나머지 값들도 후보로 본다(라벨 제외)
+    - validator가 있으면 validator를 통과한 값만 반환(날짜/가격 오류 방지)
     """
-    cand = {_norm(x) for x in label_candidates}
+    cand: Set[str] = set()
+    for x in label_candidates:
+        cand |= _label_key_variants(x)
 
     for df in dfs:
         arr = df.astype(str).values
@@ -475,30 +555,48 @@ def scan_label_value(dfs: List[pd.DataFrame], label_candidates: List[str]) -> st
 
         for r in range(R):
             for c in range(C):
-                cell = _norm(arr[r][c])
+                cell = _norm_key(arr[r][c])
                 if cell in cand:
-                    checks = []
-                    for rr, cc in [(r, c + 1), (r, c + 2), (r + 1, c), (r + 1, c + 1)]:
+                    checks: List[str] = []
+
+                    # 주변 셀(오른쪽 1~4칸, 아래, 아래오른쪽)까지 넉넉히 탐색
+                    neighbor_coords = []
+                    for k in range(1, 5):
+                        neighbor_coords.append((r, c + k))
+                    neighbor_coords += [(r + 1, c), (r + 1, c + 1), (r + 2, c), (r + 2, c + 1)]
+
+                    for rr, cc in neighbor_coords:
                         if 0 <= rr < R and 0 <= cc < C:
                             v = str(arr[rr][cc]).strip()
                             if v and v.lower() != "nan":
                                 checks.append(v)
 
+                    # 같은 행 전체도 후보로 봄(멀리 떨어진 값 대응)
                     row_vals = [
                         str(x).strip()
                         for x in arr[r].tolist()
                         if str(x).strip() and str(x).strip().lower() != "nan"
                     ]
-                    row_vals = [x for x in row_vals if _norm(x) not in cand]
+                    row_vals = [x for x in row_vals if _norm_key(x) not in cand]
 
                     for v in checks + row_vals:
-                        if re.fullmatch(r"\d+\.", v):
+                        # 문항번호(예: "6.", "6") 같은 잡값 1차 차단
+                        if re.fullmatch(r"\d{1,2}\.?", v.strip()):
                             continue
+
+                        if validator is not None and not validator(v):
+                            continue
+
                         return v
     return ""
 
-def find_row_best_int(dfs: List[pd.DataFrame], must_contain: List[str]) -> Optional[int]:
-    """특정 키워드가 포함된 행에서 가장 큰 정수값을 찾음"""
+def find_row_best_int(
+    dfs: List[pd.DataFrame],
+    must_contain: List[str],
+    min_value: Optional[int] = None,
+    max_value: Optional[int] = None
+) -> Optional[int]:
+    """특정 키워드가 포함된 행에서 정수값 후보 중 최댓값(필요 시 범위 제한)을 찾음"""
     keys = [_norm(x) for x in must_contain]
     best = None
 
@@ -508,8 +606,17 @@ def find_row_best_int(dfs: List[pd.DataFrame], must_contain: List[str]) -> Optio
             row = [str(x).strip() for x in arr[r].tolist()]
             joined = _norm("".join(row))
             if all(k in joined for k in keys):
-                nums = [_to_int(x) for x in row]
-                nums = [x for x in nums if x is not None and x > 0]
+                nums: List[int] = []
+                for x in row:
+                    v = _to_int(x)
+                    if v is None:
+                        continue
+                    if min_value is not None and v < min_value:
+                        continue
+                    if max_value is not None and v > max_value:
+                        continue
+                    nums.append(v)
+
                 if nums:
                     m = max(nums)
                     if best is None or m > best:
@@ -536,7 +643,7 @@ def extract_correction_after_map(dfs: List[pd.DataFrame]) -> Dict[str, str]:
     '정정사항' 표에서 (항목 -> 정정후) 값을 뽑아낸다.
     - 정정전/정정후 헤더가 있는 표를 찾는다.
     - 항목 셀이 비어 있으면(병합셀) 직전 항목을 carry-forward.
-    - key는 _norm(항목)으로 저장
+    - key는 _norm_key(번호 제거된 항목명)으로 저장
     """
     out: Dict[str, str] = {}
 
@@ -591,36 +698,44 @@ def extract_correction_after_map(dfs: List[pd.DataFrame]) -> Dict[str, str]:
                             break
 
             if after_val:
-                out[_norm(item)] = after_val
+                # 항목명 앞 번호/기호 제거 후 키 정규화
+                item_clean = _strip_leading_item_no(item)
+                out[_norm_key(item_clean)] = after_val
 
     return out
 
 def scan_label_value_preferring_correction(
     dfs: List[pd.DataFrame],
     label_candidates: List[str],
-    corr_after: Optional[Dict[str, str]] = None
+    corr_after: Optional[Dict[str, str]] = None,
+    validator=None
 ) -> str:
     """
-    정정 공시일 때: '정정사항 표(정정후)' 값을 먼저 반환하고,
-    없으면 기존 표에서 라벨 탐색 로직 사용
+    정정 공시일 때: '정정사항 표(정정후)' 값을 먼저 보되,
+    validator(날짜/가격 검증)를 통과한 값만 채택한다.
+    없으면 기존 표에서 라벨 탐색(validator 적용)으로 fallback.
     """
     if corr_after:
-        cand_norm = [_norm(x) for x in label_candidates]
+        cand_norm: Set[str] = set()
+        for x in label_candidates:
+            cand_norm |= _label_key_variants(x)
 
         # 1) 정확 매칭
         for c in cand_norm:
             v = corr_after.get(c, "")
             if str(v).strip():
-                return str(v).strip()
+                if validator is None or validator(v):
+                    return str(v).strip()
 
         # 2) 포함 매칭(항목명이 약간 다를 때)
         for k, v in corr_after.items():
             if not str(v).strip():
                 continue
             if any(c in k for c in cand_norm):
-                return str(v).strip()
+                if validator is None or validator(v):
+                    return str(v).strip()
 
-    return scan_label_value(dfs, label_candidates)
+    return scan_label_value(dfs, label_candidates, validator=validator)
 
 def build_fund_use_text(dfs: List[pd.DataFrame], corr_after: Optional[Dict[str, str]] = None) -> str:
     """
@@ -645,10 +760,10 @@ def build_fund_use_text(dfs: List[pd.DataFrame], corr_after: Optional[Dict[str, 
 
         # 1) 정정후 우선(정정사항 표에서 금액 추출)
         if corr_after:
-            kn = _norm(k)
+            kn = _norm_key(k)
             for itemk, v in corr_after.items():
-                if kn in itemk:
-                    amt = _max_int_in_text(v) or _to_int(v)
+                if kn and (kn in itemk):
+                    amt = _int_from_text(v)
                     if amt is not None and amt >= 1_000_000:
                         if best is None or amt > best:
                             best = amt
@@ -706,14 +821,20 @@ def parse_rights_issue_record(
         or market_from_title(title)
     )
 
-    # 결의일
+    # 결의일(날짜 검증 적용: 정정사유 텍스트 유입 방지)
     rec["이사회결의일"] = scan_label_value_preferring_correction(
         dfs,
         ["15. 이사회결의일(결정일)", "이사회결의일(결정일)", "이사회결의일", "결정일"],
-        corr_after
+        corr_after,
+        validator=is_date_like
     )
     rec["최초 이사회결의일"] = (
-        scan_label_value_preferring_correction(dfs, ["최초 이사회결의일", "최초이사회결의일"], corr_after)
+        scan_label_value_preferring_correction(
+            dfs,
+            ["최초 이사회결의일", "최초이사회결의일"],
+            corr_after,
+            validator=is_date_like
+        )
         or rec["이사회결의일"]
     )
 
@@ -755,33 +876,42 @@ def parse_rights_issue_record(
     if prev_shares:
         rec["증자전 주식수"] = f"{prev_shares:,}"
 
-    # 발행가/기준주가/할인율(정정후 우선)
+    # 발행가/기준주가(가격 검증 적용: "6" 문항번호 유입 방지)
     price_txt = scan_label_value_preferring_correction(
         dfs,
-        ["6. 신주 발행가액", "신주 발행가액", "신주발행가액", "신주 발행가액(원)", "신주발행가액(원)"],
-        corr_after
+        ["6. 신주 발행가액", "신주 발행가액", "신주발행가액", "확정 발행가액", "확정발행가액", "발행가액", "발행가액(원)", "1주당 발행가액"],
+        corr_after,
+        validator=is_price_like
     )
-    price = (
-        _to_int(price_txt)
-        or find_row_best_int(dfs, ["신주발행가액", "보통주식"])
-        or find_row_best_int(dfs, ["신주", "발행가액"])
-    )
-    if price:
+    price = _int_from_text(price_txt)
+    if price is None:
+        price = (
+            find_row_best_int(dfs, ["신주발행가액", "보통주식"], min_value=10, max_value=2_000_000)
+            or find_row_best_int(dfs, ["신주", "발행가액"], min_value=10, max_value=2_000_000)
+        )
+    if price is not None:
         rec["확정발행가(원)"] = f"{price:,}"
     else:
-        rec["확정발행가(원)"] = price_txt
+        rec["확정발행가(원)"] = price_txt  # 미정/추후확정 같은 텍스트일 수도 있음
 
-    base_txt = scan_label_value_preferring_correction(dfs, ["7. 기준주가", "기준주가"], corr_after)
-    base_price = (
-        _to_int(base_txt)
-        or find_row_best_int(dfs, ["기준주가", "보통주식"])
-        or find_row_best_int(dfs, ["기준주가"])
+    base_txt = scan_label_value_preferring_correction(
+        dfs,
+        ["7. 기준주가", "기준주가", "기준주가(원)"],
+        corr_after,
+        validator=is_price_like
     )
-    if base_price:
+    base_price = _int_from_text(base_txt)
+    if base_price is None:
+        base_price = (
+            find_row_best_int(dfs, ["기준주가", "보통주식"], min_value=10, max_value=2_000_000)
+            or find_row_best_int(dfs, ["기준주가"], min_value=10, max_value=2_000_000)
+        )
+    if base_price is not None:
         rec["기준주가"] = f"{base_price:,}"
     else:
         rec["기준주가"] = base_txt
 
+    # 할인율/할증율(기존 로직 유지)
     disc_txt = scan_label_value_preferring_correction(
         dfs,
         ["7-2. 기준주가에 대한 할인율 또는 할증율 (%)", "기준주가에 대한 할인율 또는 할증율 (%)", "할인율또는할증율", "기준주가에대한할인율또는할증율"],
@@ -793,25 +923,18 @@ def parse_rights_issue_record(
             find_row_best_float(dfs, ["기준주가에대한할인율또는할증율"])
             or find_row_best_float(dfs, ["할인율또는할증율"])
         )
-    if disc is not None:
-        rec["할인(할증률)"] = f"{disc}"
-    else:
-        rec["할인(할증률)"] = disc_txt
+    rec["할인(할증률)"] = f"{disc}" if disc is not None else disc_txt
 
-    # 일정(정정후 우선)
-    rec["납입일"] = scan_label_value_preferring_correction(dfs, ["9. 납입일", "납입일"], corr_after)
+    # 일정(날짜 검증 적용)
+    rec["납입일"] = scan_label_value_preferring_correction(dfs, ["9. 납입일", "납입일"], corr_after, validator=is_date_like)
     rec["신주의 배당기산일"] = scan_label_value_preferring_correction(
-        dfs,
-        ["10. 신주의 배당기산일", "신주의 배당기산일", "배당기산일"],
-        corr_after
+        dfs, ["10. 신주의 배당기산일", "신주의 배당기산일", "배당기산일"], corr_after, validator=is_date_like
     )
     rec["신주의 상장 예정일"] = scan_label_value_preferring_correction(
-        dfs,
-        ["12. 신주의 상장 예정일", "신주의 상장 예정일", "상장예정일"],
-        corr_after
+        dfs, ["12. 신주의 상장 예정일", "신주의 상장 예정일", "상장예정일"], corr_after, validator=is_date_like
     )
 
-    # 자금용도/투자자(정정후 우선)
+    # 자금용도 / 투자자 (정정후 우선 + fund/use 분해에도 정정후 적용)
     rec["자금용도"] = (
         scan_label_value_preferring_correction(dfs, ["4. 자금조달의 목적", "자금조달의 목적", "자금용도"], corr_after)
         or build_fund_use_text(dfs, corr_after=corr_after)
