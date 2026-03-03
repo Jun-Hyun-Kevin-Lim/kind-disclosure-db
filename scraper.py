@@ -1,14 +1,15 @@
 # ==========================================================
-# #유상증자_코드V4.7 (파싱 디테일 극강화 & 완전 복구판)
-# - 상장시장: (주), 주식회사 등 접두/접미사 제거 후 정밀 Smart Mapping
-# - 발행가액: 50원 이하 숫자는 항목 인덱스(오류)로 간주하여 원천 차단 ("6" 버그 픽스)
-# - 할인율: 표기 변형(할증률, 산정시 할인율 등) 키워드 스캔 후보 대폭 추가
-# - [추가] 회사명 옆에 '보고서명' 컬럼 추가
+# #유상증자_코드V5.1 (보고서명 유지 & 투자자 세부 추출 고도화)
+# - 시트 가독성 향상: '회사명' 옆에 '보고서명(공시 제목)' 컬럼 유지
+# - 투자자 추출 강화: "회사 또는 최대주주와의 관계" 등 오답 필터링 및 '성명(법인명)' 하위 데이터 스캔
+# - 상장시장 누락 완벽 해결: urllib을 이용해 KIND 헤더 API 직접 타격
+# - Dynamic Smart Mapping, 확정발행금액 1200경 억제 등 기존 복구 로직 유지
 # ==========================================================
 import os
 import re
 import json
 import time
+import urllib.request
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -45,7 +46,6 @@ GOOGLE_CREDENTIALS_JSON = (
 RIGHTS_OUT_SHEET = os.getenv("RIGHTS_OUT_SHEET", "유상증자")
 SEEN_SHEET_NAME = os.getenv("SEEN_SHEET_NAME", "seen")
 
-# [변경] "회사명" 바로 다음에 "보고서명"을 추가했습니다.
 RIGHTS_COLUMNS = [
     "회사명", "보고서명", "상장시장", "최초 이사회결의일", "증자방식", "발행상품",
     "신규발행주식수", "확정발행가(원)", "기준주가", "확정발행금액(억원)",
@@ -75,7 +75,6 @@ def _clean_label(s: str) -> str:
     return re.sub(r"^([①-⑩]|\(\d+\)|\d+\.)+", "", s)
 
 def norm_company_name(name: str) -> str:
-    """Smart Mapping을 위해 '주식회사', '(주)' 등을 제거한 핵심 이름 추출"""
     if not name: return ""
     n = name.replace("주식회사", "").replace("(주)", "").strip()
     return _norm(n)
@@ -124,14 +123,11 @@ def market_from_title(title: str) -> str:
 
 def market_from_html(html: str) -> str:
     if not html: return ""
-    html_lower = html.lower()
+    h_low = html.lower()
     
-    if "mark_kosdaq" in html_lower: return "코스닥"
-    if "mark_kospi" in html_lower: return "유가증권"
-    if "mark_konex" in html_lower: return "코넥스"
-    
-    m = re.search(r'alt=["\']?(코스닥|유가증권|코넥스)["\']?', html)
-    if m: return m.group(1)
+    if "icn_t_kosdaq" in h_low or "alt=\"코스닥\"" in h_low or "코스닥시장" in h_low: return "코스닥"
+    if "icn_t_kospi" in h_low or "alt=\"유가증권\"" in h_low or "유가증권시장" in h_low: return "유가증권"
+    if "icn_t_konex" in h_low or "alt=\"코넥스\"" in h_low or "코넥스시장" in h_low: return "코넥스"
     
     if "코스닥" in html: return "코스닥"
     if "유가증권" in html: return "유가증권"
@@ -207,10 +203,20 @@ def extract_tables_from_html_robust(html: str) -> List[pd.DataFrame]:
 def scrape_one(context, acpt_no: str) -> Tuple[List[pd.DataFrame], str, str]:
     url = viewer_url(acpt_no)
     page = context.new_page()
+    header_html = ""
     try:
+        try:
+            header_url = f"{BASE}/common/disclsviewer.do?method=searchHeaderInfo&acptNo={acpt_no}"
+            req = urllib.request.Request(header_url, headers={'User-Agent': 'Mozilla/5.0'})
+            with urllib.request.urlopen(req, timeout=5) as response:
+                header_html = response.read().decode('utf-8', errors='ignore')
+        except Exception as e:
+            pass
+
         page.goto(url, wait_until="networkidle", timeout=60000)
-        page.wait_for_timeout(2500) 
-        all_frames_html = page.content() + " " + " ".join([fr.content() for fr in page.frames])
+        page.wait_for_timeout(1500) 
+        
+        all_frames_html = header_html + " " + page.content() + " " + " ".join([fr.content() for fr in page.frames])
         best_html = pick_best_frame_html(page) or ""
         if best_html.lower().count("<table") == 0: raise RuntimeError("table 못 찾음")
         return extract_tables_from_html_robust(best_html), url, all_frames_html
@@ -416,18 +422,73 @@ def extract_fund_use_and_amount(dfs, corr_after) -> Tuple[str, float]:
     total_sum = sum(found_amts.get(name, 0) for name in uses)
     return ", ".join(uses), total_sum
 
+# [핵심 변경] 투자자 이름만 정밀하게 추출하는 강화된 함수
+def extract_investors(dfs: List[pd.DataFrame], corr_after: Dict[str, str]) -> str:
+    investors = []
+    # 걸러내야 할 오답(분류명) 리스트
+    blacklist = ["회사또는최대주주와의관계", "최대주주와의관계", "회사와의관계", "관계", "배정주식수", "선정경위", "비고", "-", "해당사항없음", "성명", "법인명"]
+    
+    # 1. 정정후 표에서 확인
+    if corr_after:
+        for k, v in corr_after.items():
+            if any(x in _norm(k) for x in ["대상자", "성명", "법인명", "투자자"]):
+                val_norm = _norm(v)
+                if v and str(v).lower() != 'nan' and val_norm not in blacklist and "관계" not in val_norm:
+                    return str(v).strip()
+
+    # 2. 표를 순회하며 "성명(법인명)" 컬럼을 찾아 그 아래 데이터들을 모두 수집
+    for df in dfs:
+        arr = df.astype(str).values
+        R, C = arr.shape
+        for r in range(R):
+            row_vals = [_norm(x) for x in arr[r].tolist()]
+            row_str = "".join(row_vals)
+            
+            # 헤더 행 찾기
+            if any(x in row_str for x in ["성명(법인명)", "배정대상자", "제3자배정대상자", "출자자"]):
+                name_col = -1
+                for c in range(C):
+                    cell = row_vals[c]
+                    # "관계"라는 단어가 없는 성명/법인명 컬럼 탐색
+                    if any(x in cell for x in ["성명", "법인명", "대상자", "투자자", "출자자"]) and "관계" not in cell and "주식" not in cell:
+                        name_col = c
+                        break
+                
+                # 컬럼을 찾았다면 밑으로 내려가며 이름 수집
+                if name_col != -1:
+                    for rr in range(r + 1, R):
+                        val = str(arr[rr][name_col]).strip()
+                        val_norm = _norm(val)
+                        
+                        # 표가 끝나거나 다음 항목 번호가 시작되면 스캔 중단
+                        if re.match(r"^\d+\.", val) or "기타투자판단" in val_norm or "합계" in val_norm:
+                            break
+                            
+                        # 정상적인 이름 데이터만 배열에 추가
+                        if val and val.lower() != "nan" and val_norm not in blacklist and "관계" not in val_norm and "주식수" not in val_norm:
+                            if len(val) < 50 and val not in investors:
+                                investors.append(val)
+    
+    if investors:
+        return ", ".join(investors)
+        
+    # 3. 못 찾은 경우 기존 방식 (단, '관계'라는 텍스트가 걸리면 버림)
+    val = scan_label_value_preferring_correction(dfs, ["제3자배정대상자", "제3자배정 대상자", "투자자", "성명(법인명)"], corr_after)
+    if val and "관계" not in _norm(val):
+        return val
+        
+    return ""
+
 # ==========================================================
 # 레코드 파싱 로직 
 # ==========================================================
 def parse_rights_issue_record(dfs, t: Target, corr_after, html_raw, company_market_map) -> dict:
     rec = {k: "" for k in RIGHTS_COLUMNS}
     rec["접수번호"] = t.acpt_no
-    
     rec["링크"] = t.link if t.link else viewer_url(t.acpt_no)
 
     title_clean = t.title.replace("[자동복구대상]", "").strip()
     
-    # [추가] 보고서명을 title_clean으로 저장합니다.
     rec["보고서명"] = title_clean
     
     rec["회사명"] = (
@@ -436,7 +497,6 @@ def parse_rights_issue_record(dfs, t: Target, corr_after, html_raw, company_mark
         or title_clean
     )
     
-    # [상장시장 정밀 복구] (주) 등을 제거한 정규화 이름으로 Smart Mapping 실행
     mkt = scan_label_value_preferring_correction(dfs, ["상장시장", "시장구분"], corr_after)
     if mkt and ("해당사항" in mkt or len(mkt) < 2 or mkt in ("-", ".")): mkt = ""
     
@@ -448,6 +508,10 @@ def parse_rights_issue_record(dfs, t: Target, corr_after, html_raw, company_mark
         or company_market_map.get(norm_company_name(title_clean))
         or market_from_html(html_raw)
     )
+
+    if rec["상장시장"] and rec["회사명"]:
+        company_market_map[norm_company_name(rec["회사명"])] = rec["상장시장"]
+        company_market_map[norm_company_name(title_clean)] = rec["상장시장"]
 
     def get_valid_date(labels):
         val = scan_label_value_preferring_correction(dfs, labels, corr_after)
@@ -470,7 +534,6 @@ def parse_rights_issue_record(dfs, t: Target, corr_after, html_raw, company_mark
         rec["신규발행주식수"] = f"{issue_shares:,}"
     if prev_shares: rec["증자전 주식수"] = f"{prev_shares:,}"
 
-    # [발행가액 "6" 버그 완벽 차단] 50원 이하의 숫자는 항목 번호일 확률이 99%이므로 파기하고 다시 찾음
     price_cands = ["신주 발행가액", "신주발행가액", "예정발행가액", "예정발행가", "확정발행가액", "1주당 확정발행가액", "발행가액"]
     price_txt = scan_label_value_preferring_correction(dfs, price_cands, corr_after)
     price = _to_int(price_txt)
@@ -494,7 +557,6 @@ def parse_rights_issue_record(dfs, t: Target, corr_after, html_raw, company_mark
     if base_price: rec["기준주가"] = f"{base_price:,}"
     else: rec["기준주가"] = base_txt if base_txt else ""
 
-    # [할인율 키워드 대폭 확장] 다양한 공시 텍스트 포맷 커버
     disc_cands = [
         "할인율", "할증률", "할인율(%)", "할인율 또는 할증률", 
         "할인(할증)율", "발행가액 산정시 할인율", 
@@ -512,7 +574,9 @@ def parse_rights_issue_record(dfs, t: Target, corr_after, html_raw, company_mark
 
     uses_text, total_fund_amt = extract_fund_use_and_amount(dfs, corr_after)
     rec["자금용도"] = uses_text
-    rec["투자자"] = scan_label_value_preferring_correction(dfs, ["제3자배정대상자", "제3자배정 대상자", "투자자"], corr_after)
+    
+    # [적용] 개선된 투자자 추출 로직 연결
+    rec["투자자"] = extract_investors(dfs, corr_after)
 
     sh = _to_int(rec["신규발행주식수"])
     pr = _to_int(rec["확정발행가(원)"])
@@ -540,7 +604,6 @@ def run():
     for r, row in enumerate(seen_values[1:], start=2):
         if row and row[0].strip().isdigit(): seen_index[row[0].strip()] = r
 
-    # [Smart Mapping 강화] (주) 등을 벗겨낸 순수 이름으로 상장시장을 기억해둡니다.
     company_market_map = {}
     for row in values[1:]:
         c_name = row[RIGHTS_COLUMNS.index("회사명")].strip() if len(row) > RIGHTS_COLUMNS.index("회사명") else ""
@@ -565,20 +628,21 @@ def run():
         pay_date = get_val(row, "납입일")
         first_date = get_val(row, "최초 이사회결의일")
         link_val = get_val(row, "링크")
+        investor_val = get_val(row, "투자자")
         
-        # 금액, 가격, 링크 등 필수 데이터에 이상이 생겼을 때 스스로 파싱 목록에 올립니다
+        # [감지 조건 추가] "관계", "최대주주" 등의 쓰레기 텍스트가 있으면 강제로 파싱 대기열에 올림
         needs_fix = (
             not link_val or 
             not fund or "(원)" in fund or
-            not price or (price.replace(",","").isdigit() and int(price.replace(",","")) <= 50) or # 50원 이하 가격 감지
+            not price or (price.replace(",","").isdigit() and int(price.replace(",","")) <= 50) or 
             not fund_amt or len(fund_amt.replace(",", "").replace(".", "")) >= 8 or 
             not market or
             not re.search(r'\d', pay_date) or "정정" in pay_date or "변경" in pay_date or "요청" in pay_date or
-            not first_date
+            not first_date or
+            "관계" in investor_val or "최대주주" in investor_val
         )
         
         if needs_fix and acpt not in targets_dict:
-            # [변경] 복구 대상 제목을 가져올 때 '보고서명'을 먼저 찾습니다.
             title = get_val(row, "보고서명") or get_val(row, "회사명") or "[자동복구대상]"
             restored_link = link_val if link_val else viewer_url(acpt)
             targets_dict[acpt] = Target(acpt_no=acpt, title=title, link=restored_link, market=market)
