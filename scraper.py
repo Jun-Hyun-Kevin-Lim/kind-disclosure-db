@@ -31,7 +31,7 @@ RSS_URL = os.getenv("RSS_URL", DEFAULT_RSS)
 KEYWORDS = [x.strip() for x in os.getenv("KEYWORDS", "유상증자").split(",") if x.strip()]
 
 HEADLESS = os.getenv("HEADLESS", "true").lower() == "true"
-LIMIT = int(os.getenv("LIMIT", "0"))  # 0이면 RSS가 주는 만큼 전부
+LIMIT = int(os.getenv("LIMIT", "30"))  # 0이면 RSS가 주는 만큼 전부
 RUN_ONE_ACPTNO = os.getenv("RUN_ONE_ACPTNO", "").strip()
 
 GOOGLE_SHEET_ID = os.environ.get("GOOGLE_SHEET_ID", "").strip()
