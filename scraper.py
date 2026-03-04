@@ -6,6 +6,7 @@
 # - [개선] 확정발행금액 산출 시 '신규발행주식수 * 확정발행가' 절대 공식을 1순위로 적용
 # - [추가] "유상증자결정"이 포함된 보고서만 엄격하게 수집/처리하도록 필터링 강화
 # - [개선] 회사명(종속회사 포함) 파싱 로직 고도화 및 길이 제한 완화, 불순물 완벽 제거
+# - [핵심개선] 신규발행주식수 추출 시 '증자전 주식총수'와 혼동되지 않도록 타겟 셀 정밀 추적 엔진 탑재
 # ==========================================================
 import os
 import re
@@ -524,15 +525,25 @@ def extract_investors(dfs: List[pd.DataFrame], corr_after: Dict[str, str]) -> st
 
     return ""
 
+
+# ==========================================================
+# [핵심 로직 교체] 신규발행주식수 정밀 추적 엔진
+# ==========================================================
 def extract_issue_shares_and_type(dfs: List[pd.DataFrame], corr_after: Dict[str, str]) -> Tuple[Optional[int], str]:
     stock_type = "보통주식"
     best_amt = 0
     
+    # 1. 정정공시 텍스트 스캔
     if corr_after:
         for k, v in corr_after.items():
-            if any(c in _norm(k) for c in ["신주의종류와수", "발행예정주식수"]):
+            k_norm = _norm(k)
+            # 신규발행주식과 관련된 명확한 키워드만 타겟팅
+            if any(c in k_norm for c in ["신주의종류와수", "발행예정주식수", "신주발행"]):
+                # 증자전 주식수, 발행가액 등이 섞여 들어오는 것 사전 차단
+                if any(bad in k_norm for bad in ["발행가", "가액", "총수", "증자전", "비율", "기발행"]):
+                    continue
                 amt = _max_int_in_text(v)
-                if amt and amt > best_amt:
+                if amt and amt > 100:
                     best_amt = amt
                     if "상환전환우선주" in v: stock_type = "상환전환우선주"
                     elif "전환우선주" in v: stock_type = "전환우선주"
@@ -543,29 +554,63 @@ def extract_issue_shares_and_type(dfs: List[pd.DataFrame], corr_after: Dict[str,
     if best_amt > 0:
         return best_amt, stock_type
 
+    # 2. 본문 표에서 스캔 (정확도 100% 타겟 셀 추적 방식)
+    target_labels = ["신주의종류와수", "신주의종류", "발행예정주식", "신주발행", "발행신주"]
+    bad_kws = ["증자전", "기발행", "총수", "발행가", "가액", "비율", "금액", "자금", "일정", "목적"]
+    
     for df in dfs:
         arr = df.astype(str).values
         R, C = arr.shape
-        for r in range(R):
-            row_joined = _norm("".join(arr[r]))
-            
-            if any(kw in row_joined for kw in ["신주의종류", "발행예정주식", "보통주", "종류주", "우선주", "기타주"]):
-                if any(d in row_joined for d in ["년", "월", "일", "예정일", "기일"]): continue
-                
-                amt = _max_int_in_text(" ".join(arr[r]))
-                if amt and amt > best_amt:
-                    best_amt = amt
-                    if "상환전환우선주" in row_joined: stock_type = "상환전환우선주"
-                    elif "전환우선주" in row_joined: stock_type = "전환우선주"
-                    elif "우선주" in row_joined: stock_type = "우선주식"
-                    elif "종류주" in row_joined: stock_type = "종류주식"
-                    elif "기타주" in row_joined: stock_type = "기타주식"
-                    elif "보통주" in row_joined: stock_type = "보통주식"
-    
-    if best_amt > 0:
-        return best_amt, stock_type
         
-    return None, ""
+        for r in range(R):
+            for c in range(C):
+                cell_norm = _norm(arr[r][c])
+                # 타겟 라벨을 찾았고, 그 셀에 오답(발행가, 증자전 등)이 없는 순수한 셀인지 확인
+                if any(lbl in cell_norm for lbl in target_labels) and not any(bad in cell_norm for bad in bad_kws):
+                    
+                    # 발견한 라벨의 오른쪽 셀들을 순차적으로 탐색하여 숫자를 찾음
+                    for cc in range(c + 1, C):
+                        v_norm = _norm(arr[r][cc])
+                        # 오른쪽으로 가다가 '증자전', '총수' 등 다른 구역을 만나면 즉시 중단 (방어선)
+                        if any(bad in v_norm for bad in ["증자전", "총수", "발행가", "액면가"]): break
+                        amt = _max_int_in_text(arr[r][cc])
+                        if amt and amt > 100:
+                            best_amt = amt
+                            break
+                    
+                    # 오른쪽 셀에서 찾지 못했다면 바로 아래쪽 셀(병합된 경우 등) 탐색
+                    if best_amt == 0 and r + 1 < R:
+                        for cc in range(C):
+                            v_norm = _norm(arr[r+1][cc])
+                            if any(bad in v_norm for bad in ["증자전", "총수", "발행가", "액면가"]): continue
+                            amt = _max_int_in_text(arr[r+1][cc])
+                            if amt and amt > 100:
+                                best_amt = amt
+                                break
+                                
+                    # 주식 종류 판단 (해당 행과 아래 행의 텍스트 종합)
+                    if best_amt > 0:
+                        row_str = _norm("".join(arr[r]))
+                        if r + 1 < R: row_str += _norm("".join(arr[r+1]))
+                        
+                        if "상환전환우선주" in row_str: stock_type = "상환전환우선주"
+                        elif "전환우선주" in row_str: stock_type = "전환우선주"
+                        elif "우선주" in row_str: stock_type = "우선주식"
+                        elif "종류주" in row_str: stock_type = "종류주식"
+                        elif "기타주" in row_str: stock_type = "기타주식"
+                        elif "보통주" in row_str: stock_type = "보통주식"
+                        
+                        return best_amt, stock_type
+
+    # 3. 최후의 보루 (가장 보수적인 단순 텍스트 탐색)
+    if best_amt == 0:
+        val = scan_label_value(dfs, ["신주의 종류와 수", "발행예정주식", "발행예정주식수"])
+        amt = _max_int_in_text(val)
+        if amt and amt > 100:
+            best_amt = amt
+
+    return (best_amt if best_amt > 0 else None), stock_type
+
 
 # ==========================================================
 # 레코드 파싱 로직  
