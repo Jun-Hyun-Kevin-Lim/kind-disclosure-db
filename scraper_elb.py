@@ -217,7 +217,7 @@ def scrape_one(context, acpt_no: str) -> Tuple[List[pd.DataFrame], str, str]:
         except: pass
 
 # ==========================================================
-# 4. 정정사항 엔진 및 기본 스캔
+# 4. 정정사항 엔진
 # ==========================================================
 def extract_correction_after_map(dfs: List[pd.DataFrame]) -> Dict[str, str]:
     out: Dict[str, str] = {}
@@ -312,7 +312,6 @@ def find_row_best_float(dfs, must_contain) -> Optional[float]:
 # 5. 핵심 4대 컬럼 전용 추출기
 # ==========================================================
 
-# 1) [유지] 발행상품
 def extract_product_type(dfs: List[pd.DataFrame], corr_after: Dict) -> str:
     labels = ["1. 사채의 종류", "1.사채의종류", "사채의 종류", "사체의 종류", "사태의 종류", "사케의 종류", "사채종류", "종류"]
     def get_clean_product(text: str) -> str:
@@ -430,92 +429,97 @@ def extract_fund_usage(dfs: List[pd.DataFrame], corr_after: Dict) -> str:
 
 
 # ----------------------------------------------------------------------
-# [V13.0 궁극의 수술] Put/Call Option 직독직해 스캐너
-# - 표를 쪼개는 DataFrame 방식을 100% 버리고, 오직 HTML 생텍스트에서 
-#   사용자가 지정한 "제목"을 찾은 뒤 그 밑을 싹쓸이 하는 방식
+# [V13.0 궁극의 개조] Put/Call Option 직독직해 스캐너
+# 표 구조(DataFrame)를 완전히 버리고, 오직 HTML 생텍스트에서 '제목'을 찾은 뒤
+# 그 밑에 있는 텍스트를 무조건 긁어오는 가장 직관적인 엔진
 # ----------------------------------------------------------------------
 def extract_option_details(html_raw: str, option_type: str, corr_after: Dict[str, str]) -> str:
     my_kws = ["조기상환청구권", "put option", "풋옵션"] if option_type == 'put' else ["매도청구권", "call option", "콜옵션"]
+    opp_kws = ["매도청구권", "call option", "콜옵션", "【특정인", "미상환 주권", "기타 투자판단", "발행결정 전후", "10. 기타사항", "11. 기타사항", "12. 기타사항", "13. 기타사항", "20. 기타사항", "기타사항"] if option_type == 'put' else ["조기상환청구권", "put option", "풋옵션", "【특정인", "미상환 주권", "기타 투자판단", "발행결정 전후", "10. 기타사항", "11. 기타사항", "12. 기타사항", "13. 기타사항", "20. 기타사항", "기타사항"]
     
-    # 정정공시 최우선
     if corr_after:
         for k, v in corr_after.items():
             if any(_norm(kw).lower() in _norm(k).lower() for kw in my_kws) and len(v) > 10:
-                # 앞쪽 쓰레기 라벨 소거
-                val = re.sub(r'^(?:\[?\s*(?:조기상환청구권|매도청구권|풋옵션|콜옵션).*?\]?)', '', v, flags=re.IGNORECASE)
-                val = re.sub(r'^[:\-]\s*', '', val.strip())
+                val = v
+                for kw in my_kws:
+                    pattern = r'^.*?' + kw + r'(?:[\s\(\)\[\]a-zA-Z]*(?:에\s*관한\s*사항)?\s*\]?)?'
+                    val = re.sub(pattern, '', val, flags=re.IGNORECASE)
+                val = re.sub(r'^[:\-\]\]\s]+', '', val.strip())
                 return _single_line(val)
 
-    # HTML 구조를 사람이 읽는 것처럼 '줄바꿈'이 있는 통짜 텍스트로 변환
+    # HTML을 줄바꿈이 살아있는 통짜 텍스트로 변환
     soup = BeautifulSoup(html_raw, 'lxml')
     for tag in soup(['style', 'script']): tag.decompose()
     for tag in soup.find_all(['br', 'p', 'div', 'tr', 'td', 'th', 'li']):
         tag.insert_after('\n')
         
     text = soup.get_text(separator='\n')
-    text = re.sub(r'\n{2,}', '\n', text) # 다중 줄바꿈 정리
+    text = re.sub(r'\n[ \t]+', '\n', text)
+    text = re.sub(r'\n{2,}', '\n', text)
     
-    # 사용자가 정확히 짚어준 그 키워드! 
-    if option_type == 'put':
-        start_kws = [
-            r'\[?\s*조기상환청구권\s*\([^)]*Put[^)]*\)\s*(?:에\s*관한\s*사항)?\s*\]?',
-            r'\[?\s*조기상환청구권\s*(?:에\s*관한\s*사항)?\s*\]?',
-            r'\[?\s*Put\s*Option\s*(?:에\s*관한\s*사항)?\s*\]?'
-        ]
-        stop_kws = [
-            r'\[?\s*매도청구권', r'Call\s*Option', r'콜옵션', 
-            r'【\s*특정인', r'미상환\s*주권', r'기타\s*투자판단', 
-            r'1[0-9]\.\s*기타사항', r'2[0-9]\.\s*기타사항', r'발행결정\s*전후', r'\[?\s*기타\s*\]?'
-        ]
-    else:
-        start_kws = [
-            r'\[?\s*매도청구권\s*\([^)]*Call[^)]*\)\s*(?:에\s*관한\s*사항)?\s*\]?',
-            r'\[?\s*매도청구권\s*(?:에\s*관한\s*사항)?\s*\]?',
-            r'\[?\s*Call\s*Option\s*(?:에\s*관한\s*사항)?\s*\]?'
-        ]
-        stop_kws = [
-            r'\[?\s*조기상환청구권', r'Put\s*Option', r'풋옵션', 
-            r'【\s*특정인', r'미상환\s*주권', r'기타\s*투자판단', 
-            r'1[0-9]\.\s*기타사항', r'2[0-9]\.\s*기타사항', r'발행결정\s*전후', r'\[?\s*기타\s*\]?'
-        ]
-
-    best_text = ""
+    lines = text.split('\n')
+    target_indices = []
     
-    # 텍스트 전체에서 시작 키워드를 찾음
-    for start_kw in start_kws:
-        matches = list(re.finditer(start_kw, text, re.IGNORECASE))
-        if not matches: continue
-        
-        # 찾은 키워드의 끝(end) 부분부터 다음 목차가 나올 때까지 전부 오려냄!
-        for m in matches:
-            start_idx = m.end()
-            sub_text = text[start_idx:]
+    # 문서 전체에서 옵션 '제목'이 될 만한 줄을 모두 찾음
+    for i, line in enumerate(lines):
+        line_clean = re.sub(r'\s+', '', line).lower()
+        if any(re.sub(r'\s+', '', kw).lower() in line_clean for kw in my_kws):
             
-            stop_idx = len(sub_text)
-            for stop_kw in stop_kws:
-                stop_m = re.search(stop_kw, sub_text, re.IGNORECASE)
-                # 방금 찾은 제목 바로 옆에 붙어있는 라벨은 무시하고, 10글자 이후에 등장하는 진짜 '다음 목차'에서 절단
-                if stop_m and 10 < stop_m.start() < stop_idx:
-                    stop_idx = stop_m.start()
-            
-            extracted = sub_text[:stop_idx].strip()
-            
-            # 오려낸 텍스트 맨 앞에 남아있는 쓸데없는 특수기호나 글자 청소
-            extracted = re.sub(r'^[:\-\]\]\s]+', '', extracted) 
-            extracted = re.sub(r'^(?:에\s*관한\s*사항)?', '', extracted).strip()
-            extracted = re.sub(r'^[:\-\]\]\s]+', '', extracted)
-            
-            extracted = _single_line(extracted)
-            
-            # 가장 긴 상세내용(보통 문서 하단의 20. 기타사항에 적힌 내용)을 최우선으로 저장
-            if len(extracted) > len(best_text):
-                best_text = extracted
+            # 교차 오염 방지: 한 줄에 Put과 Call이 같이 적혀있으면 스킵 (예: 매도청구권은 조기상환청구권과 동일...)
+            if any(re.sub(r'\s+', '', opp).lower() in line_clean for opp in ["매도청구권", "calloption", "콜옵션"] if option_type == 'put'):
+                continue
+            if any(re.sub(r'\s+', '', opp).lower() in line_clean for opp in ["조기상환청구권", "putoption", "풋옵션"] if option_type == 'call'):
+                continue
                 
-        if len(best_text) > 20:
-            break 
-
-    return best_text
-
+            # 점수 부여: "사항"이나 대괄호 "["가 있으면 명확한 제목일 확률이 높음
+            score = 1
+            if "사항" in line: score += 2
+            if line.strip().startswith("[") or line.strip().startswith("【") or re.match(r'^[가-힣0-9]\.', line.strip()): 
+                score += 1
+            target_indices.append((i, score))
+            
+    if not target_indices:
+        return ""
+        
+    # 점수가 가장 높고, 가장 문서 하단(인덱스가 큼)에 있는 줄을 최종 '제목' 줄로 선택
+    target_indices.sort(key=lambda x: (x[1], x[0]))
+    best_start_idx = target_indices[-1][0]
+    
+    collected_lines = []
+    # 선택된 제목 줄 '바로 밑'부터 한 줄씩 내려가면서 복사 시작
+    for i in range(best_start_idx + 1, len(lines)):
+        line = lines[i].strip()
+        if not line: continue
+        
+        line_clean = re.sub(r'\s+', '', line).lower()
+        is_stop = False
+        
+        # 상대방 옵션이나 '기타사항' 등 다음 목차가 나오면 복사 즉시 중단 (절단기)
+        for kw in opp_kws:
+            if re.sub(r'\s+', '', kw).lower() in line_clean:
+                is_stop = True
+                break
+        
+        if is_stop:
+            break
+            
+        collected_lines.append(line)
+        
+    # 제목 줄에 내용이 같이 섞여있는 경우를 대비해 제목 줄도 복사하되, '[조기상환청구권]' 같은 라벨은 싹 지움
+    header_line = lines[best_start_idx].strip()
+    header_line_cleaned = header_line
+    for kw in my_kws:
+        pattern = r'^.*?' + kw + r'(?:[\s\(\)\[\]a-zA-Z]*(?:에\s*관한\s*사항)?\s*\]?)?'
+        header_line_cleaned = re.sub(pattern, '', header_line_cleaned, flags=re.IGNORECASE)
+    
+    header_line_cleaned = re.sub(r'^[:\-\]\]\s]+', '', header_line_cleaned)
+    
+    # 지우고 남은 알맹이 내용이 있으면 맨 앞에 추가
+    if header_line_cleaned and len(header_line_cleaned) > 5:
+        collected_lines.insert(0, header_line_cleaned)
+        
+    res = " ".join(collected_lines)
+    return _single_line(res)
 
 def extract_call_ratio_and_ytc(call_text: str, html_raw: str) -> Tuple[str, str]:
     ratio, ytc = "", ""
@@ -572,7 +576,7 @@ def extract_call_ratio_and_ytc(call_text: str, html_raw: str) -> Tuple[str, str]
                     if m and 0 <= float(m.group(1)) <= 20: ytc = f"{float(m.group(1)):g}%"; break
     return ratio, ytc
 
-# [유지] V11.9 전환청구기간 블록 캡처기 (시작일 = 종료일 겹침 방지)
+# [유지] 전환청구기간 블록 캡처기 (시작일 = 종료일 겹침 방지)
 def extract_period_dates(dfs, corr_after, period_kws) -> Tuple[str, str]:
     if corr_after:
         for k, v in corr_after.items():
@@ -696,7 +700,7 @@ def parse_bond_record(dfs, t: Target, corr_after, html_raw, company_market_map) 
     s_date, e_date = extract_period_dates(dfs, corr_after, ["전환청구기간", "교환청구기간", "권리행사기간"])
     rec["전환청구 시작"], rec["전환청구 종료"] = s_date, e_date
 
-    # [호출] V13.0 옵션 직독직해 스캐너 연결 (dfs 파라미터 삭제)
+    # [호출] V13.0 직독직해 텍스트 스캐너 연결 (dfs 파라미터 삭제)
     rec["Put Option"] = extract_option_details(html_raw, 'put', corr_after)
     rec["Call Option"] = extract_option_details(html_raw, 'call', corr_after)
     
