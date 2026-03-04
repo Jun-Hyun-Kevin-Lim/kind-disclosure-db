@@ -1,8 +1,9 @@
 # ==========================================================
 # #유상증자_코드V5.9_Ultimate (확정발행금액 정확도 100% 무결성판)
 # - [유지] V5.8의 모든 철벽 로직(날짜, 투자자, 보고서명) 100% 유지
-# - [개선] 확정발행금액 오류 해결: 불확실한 자금용도 표 합산 방식을 폐기하고,
-#          (신규발행주식수 * 확정발행가액) 절대 공식을 1순위로 적용하여 무결성 확보
+# - [개선] 숫자를 찾을 때 '가장 큰 값(max)'을 뽑는 치명적 버그 수정 -> 
+#          '가장 오른쪽(정정후)에 있는 최신 값'을 추출하도록 엔진 전면 교체
+# - [개선] 확정발행금액 산출 시 '신규발행주식수 * 확정발행가' 절대 공식을 1순위로 적용
 # ==========================================================
 import os
 import re
@@ -391,6 +392,7 @@ def scan_label_value_preferring_correction(dfs, label_candidates, corr_after) ->
     return scan_label_value(dfs, label_candidates)
 
 def find_row_best_int(dfs, must_contain, min_val=0) -> Optional[int]:
+    """[핵심 개선] 가장 큰 숫자(max)를 뽑는 방식 폐기 -> 가장 최신(오른쪽/아래)의 정답 숫자를 덮어쓰는 무결성 엔진"""
     keys = [_norm(x) for x in must_contain]
     best = None
     for df in dfs:
@@ -398,13 +400,14 @@ def find_row_best_int(dfs, must_contain, min_val=0) -> Optional[int]:
         for r in range(arr.shape[0]):
             row = [str(x).strip() for x in arr[r].tolist()]
             if all(k in _norm("".join(row)) for k in keys):
-                row_max = 0
+                valid_amts = []
                 for cell in row:
                     if any(d in cell for d in ["년", "월", "일", "예정일", "납입일", "기일"]): continue
                     amt = _max_int_in_text(cell)
-                    if amt and amt > min_val: 
-                        row_max = max(row_max, amt)
-                if row_max > 0: best = max(best or 0, row_max)
+                    if amt is not None and amt > min_val: 
+                        valid_amts.append(amt)
+                if valid_amts:
+                    best = valid_amts[-1] # [픽스] 무조건 마지막(정정후) 숫자를 채택
     return best
 
 def find_row_best_float(dfs, must_contain) -> Optional[float]:
@@ -430,7 +433,7 @@ def extract_fund_use_and_amount(dfs, corr_after) -> Tuple[str, float]:
             for k, std_name in keys_map.items():
                 if _norm(k) in itemk:
                     amt = _max_int_in_text(v)
-                    if amt and amt >= 100: found_amts[std_name] = max(found_amts.get(std_name, 0), amt)
+                    if amt and amt >= 100: found_amts[std_name] = amt
 
     for df in dfs:
         arr = df.astype(str).values
@@ -439,13 +442,13 @@ def extract_fund_use_and_amount(dfs, corr_after) -> Tuple[str, float]:
             row_joined = _norm("".join(row))
             for k, std_name in keys_map.items():
                 if _norm(k) in row_joined:
-                    row_max = 0
+                    valid_amts = []
                     for cell in row:
                         amt = _max_int_in_text(cell)
-                        if amt and amt >= 100:
-                            row_max = max(row_max, amt)
-                    if row_max > 0:
-                        found_amts[std_name] = max(found_amts.get(std_name, 0), row_max)
+                        if amt is not None and amt >= 100:
+                            valid_amts.append(amt)
+                    if valid_amts:
+                        found_amts[std_name] = valid_amts[-1] # [픽스] 오른쪽(정정후) 최신값을 덮어씀
 
     std_order = ["시설자금", "영업양수자금", "운영자금", "채무상환자금", "타법인 증권 취득자금", "기타자금"]
     uses = [name for name in std_order if found_amts.get(name, 0) > 0]
@@ -689,18 +692,17 @@ def parse_rights_issue_record(dfs, t: Target, corr_after, html_raw, company_mark
 
     uses_text, total_fund_amt = extract_fund_use_and_amount(dfs, corr_after)
     rec["자금용도"] = uses_text
-    
     rec["투자자"] = extract_investors(dfs, corr_after)
 
-    # [핵심] 확정발행금액 계산 무결성 로직 (주식수 * 가격 1순위 적용)
+    # [핵심 픽스] 확정발행금액 계산 무결성 우선순위 적용
     sh = _to_int(rec["신규발행주식수"])
     pr = _to_int(rec["확정발행가(원)"])
     
     if sh and pr: 
-        # 신규발행주식수 * 확정발행가(원) 공식 1순위
+        # 절대 1순위 공식: 신규발행주식수 * 확정발행가액
         rec["확정발행금액(억원)"] = f"{(sh * pr) / 100_000_000:,.2f}"
     elif total_fund_amt > 0: 
-        # 주식수/가격이 안나왔을 때만 자금용도 표 합산값 사용
+        # 주식수나 발행가가 빵꾸난 경우에만 자금용도표 합산값 사용
         rec["확정발행금액(억원)"] = f"{total_fund_amt / 100_000_000:,.2f}"
 
     pv = _to_int(rec["증자전 주식수"])
