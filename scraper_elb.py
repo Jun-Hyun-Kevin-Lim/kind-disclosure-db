@@ -122,7 +122,7 @@ def viewer_url(acpt_no: str, docno: str = "") -> str:
 def match_strict_keyword(title: str) -> bool:
     if not title: return False
     t_no_space = title.replace(" ", "")
-    return any(kw in t_no_space for kw in ["전환사채권발행결정", "교환사채권발행결정", "신주인수권부사채권발행결정"])
+    return any(kw in t_no_space for kw in ["전환사채권발행결정", "전환사채매도결정", "교환사채권발행결정", "신주인수권부사채권발행결정"])
 
 def is_correction_title(title: str) -> bool:
     return "정정" in (title or "")
