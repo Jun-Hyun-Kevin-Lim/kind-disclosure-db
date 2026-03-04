@@ -1,10 +1,11 @@
 # ==========================================================
-# #유상증자_코드V5.9_Ultimate (확정발행금액 정확도 100% 무결성판 + 회사명 필터링 개선)
+# #유상증자_코드V5.9_Ultimate (확정발행금액 정확도 100% 무결성판 + 신규발행주식수 버그 픽스)
 # - [유지] V5.8의 모든 철벽 로직(날짜, 투자자, 보고서명) 100% 유지
 # - [개선] 숫자를 찾을 때 '가장 큰 값(max)'을 뽑는 치명적 버그 수정 -> 
 #          '가장 오른쪽(정정후)에 있는 최신 값'을 추출하도록 엔진 전면 교체
 # - [개선] 확정발행금액 산출 시 '신규발행주식수 * 확정발행가' 절대 공식을 1순위로 적용
 # - [개선] 회사명 파싱 시 '상장 여부', '해당사항' 등의 오인출 텍스트 강제 필터링 추가
+# - [개선] 신규발행주식수 추출 시 빈칸으로 나오거나 다른 숫자로 덮어써지는 버그 원천 차단
 # ==========================================================
 import os
 import re
@@ -393,7 +394,6 @@ def scan_label_value_preferring_correction(dfs, label_candidates, corr_after) ->
     return scan_label_value(dfs, label_candidates)
 
 def find_row_best_int(dfs, must_contain, min_val=0) -> Optional[int]:
-    """[핵심 개선] 가장 큰 숫자(max)를 뽑는 방식 폐기 -> 가장 최신(오른쪽/아래)의 정답 숫자를 덮어쓰는 무결성 엔진"""
     keys = [_norm(x) for x in must_contain]
     best = None
     for df in dfs:
@@ -408,7 +408,7 @@ def find_row_best_int(dfs, must_contain, min_val=0) -> Optional[int]:
                     if amt is not None and amt > min_val: 
                         valid_amts.append(amt)
                 if valid_amts:
-                    best = valid_amts[-1] # [픽스] 무조건 마지막(정정후) 숫자를 채택
+                    best = valid_amts[-1]
     return best
 
 def find_row_best_float(dfs, must_contain) -> Optional[float]:
@@ -449,7 +449,7 @@ def extract_fund_use_and_amount(dfs, corr_after) -> Tuple[str, float]:
                         if amt is not None and amt >= 100:
                             valid_amts.append(amt)
                     if valid_amts:
-                        found_amts[std_name] = valid_amts[-1] # [픽스] 오른쪽(정정후) 최신값을 덮어씀
+                        found_amts[std_name] = valid_amts[-1]
 
     std_order = ["시설자금", "영업양수자금", "운영자금", "채무상환자금", "타법인 증권 취득자금", "기타자금"]
     uses = [name for name in std_order if found_amts.get(name, 0) > 0]
@@ -526,11 +526,12 @@ def extract_issue_shares_and_type(dfs: List[pd.DataFrame], corr_after: Dict[str,
     stock_type = "보통주식"
     best_amt = 0
     
+    # 1. 정정공시 텍스트에서 우선 스캔
     if corr_after:
         for k, v in corr_after.items():
             if any(c in _norm(k) for c in ["신주의종류와수", "발행예정주식수"]):
                 amt = _max_int_in_text(v)
-                if amt and amt > best_amt:
+                if amt and amt > 100:
                     best_amt = amt
                     if "상환전환우선주" in v: stock_type = "상환전환우선주"
                     elif "전환우선주" in v: stock_type = "전환우선주"
@@ -541,29 +542,66 @@ def extract_issue_shares_and_type(dfs: List[pd.DataFrame], corr_after: Dict[str,
     if best_amt > 0:
         return best_amt, stock_type
 
+    # 2. 본문 표에서 스캔 (치명적 버그 수정 완료)
     for df in dfs:
         arr = df.astype(str).values
         R, C = arr.shape
-        for r in range(R):
-            row_joined = _norm("".join(arr[r]))
-            
-            if any(kw in row_joined for kw in ["신주의종류", "발행예정주식", "보통주", "종류주", "우선주", "기타주"]):
-                if any(d in row_joined for d in ["년", "월", "일", "예정일", "기일"]): continue
-                
-                amt = _max_int_in_text(" ".join(arr[r]))
-                if amt and amt > best_amt:
-                    best_amt = amt
-                    if "상환전환우선주" in row_joined: stock_type = "상환전환우선주"
-                    elif "전환우선주" in row_joined: stock_type = "전환우선주"
-                    elif "우선주" in row_joined: stock_type = "우선주식"
-                    elif "종류주" in row_joined: stock_type = "종류주식"
-                    elif "기타주" in row_joined: stock_type = "기타주식"
-                    elif "보통주" in row_joined: stock_type = "보통주식"
-    
-    if best_amt > 0:
-        return best_amt, stock_type
         
-    return None, ""
+        for r in range(R):
+            row_str = _norm("".join(arr[r]))
+            
+            # "신주의 종류와 수" 등 타겟 키워드가 있는 확실한 행 탐색
+            if "신주의종류" in row_str or "발행예정주식" in row_str or "신주발행" in row_str:
+                
+                # 오답 방지: 이 행에 '증자전', '총수' 등 다른 지표가 섞여 있는지 확인 (표 병합 버그 방어)
+                is_mixed_row = any(bad in row_str for bad in ["증자전", "기발행", "총수"])
+                
+                if not is_mixed_row:
+                    # 깔끔한 행이면 각주 등 잔여 텍스트를 무시하고 해당 행의 가장 큰 값을 추출
+                    amt = _max_int_in_text(" ".join(arr[r]))
+                    if amt and amt > 100:
+                        best_amt = amt
+                else:
+                    # 병합된 행이라면 각 셀을 개별적으로 검사하여 오답 셀을 피함
+                    for cell in arr[r]:
+                        c_str = str(cell)
+                        if any(bad in _norm(c_str) for bad in ["증자전", "기발행", "총수"]): continue
+                        amt = _max_int_in_text(c_str)
+                        if amt and amt > 100:
+                            best_amt = amt
+                            break
+                            
+                if best_amt > 0:
+                    if "상환전환우선주" in row_str: stock_type = "상환전환우선주"
+                    elif "전환우선주" in row_str: stock_type = "전환우선주"
+                    elif "우선주" in row_str: stock_type = "우선주식"
+                    elif "종류주" in row_str: stock_type = "종류주식"
+                    elif "기타주" in row_str: stock_type = "기타주식"
+                    elif "보통주" in row_str: stock_type = "보통주식"
+                    break
+        
+        if best_amt > 0:
+            break
+            
+        # 3. 예비 탐색 (항목명이 누락되거나 다른 행에 분리된 경우)
+        if best_amt == 0:
+            for r in range(R):
+                row_str = _norm("".join(arr[r]))
+                if any(kw in row_str for kw in ["보통주", "종류주", "우선주", "기타주"]):
+                    if any(bad in row_str for bad in ["증자전", "기발행", "총수", "비율", "감자", "년", "월", "일", "발행가", "기준주가"]):
+                        continue
+                    amt = _max_int_in_text(" ".join(arr[r]))
+                    if amt and amt > 100:
+                        best_amt = amt
+                        if "상환전환우선주" in row_str: stock_type = "상환전환우선주"
+                        elif "전환우선주" in row_str: stock_type = "전환우선주"
+                        elif "우선주" in row_str: stock_type = "우선주식"
+                        elif "종류주" in row_str: stock_type = "종류주식"
+                        elif "기타주" in row_str: stock_type = "기타주식"
+                        elif "보통주" in row_str: stock_type = "보통주식"
+                        break
+
+    return (best_amt if best_amt > 0 else None), stock_type
 
 # ==========================================================
 # 레코드 파싱 로직 
@@ -579,7 +617,6 @@ def parse_rights_issue_record(dfs, t: Target, corr_after, html_raw, company_mark
     comp_cands = ["회사명", "회사 명", "발행회사", "발행회사명", "법인명", "종속회사명"]
     table_comp = scan_label_value_preferring_correction(dfs, comp_cands, corr_after)
     
-    # [버그 수정] 테이블 파서가 '상장 여부', '해당사항' 등의 주변 텍스트를 오인출한 경우 강제 필터링
     if table_comp:
         table_comp_clean = table_comp.replace(" ", "")
         bad_kws = ["상장여부", "여부", "해당사항", "해당없음", "본점", "소재지"]
