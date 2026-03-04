@@ -1,9 +1,9 @@
 # ==========================================================
-# #주식연계채권_코드V10.9_Num_Correction_Master (숫자 컬럼 정정후 100% 타격판)
-# 1. [완벽수정] 숫자 4대 컬럼(행사가액, 주식수, 비율, 리픽싱)에서 정정후 데이터(corr_after) 우선순위 극대화
-# 2. [유지] Call 비율 / YTC 문맥 정밀 추출 엔진
-# 3. [유지] 발행상품: '제O회차' 포맷 유지 및 쓰레기값 완벽 제거 (DART 퀄리티)
-# 4. [유지] Put/Call Option 본문 절단기 및 자금용도 라벨 추출 로직 100% 유지
+# #주식연계채권_코드V11.0_Reverse_Scan_Master (독립된 정정표 완벽 타격판)
+# 1. [대규모업데이트] 역방향 스캔(Reverse Scanning): 표를 아래서부터 위로 스캔하여 문서 하단의 '정정 후' 독립 표를 1순위로 추출
+# 2. [완벽수정] 숫자 4대 컬럼(행사가액, 주식수, 비율, 리픽싱)이 코아스처럼 독립된 표에 있어도 완벽하게 덮어쓰기 적용
+# 3. [유지] Call 비율 / YTC 문맥 정밀 추출 엔진
+# 4. [유지] 발행상품: '제O회차' 포맷 유지, 자금용도 라벨 추출 및 옵션 본문 절단기 100% 보존
 # ==========================================================
 import os
 import re
@@ -219,7 +219,7 @@ def scrape_one(context, acpt_no: str) -> Tuple[List[pd.DataFrame], str, str]:
         except: pass
 
 # ==========================================================
-# 4. 정정사항 엔진 및 기본 스캔
+# 4. 정정사항 엔진 및 [핵심] 역방향 스캔(Reverse)
 # ==========================================================
 def extract_correction_after_map(dfs: List[pd.DataFrame]) -> Dict[str, str]:
     out: Dict[str, str] = {}
@@ -256,18 +256,16 @@ def extract_correction_after_map(dfs: List[pd.DataFrame]) -> Dict[str, str]:
     return out
 
 def scan_label_value_preferring_correction(dfs, label_candidates, corr_after) -> str:
-    """[V10.9 강화] 정정후(corr_after) 맵에 해당 라벨이 있으면 무조건 그것만 반환하고 종료"""
     cand_clean = {_clean_label(x) for x in label_candidates}
     
     if corr_after:
         for c in cand_clean:
-            if c in corr_after and str(corr_after[c]).strip(): 
-                return _single_line(str(corr_after[c]))
+            if c in corr_after and str(corr_after[c]).strip(): return _single_line(str(corr_after[c]))
         for k, v in corr_after.items():
-            if str(v).strip() and any(c in k for c in cand_clean): 
-                return _single_line(str(v))
+            if str(v).strip() and any(c in k for c in cand_clean): return _single_line(str(v))
             
-    for df in dfs:
+    # [핵심 변경] 역방향 스캔: 문서 맨 밑(정정 후 테이블)부터 위로 올라가며 검색
+    for df in reversed(dfs):
         arr = df.astype(str).values
         R, C = arr.shape
         for r in range(R):
@@ -285,9 +283,10 @@ def scan_label_value_preferring_correction(dfs, label_candidates, corr_after) ->
 
 def find_row_best_int(dfs, must_contain, min_val=-1) -> Optional[int]:
     keys = [_norm(x) for x in must_contain]
-    best = None
-    for df in dfs:
+    # [핵심 변경] 역방향 스캔: 문서 맨 밑의 최신 표부터 검색 후 발견 즉시 종료
+    for df in reversed(dfs):
         arr = df.astype(str).values
+        best_in_df = None
         for r in range(arr.shape[0]):
             row = [str(x).strip() for x in arr[r].tolist()]
             if all(k in _norm("".join(row)) for k in keys):
@@ -295,22 +294,28 @@ def find_row_best_int(dfs, must_contain, min_val=-1) -> Optional[int]:
                     if any(d in cell for d in ["년", "월", "일", "예정일"]): continue
                     amt = _max_int_in_text(cell)
                     if amt is not None and amt > min_val: 
-                        best = max(best or 0, amt)
-    return best
+                        best_in_df = max(best_in_df or 0, amt)
+        if best_in_df is not None:
+            return best_in_df
+    return None
 
 def find_row_best_float(dfs, must_contain) -> Optional[float]:
     keys = [_norm(x) for x in must_contain]
-    for df in dfs:
+    # [핵심 변경] 역방향 스캔
+    for df in reversed(dfs):
         arr = df.astype(str).values
+        best_in_df = None
         for r in range(arr.shape[0]):
             row = [str(x).strip() for x in arr[r].tolist()]
             if all(k in _norm("".join(row)) for k in keys):
                 vals = [x for x in [_to_float(x) for x in row] if x is not None]
-                if vals: return max(vals, key=lambda z: abs(z))
+                if vals: best_in_df = max(vals, key=lambda z: abs(z))
+        if best_in_df is not None:
+            return best_in_df
     return None
 
 # ==========================================================
-# 5. 핵심 컬럼 전용 추출기
+# 5. 핵심 4대 컬럼 전용 추출기 (역방향 스캔 반영)
 # ==========================================================
 
 def extract_product_type(dfs: List[pd.DataFrame], corr_after: Dict) -> str:
@@ -340,7 +345,7 @@ def extract_product_type(dfs: List[pd.DataFrame], corr_after: Dict) -> str:
         cleaned = clean_product(val)
         if cleaned and "사채" in cleaned: return cleaned
         
-    for df in dfs:
+    for df in reversed(dfs): # 역방향 스캔
         arr = df.astype(str).values
         for r in range(min(8, arr.shape[0])): 
             row_str = " ".join([str(x) for x in arr[r] if str(x).lower() != 'nan'])
@@ -351,8 +356,9 @@ def extract_product_type(dfs: List[pd.DataFrame], corr_after: Dict) -> str:
 
 def extract_fund_usage(dfs: List[pd.DataFrame], corr_after: Dict) -> str:
     target_keys = ["시설자금", "영업양수자금", "운영자금", "채무상환자금", "타법인 증권 취득자금", "타법인증권취득자금", "기타자금"]
-    found_funds = {}
-    for df in dfs:
+    
+    for df in reversed(dfs): # 역방향 스캔
+        found_funds = {}
         arr = df.astype(str).values
         R, C = arr.shape
         for r in range(R):
@@ -370,8 +376,12 @@ def extract_fund_usage(dfs: List[pd.DataFrame], corr_after: Dict) -> str:
                         if amt > 0:
                             std_key = "타법인 증권 취득자금" if "타법인" in tk else tk
                             found_funds[std_key] = max(found_funds.get(std_key, 0), amt)
+        if found_funds:
+            result = [k for k, v in sorted(found_funds.items(), key=lambda x: x[1], reverse=True)]
+            return _single_line(", ".join(result))
 
     if corr_after:
+        found_funds = {}
         for k, v in corr_after.items():
             for tk in target_keys:
                 if _norm(tk) in _norm(k):
@@ -379,11 +389,10 @@ def extract_fund_usage(dfs: List[pd.DataFrame], corr_after: Dict) -> str:
                     if amt and amt > 100:
                         std_key = "타법인 증권 취득자금" if "타법인" in tk else tk
                         found_funds[std_key] = amt
-
-    if found_funds:
-        result = [k for k, v in sorted(found_funds.items(), key=lambda x: x[1], reverse=True)]
-        return _single_line(", ".join(result))
-    
+        if found_funds:
+            result = [k for k, v in sorted(found_funds.items(), key=lambda x: x[1], reverse=True)]
+            return _single_line(", ".join(result))
+            
     val = scan_label_value_preferring_correction(dfs, ["조달자금의 구체적 사용 목적", "자금용도"], corr_after)
     return _single_line(val)
 
@@ -396,7 +405,7 @@ def extract_option_details(dfs: List[pd.DataFrame], html_raw: str, option_type: 
                 return _single_line(v)
                 
     best_table_text = ""
-    for df in dfs:
+    for df in reversed(dfs): # 역방향 스캔
         arr = df.astype(str).values
         R, C = arr.shape
         for r in range(R):
@@ -421,13 +430,13 @@ def extract_option_details(dfs: List[pd.DataFrame], html_raw: str, option_type: 
 
                     if len(cand) > len(best_table_text):
                         best_table_text = cand
+        if len(best_table_text) > 50:
+            break
 
     if len(best_table_text) > 30:
         stop_kws = ["【특정인", "미상환 주권", "기타 투자판단", "발행결정 전후", "10. 기타사항"]
-        if option_type == 'put': 
-            stop_kws.extend(["매도청구권", "call option", "콜옵션", "\\[CALL"])
-        else: 
-            stop_kws.extend(["조기상환청구권", "put option", "풋옵션", "\\[PUT"])
+        if option_type == 'put': stop_kws.extend(["매도청구권", "call option", "콜옵션", "\\[CALL"])
+        else: stop_kws.extend(["조기상환청구권", "put option", "풋옵션", "\\[PUT"])
             
         best_idx = len(best_table_text)
         for stop in stop_kws:
@@ -526,7 +535,7 @@ def extract_call_ratio_and_ytc(call_text: str, html_raw: str) -> Tuple[str, str]
 
 def extract_period_dates(dfs, corr_after, period_kws) -> Tuple[str, str]:
     s_date, e_date = "", ""
-    for df in dfs:
+    for df in reversed(dfs): # 역방향 스캔
         arr = df.astype(str).values
         for r in range(arr.shape[0]):
             row_str = _norm("".join(arr[r]))
@@ -536,6 +545,7 @@ def extract_period_dates(dfs, corr_after, period_kws) -> Tuple[str, str]:
                 elif "종료" in row_str and not e_date and dates: e_date = _format_date(dates[-1])
                 elif len(dates) >= 2:
                     return _format_date(dates[0]), _format_date(dates[-1])
+        if s_date and e_date: return s_date, e_date
     return s_date, e_date
 
 def extract_investors(dfs: List[pd.DataFrame], corr_after: Dict[str, str]) -> str:
@@ -554,12 +564,13 @@ def extract_investors(dfs: List[pd.DataFrame], corr_after: Dict[str, str]) -> st
             if is_valid(chunk) and chunk.strip() not in investors: investors.append(chunk.strip())
             
     if not investors:
-        for df in dfs:
+        for df in reversed(dfs): # 역방향 스캔
             if any(kw in _norm(df.to_string()) for kw in ["발행대상자명", "대상자명"]):
                 arr = df.astype(str).values
                 for r in range(1, arr.shape[0]):
                     name = arr[r][0].split('\n')[0].strip()
                     if is_valid(name) and name not in investors: investors.append(name)
+            if investors: break
                     
     return _single_line(", ".join(investors[:12]))
 
@@ -598,7 +609,6 @@ def parse_bond_record(dfs, t: Target, corr_after, html_raw, company_market_map) 
     rec["발행상품"] = extract_product_type(dfs, corr_after)
 
     def get_corr_num(labels, fallback_keys=[], min_val=-1, as_float=False):
-        # [V10.9 수정] 정정후 데이터 최우선 참조
         val = scan_label_value_preferring_correction(dfs, labels, corr_after)
         if as_float:
             num = _to_float(val)
@@ -617,7 +627,7 @@ def parse_bond_record(dfs, t: Target, corr_after, html_raw, company_market_map) 
     rec["Coupon"] = get_corr_num(["표면이자율(%)", "표면이자율", "표면금리"], ["표면이자율"], -1, True)
     rec["YTM"] = get_corr_num(["만기이자율(%)", "만기이자율", "만기보장수익률"], ["만기이자율"], -1, True)
     
-    # [V10.9 핵심: 정정후 맵핑 강화 적용된 숫자 4대장 컬럼]
+    # [V11.0 핵심] 정정후 데이터 최우선 타격 4대장
     rec["행사(전환)가액(원)"] = get_corr_num(["전환가액(원/주)", "교환가액(원/주)", "행사가액(원/주)", "전환가액", "교환가액", "행사가액"], ["가액", "원"], 50)
     rec["전환주식수"] = get_corr_num(["전환에 따라 발행할 주식수", "교환대상 주식수", "주식수"], ["주식수"], 50)
     rec["주식총수대비 비율"] = scan_label_value_preferring_correction(dfs, ["주식총수 대비 비율(%)", "총수 대비 비율"], corr_after)
