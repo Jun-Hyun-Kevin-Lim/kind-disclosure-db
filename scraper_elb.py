@@ -1,9 +1,9 @@
 # ==========================================================
-# #주식연계채권_코드V12.0_Option_Firewall_Master (옵션 교차오염 차단 완벽판)
-# 1. [완벽수정] Put/Call Option: Call 옵션 칸에 Put 옵션 내용이 들어가는 '교차 오염' 버그 완벽 차단 (상대방 키워드 감지 시 즉시 절단/폐기)
-# 2. [완벽수정] Put/Call Option: 추출된 텍스트 앞의 '[PUT OPTION]', '조기상환청구권' 등 불필요한 제목 라벨 완벽 청소
-# 3. [유지] V11.9의 전환청구기간 시작일/종료일 동일값 복사 버그 방지 (블록 캡처) 완벽 유지
-# 4. [유지] V11.4의 발행상품 1차 절단, 납입일 역방향 스캔, Call 비율/YTC 문맥 추출 100% 보존
+# #주식연계채권_코드V12.1_Option_Sniper (옵션 다이렉트 스나이퍼 종결판)
+# 1. [완벽해결] Put/Call Option: 사용자가 짚어준 정확한 키워드 "[조기상환청구권(Put Option)에 관한 사항]" 다이렉트 타격 엔진 탑재
+# 2. [완벽해결] Put/Call Option: 문서 하단의 '기타사항' 상세 내역을 강제로 가져오기 위해 "마지막 매칭(Last Match)" 우선 추출 적용
+# 3. [완벽해결] Put/Call Option: 추출된 텍스트에서 불필요한 제목 라벨 청소 및 상대방 옵션 침범(교차오염) 시 즉각 절단
+# 4. [유지] V11.9 전환청구기간 블록 캡처, 발행상품 정제, 납입일 역방향 스캔 100% 유지
 # ==========================================================
 import os
 import re
@@ -219,7 +219,7 @@ def scrape_one(context, acpt_no: str) -> Tuple[List[pd.DataFrame], str, str]:
         except: pass
 
 # ==========================================================
-# 4. 정정사항 엔진 및 기본 스캔 (역방향 스캔)
+# 4. 정정사항 엔진
 # ==========================================================
 def extract_correction_after_map(dfs: List[pd.DataFrame]) -> Dict[str, str]:
     out: Dict[str, str] = {}
@@ -263,7 +263,7 @@ def scan_label_value_preferring_correction(dfs, label_candidates, corr_after) ->
         for k, v in corr_after.items():
             if str(v).strip() and any(c in k for c in cand_clean): return _single_line(str(v))
             
-    for df in reversed(dfs): # 역방향 스캔
+    for df in reversed(dfs):
         arr = df.astype(str).values
         R, C = arr.shape
         for r in range(R):
@@ -311,12 +311,11 @@ def find_row_best_float(dfs, must_contain) -> Optional[float]:
     return None
 
 # ==========================================================
-# 5. 핵심 4대 컬럼 전용 추출기 (V12.0 옵션 교차오염 완벽 차단)
+# 5. 핵심 4대 컬럼 전용 추출기
 # ==========================================================
 
 def extract_product_type(dfs: List[pd.DataFrame], corr_after: Dict) -> str:
     labels = ["1. 사채의 종류", "1.사채의종류", "사채의 종류", "사체의 종류", "사태의 종류", "사케의 종류", "사채종류", "종류"]
-    
     def get_clean_product(text: str) -> str:
         if not text: return ""
         t = re.sub(r'\s+', ' ', text).strip()
@@ -330,14 +329,12 @@ def extract_product_type(dfs: List[pd.DataFrame], corr_after: Dict) -> str:
         
         pattern = r'((?:제\s*\d+\s*회차?|회차\s*\d+|제?\d+회차?)?\s*(?:제\s*\d+\s*회차?)?\s*(?:(?:무기명식?|기명식?|이권부|무이권부|보증|무보증|사모|공모|비분리형?|분리형?)\s*)*(?:전환사채|교환사채|신주인수권부사채))'
         matches = re.findall(pattern, t)
-        
         for m in matches:
             res = m.strip()
             res = re.sub(r'^회차\s*(\d+)', r'제\1회차', res)
             if 5 <= len(res) <= 40:
                 s_idx = res.find("사채")
-                if s_idx != -1:
-                    res = res[:s_idx+2].strip()
+                if s_idx != -1: res = res[:s_idx+2].strip()
                 return _single_line(res)
         return ""
 
@@ -433,15 +430,14 @@ def extract_fund_usage(dfs: List[pd.DataFrame], corr_after: Dict) -> str:
     return _single_line(val)
 
 
-# [V12.0 핵심 개조] Put/Call Option '교차 오염' 완벽 방어기
+# [V12.1 완벽 개조] Put/Call Option 다이렉트 스나이퍼 + 제목 완벽 청소기
 def extract_option_details(dfs: List[pd.DataFrame], html_raw: str, option_type: str, corr_after: Dict[str, str]) -> str:
-    # 나의 키워드와, 교차 오염을 방지할 '상대방'의 키워드를 명확히 분리
-    my_kws = ["조기상환청구권", "put option", "putoption", "풋옵션"] if option_type == 'put' else ["매도청구권", "call option", "calloption", "콜옵션"]
+    my_kws = ["조기상환청구권", "put option", "풋옵션"] if option_type == 'put' else ["매도청구권", "call option", "콜옵션"]
     opp_kws = ["매도청구권", "call option", "콜옵션", "\\[CALL"] if option_type == 'put' else ["조기상환청구권", "put option", "풋옵션", "\\[PUT"]
     
-    # 텍스트 앞부분에 붙은 [조기상환청구권] 같은 불필요한 라벨(제목)을 완벽하게 지워주는 청소기
     def clean_option_text(text: str, opt_type: str) -> str:
         text = _single_line(text)
+        # 사용자가 지적한 "[조기상환청구권(Put Option)에 관한 사항]" 같은 불필요한 라벨을 지우개로 싹 지워버림
         if opt_type == 'put':
             text = re.sub(r'^(?:\[?\s*조기상환청구권|put\s*option|풋옵션)[\s\(\)\[\]a-zA-Z]*(?:에\s*관한\s*사항)?\s*\]?', '', text, flags=re.IGNORECASE)
         else:
@@ -456,7 +452,32 @@ def extract_option_details(dfs: List[pd.DataFrame], html_raw: str, option_type: 
         for k, v in corr_after.items():
             if any(_norm(kw).lower() in _norm(k).lower() for kw in my_kws) and len(v) > 10:
                 return clean_option_text(v, option_type)
-                
+
+    # 1. HTML 전체 텍스트에서 사용자가 지정한 키워드를 찾아 '문서 맨 하단(마지막 매칭)'을 최우선으로 긁어옴! (가장 강력함)
+    soup = BeautifulSoup(html_raw, 'lxml')
+    for br in soup.find_all("br"): br.replace_with("\n")
+    text = soup.get_text(separator='\n', strip=True) 
+    
+    if option_type == 'put':
+        pattern_target = r'\[?\s*조기상환청구권\s*\([^)]*Put\s*Option[^)]*\)(?:\s*에\s*관한\s*사항)?\s*\]?'
+        stop_pattern = r'\n\s*(?:\[?\s*매도청구권|Call\s*Option|【\s*특정인|1[0-9]\.\s*기타사항|2[0-9]\.\s*기타사항|미상환\s*주권|발행결정\s*전후)'
+    else:
+        pattern_target = r'\[?\s*매도청구권\s*\([^)]*Call\s*Option[^)]*\)(?:\s*에\s*관한\s*사항)?\s*\]?'
+        stop_pattern = r'\n\s*(?:\[?\s*조기상환청구권|Put\s*Option|【\s*특정인|1[0-9]\.\s*기타사항|2[0-9]\.\s*기타사항|미상환\s*주권|발행결정\s*전후)'
+        
+    matches = list(re.finditer(pattern_target, text, re.IGNORECASE))
+    if matches:
+        # 무조건 가장 마지막에 매칭된 부분(보통 문서 하단 '20. 기타사항')을 가져와서 요약본에 걸리는 버그 방지
+        last_match = matches[-1] 
+        snippet = text[last_match.start():last_match.start()+5000]
+        
+        m = re.search(stop_pattern, snippet[20:], re.IGNORECASE)
+        if m: snippet = snippet[:20+m.start()]
+        
+        res = clean_option_text(snippet, option_type)
+        if len(res) > 10: return res
+        
+    # 2. 정확한 라벨이 없는 경우, 기존 표 내부 역방향 블록 스캔 (교차 오염 철벽 방어 적용)
     best_table_text = ""
     for df in reversed(dfs):
         arr = df.astype(str).values
@@ -469,13 +490,12 @@ def extract_option_details(dfs: List[pd.DataFrame], html_raw: str, option_type: 
                     self_text = str(arr[r][c]).strip()
                     right_text = " ".join([str(arr[r][cc]).strip() for cc in range(c+1, C) if str(arr[r][cc]).lower() != 'nan' and str(arr[r][cc]).strip()])
                     
-                    # 아래로 20줄 싹쓸이 (상대방 옵션이 등장하면 즉시 멈춤!)
                     bottom_lines = []
-                    for rr in range(r+1, min(R, r+20)):
+                    for rr in range(r+1, min(R, r+30)):
                         row_vals = [str(x).strip() for x in arr[rr] if str(x).lower() != 'nan' and str(x).strip()]
                         row_str = " ".join(row_vals)
                         
-                        # [방어 1] 쓸어담는 도중 상대방(Opponent)의 옵션이 등장하면 즉시 싹쓸이 중지
+                        # [핵심 방어선] 상대방 옵션 키워드가 보이면 절대 더 가져오지 않고 멈춤 (교차 오염 차단)
                         if any(opp in _norm(row_str).lower() for opp in opp_kws):
                             break
                         if any(x in row_str for x in ["【특정인", "발행결정 전후", "10. 기타사항", "11. 기타사항", "12. 기타사항", "13. 기타사항"]): 
@@ -496,16 +516,16 @@ def extract_option_details(dfs: List[pd.DataFrame], html_raw: str, option_type: 
         if len(best_table_text) > 50:
             break
 
-    # [방어 2] 묶어온 텍스트가 상대방(Opponent)의 키워드로 시작한다면, 이건 교차 오염된 쓰레기값이므로 즉시 폐기!
     if len(best_table_text) > 10:
         stop_patterns = [r'【특정인', r'미상환 주권', r'기타 투자판단', r'발행결정 전후', r'1[0-3]\.\s*기타사항']
-        stop_patterns.extend(opp_kws) # 상대방 키워드 추가
+        if option_type == 'put': stop_patterns.extend([r'매도청구권', r'call\s*option', r'콜옵션', r'\[CALL'])
+        else: stop_patterns.extend([r'조기상환청구권', r'put\s*option', r'풋옵션', r'\[PUT'])
             
         best_idx = len(best_table_text)
         for stop in stop_patterns:
             m = re.search(stop, best_table_text, re.IGNORECASE)
             if m:
-                # 텍스트 앞부분(15글자 이내)에 상대방 키워드가 있으면 교차 오염된 텍스트이므로 폐기(best_idx=0)
+                # 15글자 이내에 상대방 키워드가 나오면 이미 교차 오염된 쓰레기이므로 즉시 폐기(0 처리)
                 if m.start() < 15:
                     best_idx = 0 
                     break
@@ -516,38 +536,7 @@ def extract_option_details(dfs: List[pd.DataFrame], html_raw: str, option_type: 
         if len(res) > 10:
             return clean_option_text(res, option_type)
 
-    # 표에서 찾지 못했거나 교차 오염되어 폐기된 경우, 전체 HTML 문서에서 정교하게 다시 찾음 (Fallback)
-    soup = BeautifulSoup(html_raw, 'lxml')
-    for br in soup.find_all("br"): br.replace_with("\n")
-    text = soup.get_text(separator='\n', strip=True) 
-    
-    if option_type == 'put':
-        pattern = r'(?:\[?\s*조기상환청구권\s*\([^)]*Put[^)]*\)[^\]\n]*\]?|조기상환청구권\s*에\s*관한\s*사항|조기상환청구권\s*\(Put\s*Option\))(.*?)(?=\n\s*(?:\[?\s*매도청구권|1[0-9]\.\s*|2[0-9]\.\s*|【\s*특정인에|기타\s*투자판단|발행결정\s*전후))'
-    else:
-        pattern = r'(?:\[?\s*매도청구권\s*\([^)]*Call[^)]*\)[^\]\n]*\]?|매도청구권\s*에\s*관한\s*사항|매도청구권\s*\(Call\s*Option\))(.*?)(?=\n\s*(?:\[?\s*조기상환청구권|1[0-9]\.\s*|2[0-9]\.\s*|【\s*특정인에|기타\s*투자판단|발행결정\s*전후))'
-        
-    m = re.search(pattern, text, re.IGNORECASE | re.DOTALL)
-    if m and len(m.group(1).strip()) > 20:
-        return clean_option_text(_single_line(m.group(1).strip()), option_type)
-        
-    # 정규식마저 실패 시 최후의 스캔
-    idx = -1
-    for kw in my_kws:
-        idx = text.lower().find(kw.lower())
-        if idx != -1: break
-        
-    if idx != -1:
-        snippet = text[idx:idx+4000]
-        stop_pattern = r'\n\s*(?:【특정인|2[0-9]\.\s*기타|1[0-9]\.\s*신주|미상환\s*주권)'
-        if option_type == 'put': stop_pattern = r'\n\s*(?:매도청구권|\[?\s*Call Option\s*\]?|콜옵션|【특정인|2[0-9]\.\s*기타|1[0-9]\.\s*신주|미상환\s*주권)'
-        else: stop_pattern = r'\n\s*(?:조기상환청구권|\[?\s*Put Option\s*\]?|풋옵션|【특정인|2[0-9]\.\s*기타|1[0-9]\.\s*신주|미상환\s*주권)'
-            
-        m2 = re.search(stop_pattern, snippet[30:], re.IGNORECASE)
-        if m2: snippet = snippet[:30+m2.start()]
-        return clean_option_text(snippet, option_type)
-        
     return ""
-
 
 def extract_call_ratio_and_ytc(call_text: str, html_raw: str) -> Tuple[str, str]:
     ratio, ytc = "", ""
@@ -559,6 +548,7 @@ def extract_call_ratio_and_ytc(call_text: str, html_raw: str) -> Tuple[str, str]
         r'(\d{1,3}(?:\.\d+)?)\s*(?:%|퍼센트)\s*(?:를|을)?\s*초과하여\s*행사할\s*수\s*없',
         r'100분의\s*(\d{1,3}(?:\.\d+)?)'
     ]
+
     for p in r_patterns:
         m = re.search(p, call_text_clean, re.IGNORECASE)
         if m:
@@ -570,6 +560,7 @@ def extract_call_ratio_and_ytc(call_text: str, html_raw: str) -> Tuple[str, str]
         r'(?:연|연복리|복리)\s*(\d{1,2}(?:\.\d+)?)\s*(?:%|퍼센트)[^\d]{0,15}?(?:의\s*수익|이율|가산)',
         r'(?:%|퍼센트)[^\d]{0,15}?(?:수익률|이율|복리|연)\s*(\d{1,2}(?:\.\d+)?)'
     ]
+
     for p in y_patterns:
         m = re.search(p, call_text_clean, re.IGNORECASE)
         if m:
@@ -602,7 +593,6 @@ def extract_call_ratio_and_ytc(call_text: str, html_raw: str) -> Tuple[str, str]
                     if m and 0 <= float(m.group(1)) <= 20: ytc = f"{float(m.group(1)):g}%"; break
     return ratio, ytc
 
-# [유지] V11.9 전환청구기간 블록 캡처기 (시작일 = 종료일 겹침 방지)
 def extract_period_dates(dfs, corr_after, period_kws) -> Tuple[str, str]:
     if corr_after:
         for k, v in corr_after.items():
@@ -726,7 +716,6 @@ def parse_bond_record(dfs, t: Target, corr_after, html_raw, company_market_map) 
     s_date, e_date = extract_period_dates(dfs, corr_after, ["전환청구기간", "교환청구기간", "권리행사기간"])
     rec["전환청구 시작"], rec["전환청구 종료"] = s_date, e_date
 
-    # [호출] V12.0 옵션 교차오염 철벽 방어 엔진 적용
     rec["Put Option"] = extract_option_details(dfs, html_raw, 'put', corr_after)
     rec["Call Option"] = extract_option_details(dfs, html_raw, 'call', corr_after)
     
