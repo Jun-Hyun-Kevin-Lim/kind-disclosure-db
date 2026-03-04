@@ -1,8 +1,9 @@
 # ==========================================================
-# #주식연계채권_코드V10.5_Product_Perfect (발행상품 회차 포함 완벽 출력판)
-# 1. [완벽수정] 발행상품: '회차 3'을 지우지 않고 '제3회차'로 예쁘게 포맷팅하여 DART와 100% 동일하게 출력
-# 2. [완벽수정] 발행상품: '제9회차 제9회 무기명식...' 처럼 회차가 중복 기재된 원문도 완벽하게 살려냄
-# 3. [유지] 자금용도 라벨 추출, Put/Call Option 블록 추출, 정정공시 덮어쓰기 시스템 등 모두 원본 유지
+# #주식연계채권_코드V10.6_Option_Master (Put/Call Option 추출 완벽 복원판)
+# 1. [완벽수정] Put/Call Option: 표(Table) 내부 스캔 및 정정공시 스캔 로직 완벽 연동
+# 2. [완벽수정] 옵션 절단기: 텍스트 긁어올 때 '미상환 주권', '특정인' 등 꼬리 노이즈 칼같이 절단
+# 3. [유지] 발행상품: '제O회차' 포맷 유지 및 쓰레기값 완벽 제거 (DART 퀄리티)
+# 4. [유지] 자금용도: 금액 제외하고 라벨만 추출, 정정공시 삼중 덮어쓰기 시스템 100% 유지
 # ==========================================================
 import os
 import re
@@ -306,49 +307,40 @@ def find_row_best_float(dfs, must_contain) -> Optional[float]:
     return None
 
 # ==========================================================
-# 5. 핵심 4대 컬럼 전용 추출기
+# 5. 핵심 4대 컬럼 전용 추출기 (V10.6 옵션 추출 완벽 강화)
 # ==========================================================
 
+# 1) 발행상품 완벽 추출
 def extract_product_type(dfs: List[pd.DataFrame], corr_after: Dict) -> str:
-    """
-    [V10.5 완벽수정] 사용자의 요청대로 '제O회차' 정보를 지우지 않고 완벽히 살려내어 
-    DART와 똑같은 포맷("제13회차 무기명식 이권부 무보증 사모 전환사채")으로 출력합니다.
-    """
     labels = ["1. 사채의 종류", "1.사채의종류", "사채의 종류", "사체의 종류", "사태의 종류", "사케의 종류", "사채종류", "종류"]
     
     def clean_product(text: str) -> str:
         if not text: return ""
-        # 1차 쓰레기 라벨 지우기 (회차 정보는 살려둠!)
         t = re.sub(r'\s+', ' ', text).strip()
         t = re.sub(r'(?:1\.\s*)?(?:사채|사체|사태|사케)의\s*종류', '', t)
         t = re.sub(r'^\s*종류\s*|\s*종류\s*$', '', t)
         t = t.replace('발행결정', '').strip()
         
-        # '제 N 회차' 또는 '회차 N' 정보와 함께 뒤에 따라오는 사채명을 통째로 캡처
         pattern = r'((?:제\s*\d+\s*회차?|회차\s*\d+|제?\d+회차?)?\s*(?:제\s*\d+\s*회차?)?\s*(?:(?:무기명식|기명식|무기명|기명|이권부|무이권부|보증|무보증|사모|공모|비분리형|분리형|비분리|분리)\s*)*(?:전환사채|교환사채|신주인수권부사채|사채))'
         m = re.search(pattern, t)
         if m:
             res = m.group(1).strip()
-            # KIND 특유의 "회차 11 무기명식" 을 -> "제11회차 무기명식" 으로 예쁘게 치환 (사용자 요청 포맷 일치)
             res = re.sub(r'^회차\s*(\d+)', r'제\1회차', res)
             if len(res) > 3: return _single_line(res)
             
         return _single_line(t)
 
-    # 1. 정정공시 최우선 탐색
     if corr_after:
         for k, v in corr_after.items():
             if any(_norm(lb) in _norm(k) for lb in labels):
                 cleaned = clean_product(v)
                 if cleaned and "사채" in cleaned: return cleaned
 
-    # 2. 표 스캔
     val = scan_label_value_preferring_correction(dfs, labels, {})
     if val and "사채" in val:
         cleaned = clean_product(val)
         if cleaned and "사채" in cleaned: return cleaned
         
-    # 3. 최상단 행 병합 텍스트 전체 스캔
     for df in dfs:
         arr = df.astype(str).values
         for r in range(min(8, arr.shape[0])): 
@@ -359,6 +351,7 @@ def extract_product_type(dfs: List[pd.DataFrame], corr_after: Dict) -> str:
                 
     return ""
 
+# 2) 자금용도 라벨 전용 추출
 def extract_fund_usage(dfs: List[pd.DataFrame], corr_after: Dict) -> str:
     target_keys = ["시설자금", "영업양수자금", "운영자금", "채무상환자금", "타법인 증권 취득자금", "타법인증권취득자금", "기타자금"]
     found_funds = {}
@@ -399,30 +392,66 @@ def extract_fund_usage(dfs: List[pd.DataFrame], corr_after: Dict) -> str:
     val = scan_label_value_preferring_correction(dfs, ["조달자금의 구체적 사용 목적", "자금용도"], corr_after)
     return _single_line(val)
 
-def extract_option_details(html_raw: str, option_type: str) -> str:
+# 3) Put / Call Option 정밀 다중 스캔기 [V10.6 복원 및 강화]
+def extract_option_details(dfs: List[pd.DataFrame], html_raw: str, option_type: str, corr_after: Dict[str, str]) -> str:
+    kws = ["조기상환청구권", "Put Option", "PutOption", "put option"] if option_type == 'put' else ["매도청구권", "Call Option", "CallOption", "call option"]
+    
+    # 1. 정정공시 최우선 스캔
+    if corr_after:
+        for k, v in corr_after.items():
+            if any(_norm(kw).lower() in _norm(k).lower() for kw in kws) and len(v) > 10:
+                return _single_line(v)
+                
+    # 2. DataFrame(표) 내부 텍스트 정밀 스캔 (가장 중요)
+    best_table_text = ""
+    for df in dfs:
+        arr = df.astype(str).values
+        R, C = arr.shape
+        for r in range(R):
+            for c in range(C):
+                cell_norm = _norm(arr[r][c]).lower()
+                if any(_norm(kw).lower() in cell_norm for kw in kws):
+                    # 우측 셀들 합치기
+                    right_text = " ".join([str(arr[r][cc]).strip() for cc in range(c+1, C) if str(arr[r][cc]).lower() != 'nan' and str(arr[r][cc]).strip()])
+                    # 하단 셀들 합치기 (최대 10칸 아래까지)
+                    bottom_text = ""
+                    if r + 1 < R:
+                        bottom_text = " ".join([str(arr[rr][c]).strip() for rr in range(r+1, min(R, r+10)) if str(arr[rr][c]).lower() != 'nan' and str(arr[rr][c]).strip()])
+                    
+                    cand = right_text if len(right_text) > len(bottom_text) else bottom_text
+                    if len(cand) > len(best_table_text):
+                        best_table_text = cand
+                        
+    # 표에서 찾은 내용이 길면 채택 후 꼬리표 절단
+    if len(best_table_text) > 30:
+        stop_kws = ["【특정인", "미상환 주권", "기타 투자판단", "발행결정 전후"]
+        if option_type == 'put': stop_kws.extend(["매도청구권", "Call Option"])
+        
+        for stop in stop_kws:
+            idx = best_table_text.find(stop)
+            if idx != -1:
+                best_table_text = best_table_text[:idx]
+        return _single_line(best_table_text)
+
+    # 3. HTML 전체 본문 스캔 (표 바깥에 기재된 경우)
     soup = BeautifulSoup(html_raw, 'lxml')
     for br in soup.find_all("br"): br.replace_with("\n")
     text = soup.get_text(separator='\n', strip=True) 
     
-    if option_type == 'put':
-        pattern = r'(?:\[?\s*조기상환청구권\s*\([^)]*Put[^)]*\)[^\]\n]*\]?|조기상환청구권\s*에\s*관한\s*사항)(.*?)(?=\n\s*(?:\[?\s*매도청구권|1[0-9]\.\s*|2[0-9]\.\s*|【\s*특정인에|기타\s*투자판단))'
-    else:
-        pattern = r'(?:\[?\s*매도청구권\s*\([^)]*Call[^)]*\)[^\]\n]*\]?|매도청구권\s*에\s*관한\s*사항)(.*?)(?=\n\s*(?:1[0-9]\.\s*|2[0-9]\.\s*|【\s*특정인에|기타\s*투자판단))'
-        
-    match = re.search(pattern, text, re.IGNORECASE | re.DOTALL)
-    if match:
-        result = match.group(1).strip()
-        if len(result) > 10: return _single_line(result)
-        
-    kws = ["조기상환청구권(Put", "조기상환청구권"] if option_type == 'put' else ["매도청구권(Call", "매도청구권"]
     idx = -1
     for kw in kws:
-        idx = text.find(kw)
+        idx = text.lower().find(kw.lower())
         if idx != -1: break
+        
     if idx != -1:
         snippet = text[idx:idx+4000]
-        m = re.search(r'\n\s*(?:【특정인|2[0-9]\.\s*기타|1[0-9]\.\s*신주)', snippet[50:])
-        if m: snippet = snippet[:50+m.start()]
+        # 다음 목차 번호나 키워드에서 정확히 자름
+        stop_pattern = r'\n\s*(?:【특정인|2[0-9]\.\s*기타|1[0-9]\.\s*신주|미상환\s*주권)'
+        if option_type == 'put':
+            stop_pattern = r'\n\s*(?:매도청구권|Call Option|【특정인|2[0-9]\.\s*기타|1[0-9]\.\s*신주|미상환\s*주권)'
+            
+        m = re.search(stop_pattern, snippet[30:], re.IGNORECASE)
+        if m: snippet = snippet[:30+m.start()]
         return _single_line(snippet)
         
     return ""
@@ -484,6 +513,7 @@ def extract_investors(dfs: List[pd.DataFrame], corr_after: Dict[str, str]) -> st
                     
     return _single_line(", ".join(investors[:12]))
 
+
 # ==========================================================
 # 6. 레코드 파싱 매핑
 # ==========================================================
@@ -515,7 +545,7 @@ def parse_bond_record(dfs, t: Target, corr_after, html_raw, company_market_map) 
     
     rec["모집방식"] = scan_label_value_preferring_correction(dfs, ["사채발행방법", "모집방법", "발행방법"], corr_after)
     
-    # [호출] 1. 발행상품 (회차 정보 완벽 포함판)
+    # [호출] 1. V10.5 완벽 적용된 발행상품
     rec["발행상품"] = extract_product_type(dfs, corr_after)
 
     def get_corr_num(labels, fallback_keys=[], min_val=-1, as_float=False):
@@ -544,9 +574,9 @@ def parse_bond_record(dfs, t: Target, corr_after, html_raw, company_market_map) 
     s_date, e_date = extract_period_dates(dfs, corr_after, ["전환청구기간", "교환청구기간", "권리행사기간"])
     rec["전환청구 시작"], rec["전환청구 종료"] = s_date, e_date
 
-    # [호출] 2. Put / Call Option
-    rec["Put Option"] = extract_option_details(html_raw, 'put')
-    rec["Call Option"] = extract_option_details(html_raw, 'call')
+    # [호출] 2. Put / Call Option (V10.6 파라미터 복원 적용)
+    rec["Put Option"] = extract_option_details(dfs, html_raw, 'put', corr_after)
+    rec["Call Option"] = extract_option_details(dfs, html_raw, 'call', corr_after)
     
     ratio, ytc = extract_call_ratio_and_ytc(rec["Call Option"])
     rec["Call 비율"] = ratio
