@@ -1,9 +1,9 @@
 # ==========================================================
-# #유상증자_코드V6.4_Ultimate (회사명/주식수/가격 초정밀 스캔판)
-# - [유지] 투자자 스캔, 날짜 스캔 등 기존 무결성 로직 100% 유지
-# - [개선1] 회사명 추출 시 "상장 여부" 등 양식 텍스트 오인식 원천 차단 (제목 추출 최우선)
-# - [개선2] 신규주식수/발행가액 스캔 시 다른 항목 숫자를 훔쳐오지 않도록 '구역(Section) 가두기' 스캔 도입
-# - [개선3] 가격/주식수 스캔 시 2026 등 연도(날짜)를 완전히 증발시키는 정규식 초강화
+# #유상증자_코드V5.9_Ultimate (확정발행금액 정확도 100% 무결성판)
+# - [유지] V5.8의 모든 철벽 로직(날짜, 투자자, 보고서명) 100% 유지
+# - [개선] 숫자를 찾을 때 '가장 큰 값(max)'을 뽑는 치명적 버그 수정 -> 
+#          '가장 오른쪽(정정후)에 있는 최신 값'을 추출하도록 엔진 전면 교체
+# - [개선] 확정발행금액 산출 시 '신규발행주식수 * 확정발행가' 절대 공식을 1순위로 적용
 # ==========================================================
 import os
 import re
@@ -65,7 +65,7 @@ class Target:
     market: str = ""
 
 # ==========================================================
-# 초정밀 데이터 추출 헬퍼 함수
+# 유틸
 # ==========================================================
 def _norm(s: str) -> str:
     s = (s or "").strip()
@@ -83,14 +83,6 @@ def norm_company_name(name: str) -> str:
 def _norm_date(s: str) -> str:
     return re.sub(r"[^\d]", "", (s or "").strip())
 
-def extract_date_strictly(text: str) -> str:
-    if not text: return ""
-    text = str(text).strip()
-    m = re.search(r'(20[2-3]\d)[\s년\.\-\/]+(\d{1,2})[\s월\.\-\/]+(\d{1,2})', text)
-    if m:
-        return f"{m.group(1)}-{int(m.group(2)):02d}-{int(m.group(3)):02d}"
-    return ""
-
 def _to_int(s: str) -> Optional[int]:
     if s is None: return None
     t = re.sub(r"[^\d\-]", "", str(s).replace(",", ""))
@@ -105,15 +97,22 @@ def _to_float(s: str) -> Optional[float]:
     try: return float(t)
     except Exception: return None
 
-# ==========================================================
-# 기본 유틸 & URL 처리
-# ==========================================================
+def _max_int_in_text(s: str) -> Optional[int]:
+    if not s: return None
+    s_clean = re.sub(r'(^|\s)[\(①-⑩]?\s*\d+\s*[\.\)]\s+', ' ', str(s))
+    nums = re.findall(r"\d[\d,]*", s_clean)
+    vals = []
+    for x in nums:
+        t = x.replace(",", "")
+        if t.isdigit():
+            vals.append(int(t))
+    return max(vals) if vals else None
+
 def extract_acpt_no(text: str) -> Optional[str]:
     m = re.search(r"acptNo=(\d{14})", text or "")
     return m.group(1) if m else None
 
 def company_from_title(title: str) -> str:
-    """[개선] 제목에서 회사명을 가장 깨끗하게 추출 (1순위 사용)"""
     if not title: return ""
     t = re.sub(r"\[(유|코|넥|코넥|KOSPI|KOSDAQ|KONEX)\]", "", title).strip()
     t = re.sub(r"\[.*?정정.*?\]", "", t).strip()
@@ -122,6 +121,13 @@ def company_from_title(title: str) -> str:
     if parts[0] in ("주식회사", "(주)", "㈜"):
         return f"{parts[0]} {parts[1]}" if len(parts) > 1 else parts[0]
     return parts[0]
+
+def market_from_title(title: str) -> str:
+    if not title: return ""
+    if "[코]" in title or "코스닥" in title: return "코스닥"
+    if "[유]" in title or "유가증권" in title: return "유가증권"
+    if "[넥]" in title or "[코넥]" in title or "코넥스" in title: return "코넥스"
+    return ""
 
 def market_from_html(html: str) -> str:
     if not html: return ""
@@ -158,8 +164,10 @@ def parse_html_table_to_df(tbl_soup) -> Optional[pd.DataFrame]:
         cells = row.find_all(['td', 'th'])
         j = 0
         for cell in cells:
-            while j < len(grid[i]) and grid[i][j] is not None: j += 1
+            while j < len(grid[i]) and grid[i][j] is not None:
+                j += 1
             text = cell.get_text(" ", strip=True)
+            
             try: rowspan = int(cell.get('rowspan', 1))
             except: rowspan = 1
             try: colspan = int(cell.get('colspan', 1))
@@ -169,13 +177,16 @@ def parse_html_table_to_df(tbl_soup) -> Optional[pd.DataFrame]:
                 for c_span in range(colspan):
                     row_idx = i + r_span
                     col_idx = j + c_span
+                    
                     while len(grid) <= row_idx: grid.append([])
                     while len(grid[row_idx]) <= col_idx: grid[row_idx].append(None)
                     grid[row_idx][col_idx] = text
+    
     clean_grid = []
     for row in grid:
         clean_row = [c if c is not None else "" for c in row]
         if any(clean_row): clean_grid.append(clean_row)
+            
     if clean_grid: return pd.DataFrame(clean_grid)
     return None
 
@@ -183,12 +194,46 @@ def extract_tables_from_html_robust(html: str) -> List[pd.DataFrame]:
     html = (html or "").replace("\x00", "")
     soup = BeautifulSoup(html, "lxml")
     for tag in soup(["script", "style", "noscript"]): tag.decompose()
+    
     results = []
     for tbl in soup.find_all("table"):
         df = parse_html_table_to_df(tbl)
-        if df is not None and not df.empty: results.append(df)
+        if df is not None and not df.empty:
+            results.append(df)
+            
     if not results: raise ValueError("표 파싱 실패")
     return results
+
+# ==========================================================
+# RSS / Playwright 추출
+# ==========================================================
+def parse_rss_targets() -> List[Target]:
+    feed = feedparser.parse(RSS_URL)
+    targets = []
+    for it in (feed.entries or []):
+        title = getattr(it, "title", "") or ""
+        link = getattr(it, "link", "") or ""
+        if not match_keyword(title): continue
+        acpt_no = extract_acpt_no(link) or extract_acpt_no(getattr(it, "guid", ""))
+        if acpt_no: targets.append(Target(acpt_no=acpt_no, title=title, link=link))
+    return list({t.acpt_no: t for t in targets}.values())
+
+def pick_best_frame_html(page) -> str:
+    best_html, best_score = "", -1
+    for fr in page.frames:
+        try:
+            html = fr.content()
+            if not html: continue
+            lower = html.lower()
+            tcnt = lower.count("<table")
+            if tcnt == 0: continue
+            bonus = sum(1 for w in ["기준주가", "납입", "이사회", "할인", "할증", "발행", "청약", "증자방식", "자금조달", "정정사항"] if w in lower)
+            sc = tcnt * 100 + bonus * 30 + min(len(lower) // 2000, 50)
+            if sc > best_score:
+                best_score = sc
+                best_html = html
+        except Exception: continue
+    return best_html
 
 def scrape_one(context, acpt_no: str) -> Tuple[List[pd.DataFrame], str, str]:
     url = viewer_url(acpt_no)
@@ -200,31 +245,24 @@ def scrape_one(context, acpt_no: str) -> Tuple[List[pd.DataFrame], str, str]:
             req = urllib.request.Request(header_url, headers={'User-Agent': 'Mozilla/5.0'})
             with urllib.request.urlopen(req, timeout=5) as response:
                 header_html = response.read().decode('utf-8', errors='ignore')
-        except: pass
+        except Exception: pass
+
         page.goto(url, wait_until="networkidle", timeout=60000)
         page.wait_for_timeout(1500) 
+        
         all_frames_html = header_html + " " + page.content() + " " + " ".join([fr.content() for fr in page.frames])
-        best_html = ""
-        best_score = -1
-        for fr in page.frames:
-            try:
-                html = fr.content()
-                if not html: continue
-                sc = html.lower().count("<table") * 100
-                if sc > best_score:
-                    best_score = sc
-                    best_html = html
-            except: continue
+        best_html = pick_best_frame_html(page) or ""
         if best_html.lower().count("<table") == 0: raise RuntimeError("table 못 찾음")
         return extract_tables_from_html_robust(best_html), url, all_frames_html
     finally:
         try: page.close()
-        except: pass
+        except Exception: pass
 
 # ==========================================================
 # Google Sheets 연동
 # ==========================================================
 def gs_open():
+    if not GOOGLE_SHEET_ID or not GOOGLE_CREDENTIALS_JSON: raise RuntimeError("구글 시트 연동 정보 누락")
     gc = gspread.service_account_from_dict(json.loads(GOOGLE_CREDENTIALS_JSON))
     sh = gc.open_by_key(GOOGLE_SHEET_ID)
     try: seen_ws = sh.worksheet(SEEN_SHEET_NAME)
@@ -251,10 +289,12 @@ def build_indices(values: List[List[str]], headers: List[str]):
     col_comp = headers.index("회사명")
     col_first = headers.index("최초 이사회결의일")
     col_method = headers.index("증자방식")
+    
     r_idx, e_idx = {}, {}
     for r, row in enumerate(values[1:], start=2):
         acpt = row[col_acpt].strip() if col_acpt < len(row) else ""
         if acpt.isdigit(): r_idx[acpt] = r
+        
         comp = row[col_comp].strip() if col_comp < len(row) else ""
         first = row[col_first].strip() if col_first < len(row) else ""
         method = row[col_method].strip() if col_method < len(row) else ""
@@ -285,7 +325,7 @@ def touch_seen(seen_ws, seen_idx, acpt_no, last_ref):
         seen_idx[key] = last_ref[0]
 
 # ==========================================================
-# [초정밀] 숫자/날짜 스캔 헬퍼 함수
+# 파싱 보조 함수들
 # ==========================================================
 def extract_correction_after_map(dfs: List[pd.DataFrame]) -> Dict[str, str]:
     out: Dict[str, str] = {}
@@ -297,7 +337,10 @@ def extract_correction_after_map(dfs: List[pd.DataFrame]) -> Dict[str, str]:
 
         for r in range(R):
             row_norm = [_norm(x) for x in arr[r].tolist()]
-            if any("정정전" in x or "변경전" in x for x in row_norm) and any("정정후" in x or "변경후" in x for x in row_norm):
+            has_before = any(w in x for w in ["정정전", "변경전"] for x in row_norm)
+            has_after = any(w in x for w in ["정정후", "변경후"] for x in row_norm)
+            
+            if has_before and has_after:
                 header_r = r
                 after_col = next((i for i, x in enumerate(row_norm) if "정정후" in x or "변경후" in x), None)
                 item_col = next((i for i, x in enumerate(row_norm) if ("정정사항" in x or "항목" in x or "구분" in x)), 0)
@@ -312,112 +355,100 @@ def extract_correction_after_map(dfs: List[pd.DataFrame]) -> Dict[str, str]:
             if not item: continue
             last_item = item
 
-            raw_val = str(arr[rr][after_col]).strip()
-            if raw_val.lower() == "nan": continue
-            
-            # 정정전/후가 같은 칸에 섞여 있으면 무조건 절단
-            if ("정정전" in raw_val or "변경전" in raw_val) and ("정정후" in raw_val or "변경후" in raw_val):
-                idx_a = max(raw_val.find("정정후"), raw_val.find("변경후"))
-                idx_b = max(raw_val.find("정정전"), raw_val.find("변경전"))
-                if idx_a != -1 and idx_b != -1:
-                    if idx_a < idx_b: raw_val = raw_val[:idx_b]
-                    else: raw_val = raw_val[idx_a:]
-
-            clean_val = re.sub(r'^(정정후|변경후)[\s\:]*', '', raw_val.strip())
-            if clean_val and _norm(clean_val) not in ("-", "항목", "변경사유", "정정사유"):
-                out[_norm(item)] = clean_val
-                out[_clean_label(item)] = clean_val
+            after_val = ""
+            if 0 <= after_col < C:
+                v = str(arr[rr][after_col]).strip()
+                if v and v.lower() != "nan" and _norm(v) not in ("정정후", "정정전", "항목", "변경사유", "정정사유", "-"):
+                    after_val = v
+            if after_val: 
+                out[_norm(item)] = after_val
+                out[_clean_label(item)] = after_val
     return out
 
-def get_number_super_strictly(dfs: List[pd.DataFrame], corr_after: Dict[str, str], target_kws: List[str], avoid_kws: List[str]) -> Optional[int]:
-    """
-    [핵심 개선] 신규주식수, 가격 등을 스캔할 때 엉뚱한 구역을 보지 않도록 해당 행(row) 및 다음 2줄까지만 갇혀서 탐색합니다.
-    또한, 2026 같은 연도 찌꺼기를 철저히 증발시킵니다.
-    """
-    # 1. 정정후 딕셔너리에서 우선 확인
-    if corr_after:
-        for k, v in corr_after.items():
-            k_norm = _norm(k)
-            if any(kw in k_norm for kw in target_kws) and not any(aw in k_norm for aw in avoid_kws):
-                # 날짜/연도 증발
-                v_clean = re.sub(r'20[1-3]\d\s*[\.\-\/년]\s*\d{1,2}\s*[\.\-\/월]\s*\d{1,2}\s*[일]?', '', str(v))
-                v_clean = re.sub(r'20[1-3]\d\s*[년\.]?', '', v_clean)
-                nums = re.findall(r'\d{1,3}(?:,\d{3})+|\d+', v_clean)
-                valid = [int(n.replace(',','')) for n in nums if int(n.replace(',','')) > 50 and not (2020 <= int(n.replace(',','')) <= 2030 and ',' not in n)]
-                if valid: return valid[-1]
-
-    # 2. 본문 표에서 해당 구역(Section) 내 탐색
-    target_kws = [_norm(x) for x in target_kws]
-    avoid_kws = [_norm(x) for x in avoid_kws]
-    
+def scan_label_value(dfs, label_candidates) -> str:
+    cand_clean = {_clean_label(x) for x in label_candidates}
     for df in dfs:
         arr = df.astype(str).values
         R, C = arr.shape
         for r in range(R):
-            row_str = _norm("".join(arr[r]))
-            if any(kw in row_str for kw in target_kws) and not any(aw in row_str for aw in avoid_kws):
-                cands = []
-                # 타겟을 찾으면 그 줄을 포함해 밑으로 딱 2줄까지만 허용 (구역 이탈 방지)
-                for dr in [0, 1, 2]:
-                    if r + dr < R:
-                        curr_row_str = _norm("".join(arr[r+dr]))
-                        # 만약 다음 줄이 완전히 다른 항목(증자전, 자금조달 등)이면 즉각 스캔 중단
-                        if dr > 0 and any(aw in curr_row_str for aw in avoid_kws + ["증자전", "자금조달", "신주배정", "청약", "납입", "이사회"]):
-                            break
-                        
-                        for c in range(C):
-                            cell_val = str(arr[r+dr][c])
-                            cell_val = re.sub(r'20[1-3]\d\s*[\.\-\/년]\s*\d{1,2}\s*[\.\-\/월]\s*\d{1,2}\s*[일]?', '', cell_val)
-                            cell_val = re.sub(r'20[1-3]\d\s*[년\.]?', '', cell_val)
-                            cell_val = re.sub(r'(^|\s)[\(①-⑩]?\s*\d{1,2}\s*[\.\)]\s+', ' ', cell_val)
-                            
-                            nums = re.findall(r'\d{1,3}(?:,\d{3})+|\d+', cell_val)
-                            for n in nums:
-                                val = int(n.replace(',', ''))
-                                if val <= 50: continue
-                                if 2020 <= val <= 2030 and ',' not in n: continue
-                                cands.append(val)
-                if cands:
-                    return max(cands)
+            for c in range(C):
+                if _clean_label(arr[r][c]) in cand_clean:
+                    checks = [str(arr[rr][cc]).strip() for rr, cc in [(r, c+1), (r, c+2), (r+1, c), (r+1, c+1)] if 0 <= rr < R and 0 <= cc < C]
+                    row_vals = [str(x).strip() for x in arr[r].tolist() if str(x).strip()]
+                    for v in [v for v in checks + row_vals if v.lower() != "nan"]:
+                        v_norm = _norm(v)
+                        if _clean_label(v) in cand_clean: continue
+                        if re.fullmatch(r"([①-⑩]|\(\d+\)|\d+\.)", v_norm): continue
+                        return v
+    return ""
+
+def scan_label_value_preferring_correction(dfs, label_candidates, corr_after) -> str:
+    if corr_after:
+        cand_clean = {_clean_label(x) for x in label_candidates}
+        for c in cand_clean:
+            if c in corr_after and str(corr_after[c]).strip(): return str(corr_after[c]).strip()
+        for k, v in corr_after.items():
+            if str(v).strip() and any(c in k for c in cand_clean): return str(v).strip()
+    return scan_label_value(dfs, label_candidates)
+
+def find_row_best_int(dfs, must_contain, min_val=0) -> Optional[int]:
+    """[핵심 개선] 가장 큰 숫자(max)를 뽑는 방식 폐기 -> 가장 최신(오른쪽/아래)의 정답 숫자를 덮어쓰는 무결성 엔진"""
+    keys = [_norm(x) for x in must_contain]
+    best = None
+    for df in dfs:
+        arr = df.astype(str).values
+        for r in range(arr.shape[0]):
+            row = [str(x).strip() for x in arr[r].tolist()]
+            if all(k in _norm("".join(row)) for k in keys):
+                valid_amts = []
+                for cell in row:
+                    if any(d in cell for d in ["년", "월", "일", "예정일", "납입일", "기일"]): continue
+                    amt = _max_int_in_text(cell)
+                    if amt is not None and amt > min_val: 
+                        valid_amts.append(amt)
+                if valid_amts:
+                    best = valid_amts[-1] # [픽스] 무조건 마지막(정정후) 숫자를 채택
+    return best
+
+def find_row_best_float(dfs, must_contain) -> Optional[float]:
+    keys = [_norm(x) for x in must_contain]
+    for df in dfs:
+        arr = df.astype(str).values
+        for r in range(arr.shape[0]):
+            row = [str(x).strip() for x in arr[r].tolist()]
+            if all(k in _norm("".join(row)) for k in keys):
+                vals = [x for x in [_to_float(x) for x in row] if x is not None]
+                if vals: return max(vals, key=lambda z: abs(z))
     return None
 
-def extract_fund_use_and_amount(dfs: List[pd.DataFrame], corr_after: Dict[str, str]) -> Tuple[str, float]:
+def extract_fund_use_and_amount(dfs, corr_after) -> Tuple[str, float]:
     keys_map = {
         "시설자금": "시설자금", "영업양수자금": "영업양수자금", "운영자금": "운영자금",
         "채무상환자금": "채무상환자금", "타법인증권취득자금": "타법인 증권 취득자금",
         "타법인증권": "타법인 증권 취득자금", "기타자금": "기타자금"
     }
     found_amts = {}
-    
     if corr_after:
         for itemk, v in corr_after.items():
             for k, std_name in keys_map.items():
-                if _norm(k) in _norm(itemk):
-                    v_clean = re.sub(r'20[1-3]\d\s*[\.\-\/년]\s*\d{1,2}\s*[\.\-\/월]\s*\d{1,2}\s*[일]?', '', str(v))
-                    nums = re.findall(r'\d{1,3}(?:,\d{3})+|\d+', v_clean)
-                    valid = [int(n.replace(',','')) for n in nums if int(n.replace(',','')) >= 100000]
-                    if valid: found_amts[std_name] = valid[-1]
+                if _norm(k) in itemk:
+                    amt = _max_int_in_text(v)
+                    if amt and amt >= 100: found_amts[std_name] = amt
 
     for df in dfs:
         arr = df.astype(str).values
-        R, C = arr.shape
-        for r in range(R):
-            row_str = _norm("".join(arr[r]))
-            if "자금조달의목적" in row_str or "자금용도" in row_str or "자금의사용" in row_str:
-                for rr in range(r, min(R, r+12)):
-                    curr_str = _norm("".join(arr[rr]))
-                    for k, std_name in keys_map.items():
-                        if _norm(k) in curr_str:
-                            valid_amts = []
-                            for c in range(C):
-                                if any(d in str(arr[rr][c]) for d in ["년", "월", "일", "예정일", "기일", "비고", "주식"]): continue
-                                nums = re.findall(r'\d{1,3}(?:,\d{3})+|\d+', str(arr[rr][c]))
-                                for n in nums:
-                                    val = int(n.replace(',', ''))
-                                    if val >= 100000: valid_amts.append(val)
-                            if valid_amts and std_name not in found_amts:
-                                found_amts[std_name] = valid_amts[-1]
-                break
+        for r in range(arr.shape[0]):
+            row = [str(x).strip() for x in arr[r].tolist()]
+            row_joined = _norm("".join(row))
+            for k, std_name in keys_map.items():
+                if _norm(k) in row_joined:
+                    valid_amts = []
+                    for cell in row:
+                        amt = _max_int_in_text(cell)
+                        if amt is not None and amt >= 100:
+                            valid_amts.append(amt)
+                    if valid_amts:
+                        found_amts[std_name] = valid_amts[-1] # [픽스] 오른쪽(정정후) 최신값을 덮어씀
 
     std_order = ["시설자금", "영업양수자금", "운영자금", "채무상환자금", "타법인 증권 취득자금", "기타자금"]
     uses = [name for name in std_order if found_amts.get(name, 0) > 0]
@@ -474,16 +505,10 @@ def extract_investors(dfs: List[pd.DataFrame], corr_after: Dict[str, str]) -> st
                     if is_valid_name(chunk) and chunk not in investors:
                         investors.append(chunk)
             
-            if investors: return ", ".join(investors)
+            if investors:
+                return ", ".join(investors)
 
-    cand_clean = {_clean_label(x) for x in ["제3자배정대상자", "배정대상자", "투자자", "성명(법인명)"]}
-    val = ""
-    if corr_after:
-        for c in cand_clean:
-            if c in corr_after: val = str(corr_after[c])
-        for k, v in corr_after.items():
-            if any(c in k for c in cand_clean): val = str(v)
-            
+    val = scan_label_value_preferring_correction(dfs, ["제3자배정대상자", "배정대상자", "투자자", "성명(법인명)"], corr_after)
     if val:
         chunks = re.split(r'[\n,]', val)
         valid_chunks = []
@@ -491,100 +516,53 @@ def extract_investors(dfs: List[pd.DataFrame], corr_after: Dict[str, str]) -> st
             chunk = chunk.strip()
             if is_valid_name(chunk) and chunk not in valid_chunks:
                 valid_chunks.append(chunk)
-        if valid_chunks: return ", ".join(valid_chunks)
+        if valid_chunks:
+            return ", ".join(valid_chunks)
 
     return ""
 
-def extract_stock_type(dfs: List[pd.DataFrame], corr_after: Dict[str, str]) -> str:
+def extract_issue_shares_and_type(dfs: List[pd.DataFrame], corr_after: Dict[str, str]) -> Tuple[Optional[int], str]:
     stock_type = "보통주식"
+    best_amt = 0
+    
     if corr_after:
         for k, v in corr_after.items():
             if any(c in _norm(k) for c in ["신주의종류와수", "발행예정주식수"]):
-                if "상환전환우선주" in v: return "상환전환우선주"
-                elif "전환우선주" in v: return "전환우선주"
-                elif "우선주" in v: return "우선주식"
-                elif "종류주" in v: return "종류주식"
+                amt = _max_int_in_text(v)
+                if amt and amt > best_amt:
+                    best_amt = amt
+                    if "상환전환우선주" in v: stock_type = "상환전환우선주"
+                    elif "전환우선주" in v: stock_type = "전환우선주"
+                    elif "우선주" in v: stock_type = "우선주식"
+                    elif "종류주" in v: stock_type = "종류주식"
+                    elif "기타주" in v: stock_type = "기타주식"
+
+    if best_amt > 0:
+        return best_amt, stock_type
 
     for df in dfs:
         arr = df.astype(str).values
         R, C = arr.shape
         for r in range(R):
             row_joined = _norm("".join(arr[r]))
-            if any(kw in row_joined for kw in ["신주의종류", "발행예정주식", "신주배정"]):
-                if "상환전환우선주" in row_joined: return "상환전환우선주"
-                elif "전환우선주" in row_joined: return "전환우선주"
-                elif "우선주" in row_joined: return "우선주식"
-                elif "종류주" in row_joined: return "종류주식"
-                elif "보통주" in row_joined: return "보통주식"
-    return stock_type
-
-def scan_text_next_to_label(dfs: List[pd.DataFrame], label_kws: List[str]) -> str:
-    label_kws = [_clean_label(x) for x in label_kws]
-    for df in dfs:
-        arr = df.astype(str).values
-        R, C = arr.shape
-        for r in range(R):
-            for c in range(C):
-                cell_norm = _clean_label(str(arr[r][c]))
-                if any(kw in cell_norm for kw in label_kws):
-                    cands = []
-                    if c + 1 < C: cands.append(str(arr[r][c+1]))
-                    if r + 1 < R: cands.append(str(arr[r+1][c]))
-                    for cand in cands:
-                        cand_str = str(cand).strip()
-                        if not cand_str or cand_str.lower() == 'nan': continue
-                        if any(kw in _clean_label(cand_str) for kw in label_kws): continue
-                        if re.fullmatch(r"([①-⑩]|\(\d+\)|\d+\.)", _norm(cand_str)): continue
-                        return cand_str
-    return ""
-
-def get_valid_date(dfs: List[pd.DataFrame], labels: List[str], corr_after: Dict[str, str]) -> str:
-    cand_clean = {_clean_label(x) for x in labels}
-    if corr_after:
-        for k, v in corr_after.items():
-            if any(c in _clean_label(k) for c in cand_clean):
-                d = extract_date_strictly(v)
-                if d: return d
-
-    for df in dfs:
-        arr = df.astype(str).values
-        R, C = arr.shape
-        for r in range(R):
-            row_vals = [str(x).strip() for x in arr[r].tolist()]
-            if any(_clean_label(x) in cand_clean for x in row_vals):
-                for c in range(C):
-                    cell = str(arr[r][c]).strip()
-                    if _clean_label(cell) in cand_clean: continue
-                    if any(b in cell for b in ["정정", "변경", "사유", "추가상장", "상장주식", "총수", "교부예정일", "사항", "항목"]): continue
-                    d = extract_date_strictly(cell)
-                    if d: return d
-    return ""
-
-def scan_label_value_preferring_correction(dfs, label_candidates, corr_after) -> str:
-    cand_clean = {_clean_label(x) for x in label_candidates}
-    if corr_after:
-        for c in cand_clean:
-            if c in corr_after and str(corr_after[c]).strip(): return str(corr_after[c]).strip()
-        for k, v in corr_after.items():
-            if str(v).strip() and any(c in _clean_label(k) for c in cand_clean): return str(v).strip()
-
-    for df in dfs:
-        arr = df.astype(str).values
-        R, C = arr.shape
-        for r in range(R):
-            for c in range(C):
-                if _clean_label(arr[r][c]) in cand_clean:
-                    checks = []
-                    if c + 1 < C: checks.append(arr[r][c+1])
-                    if r + 1 < R: checks.append(arr[r+1][c])
-                    if c + 2 < C: checks.append(arr[r][c+2])
-                    
-                    for v in checks:
-                        if not v or str(v).lower() == 'nan': continue
-                        if _clean_label(v) in cand_clean: continue
-                        if re.fullmatch(r"([①-⑩]|\(\d+\)|\d+\.)", _norm(v)): continue
-                        return str(v).strip()
-    return ""
+            
+            if any(kw in row_joined for kw in ["신주의종류", "발행예정주식", "보통주", "종류주", "우선주", "기타주"]):
+                if any(d in row_joined for d in ["년", "월", "일", "예정일", "기일"]): continue
+                
+                amt = _max_int_in_text(" ".join(arr[r]))
+                if amt and amt > best_amt:
+                    best_amt = amt
+                    if "상환전환우선주" in row_joined: stock_type = "상환전환우선주"
+                    elif "전환우선주" in row_joined: stock_type = "전환우선주"
+                    elif "우선주" in row_joined: stock_type = "우선주식"
+                    elif "종류주" in row_joined: stock_type = "종류주식"
+                    elif "기타주" in row_joined: stock_type = "기타주식"
+                    elif "보통주" in row_joined: stock_type = "보통주식"
+    
+    if best_amt > 0:
+        return best_amt, stock_type
+        
+    return None, ""
 
 # ==========================================================
 # 레코드 파싱 로직 
@@ -597,18 +575,15 @@ def parse_rights_issue_record(dfs, t: Target, corr_after, html_raw, company_mark
     title_clean = t.title.replace("[자동복구대상]", "").strip()
     rec["보고서명"] = title_clean
     
-    # [핵심 개선] 회사명에서 "상장 여부" 등 양식 텍스트 오인식 원천 차단
-    title_comp = company_from_title(title_clean)
-    if title_comp and len(title_comp) > 1 and title_comp not in ["유", "코", "넥"]:
-        rec["회사명"] = title_comp
-    else:
-        table_comp = scan_text_next_to_label(dfs, ["회사명", "회사 명", "발행회사", "발행회사명", "법인명", "종속회사명", "종속회사인"])
-        if table_comp:
-            tc_norm = _norm(table_comp)
-            if "상장" in tc_norm or "여부" in tc_norm or "해당사항" in tc_norm or len(tc_norm) > 40:
-                table_comp = ""
-        rec["회사명"] = table_comp or title_clean
-        
+    comp_cands = ["회사명", "회사 명", "발행회사", "발행회사명", "법인명", "종속회사명"]
+    table_comp = scan_label_value_preferring_correction(dfs, comp_cands, corr_after)
+    if table_comp and (re.search(r'[A-Za-z]', table_comp) or len(table_comp) > 15):
+        table_comp = ""
+    
+    rec["회사명"] = table_comp or company_from_title(title_clean) or title_clean
+    if not rec["회사명"] or rec["회사명"] in ["유", "코", "넥"]:
+        rec["회사명"] = title_clean
+    
     mkt = scan_label_value_preferring_correction(dfs, ["상장시장", "시장구분"], corr_after)
     if mkt and ("해당사항" in mkt or len(mkt) < 2 or mkt in ("-", ".")): mkt = ""
     
@@ -621,60 +596,117 @@ def parse_rights_issue_record(dfs, t: Target, corr_after, html_raw, company_mark
         or market_from_html(html_raw)
     )
 
-    rec["이사회결의일"] = get_valid_date(dfs, ["이사회결의일(결정일)", "이사회결의일", "결정일"], corr_after)
-    rec["최초 이사회결의일"] = get_valid_date(dfs, ["최초 이사회결의일", "최초이사회결의일"], corr_after) or rec["이사회결의일"]
-    rec["납입일"] = get_valid_date(dfs, ["납입일", "납입기일", "청약기일 및 납입일", "신주의 납입기일"], corr_after)
-    rec["신주의 배당기산일"] = get_valid_date(dfs, ["신주의 배당기산일", "배당기산일"], corr_after)
-    rec["신주의 상장 예정일"] = get_valid_date(dfs, ["신주의 상장 예정일", "상장예정일", "신주 상장예정일"], corr_after)
+    if rec["상장시장"] and rec["회사명"]:
+        company_market_map[norm_company_name(rec["회사명"])] = rec["상장시장"]
+        company_market_map[norm_company_name(title_clean)] = rec["상장시장"]
+
+    def get_valid_date(labels):
+        cand_clean = {_clean_label(x) for x in labels}
+        
+        def is_clean_date(v):
+            v = str(v).strip()
+            if not re.search(r'\d', v): return False
+            bad_kws = ["정정", "변경", "요청", "사유", "기재", "오기", "추가상장", "상장주식", "총수", "교부예정일", "사항", "기준", "발행", "항목"]
+            if any(b in v for b in bad_kws): return False
+            if not (re.search(r'\d{4}', v) or re.search(r'\d{2,4}[\.\-\/년]\s*\d{1,2}', v)): return False
+            return True
+
+        if corr_after:
+            for k, v in corr_after.items():
+                if any(c in k for c in cand_clean):
+                    if is_clean_date(v): return str(v).strip()
+
+        for df in dfs:
+            arr = df.astype(str).values
+            R, C = arr.shape
+            for r in range(R):
+                row_vals = [str(x).strip() for x in arr[r].tolist() if str(x).strip() and str(x).strip().lower() != "nan"]
+                if any(_clean_label(x) in cand_clean for x in row_vals):
+                    possible_dates = []
+                    for v in row_vals:
+                        if _clean_label(v) in cand_clean: continue
+                        if re.fullmatch(r"([①-⑩]|\(\d+\)|\d+\.)", _norm(v)): continue
+                        if is_clean_date(v): possible_dates.append(v)
+                    if possible_dates: return possible_dates[-1] 
+                        
+        val = scan_label_value(dfs, labels)
+        if is_clean_date(val):
+            return val
+        return ""
+
+    rec["이사회결의일"] = get_valid_date(["이사회결의일(결정일)", "이사회결의일", "결정일"])
+    rec["최초 이사회결의일"] = get_valid_date(["최초 이사회결의일", "최초이사회결의일"]) or rec["이사회결의일"]
+    rec["납입일"] = get_valid_date(["납입일", "납입기일", "청약기일 및 납입일", "신주의 납입기일", "신주납입기일"])
+    rec["신주의 배당기산일"] = get_valid_date(["신주의 배당기산일", "배당기산일"])
+    rec["신주의 상장 예정일"] = get_valid_date(["신주의 상장 예정일", "상장예정일", "신주 상장예정일", "상장 예정일", "신주상장예정일"])
 
     rec["증자방식"] = scan_label_value_preferring_correction(dfs, ["증자방식", "발행방법", "배정방식"], corr_after)
-    rec["발행상품"] = extract_stock_type(dfs, corr_after)
-    
-    # [핵심 개선] 신규주식수/가격 추출 시 구역(Section) 가두기 스캔 적용
-    issue_shares = get_number_super_strictly(dfs, corr_after, 
-        target_kws=["신주의종류와수", "발행예정주식수"], 
-        avoid_kws=["증자전", "기발행", "기준", "할인", "액면"]
-    )
-    if issue_shares: rec["신규발행주식수"] = f"{issue_shares:,}"
 
-    prev_shares = get_number_super_strictly(dfs, corr_after, 
-        target_kws=["증자전발행주식총수", "기발행주식총수", "발행주식총수", "증자전주식수"], 
-        avoid_kws=["신주의종류", "발행예정주식", "액면가"]
-    )
+    issue_shares, stock_type = extract_issue_shares_and_type(dfs, corr_after)
+    if issue_shares:
+        rec["신규발행주식수"] = f"{issue_shares:,}"
+        rec["발행상품"] = stock_type
+
+    def get_corr_num(labels, min_val=0, as_float=False):
+        if not corr_after: return None
+        cand_clean = {_clean_label(x) for x in labels}
+        for k, v in corr_after.items():
+            if any(c in k for c in cand_clean):
+                if as_float: return _to_float(v)
+                else: 
+                    amt = _max_int_in_text(v)
+                    if amt is not None and amt > min_val: return amt
+        return None
+
+    prev_shares = get_corr_num(["증자전발행주식총수", "기발행주식총수", "발행주식총수", "증자전 주식수", "증자전발행주식총수(보통주식)"])
+    if not prev_shares:
+        prev_shares = _max_int_in_text(scan_label_value(dfs, ["증자전발행주식총수", "기발행주식총수", "발행주식총수", "증자전 주식수", "증자전발행주식총수(보통주식)"]))
+    if not prev_shares:
+        prev_shares = find_row_best_int(dfs, ["증자전발행주식총수", "보통주식"]) or find_row_best_int(dfs, ["발행주식총수", "보통주식"])
+
     if prev_shares: rec["증자전 주식수"] = f"{prev_shares:,}"
 
-    price = get_number_super_strictly(dfs, corr_after, 
-        target_kws=["신주발행가액", "예정발행가", "확정발행가", "발행가액", "1주당발행가"], 
-        avoid_kws=["일", "기일", "예정일", "액면가", "기준주가", "할인율"]
-    )
+    price = get_corr_num(["신주 발행가액", "신주발행가액", "예정발행가액", "확정발행가액", "발행가액", "1주당 확정발행가액"], min_val=50)
+    if not price:
+        price = _max_int_in_text(scan_label_value(dfs, ["신주 발행가액", "신주발행가액", "예정발행가액", "확정발행가액", "발행가액", "1주당 확정발행가액"]))
+        if price is not None and price <= 50: price = None
+    if not price:
+        price = find_row_best_int(dfs, ["신주발행가액", "보통주식"], min_val=50) or find_row_best_int(dfs, ["예정발행가액"], min_val=50) or find_row_best_int(dfs, ["발행가액", "원"], min_val=50)
+        
     if price: rec["확정발행가(원)"] = f"{price:,}"
 
-    base_price_val = scan_label_value_preferring_correction(dfs, ["기준주가", "기준발행가액"], corr_after)
-    base_price = extract_number_strictly(base_price_val, is_price_or_shares=True)
+    base_price = get_corr_num(["기준주가", "기준발행가액"], min_val=50)
+    if not base_price:
+        base_price = _max_int_in_text(scan_label_value(dfs, ["기준주가", "기준발행가액"]))
+        if base_price is not None and base_price <= 50: base_price = None
+    if not base_price:
+        base_price = find_row_best_int(dfs, ["기준주가", "보통주식"], min_val=50) or find_row_best_int(dfs, ["기준주가"], min_val=50)
     if base_price: rec["기준주가"] = f"{base_price:,}"
 
-    disc_str = scan_label_value_preferring_correction(dfs, ["할인율", "할증률", "할인율 또는 할증률", "할인(할증)율"], corr_after)
-    disc = _to_float(disc_str)
+    disc = get_corr_num(["할인율", "할증률", "할인율 또는 할증률", "할인(할증)율", "발행가액 산정시 할인율"], as_float=True)
+    if disc is None:
+        disc = _to_float(scan_label_value(dfs, ["할인율", "할증률", "할인율 또는 할증률", "할인(할증)율"]))
+    if disc is None:
+        disc = find_row_best_float(dfs, ["할인율또는할증율"]) or find_row_best_float(dfs, ["할인율"])
     if disc is not None: rec["할인(할증률)"] = f"{disc}"
 
     uses_text, total_fund_amt = extract_fund_use_and_amount(dfs, corr_after)
     rec["자금용도"] = uses_text
     rec["투자자"] = extract_investors(dfs, corr_after)
 
-    # 확정발행금액 보호 로직
-    sh = _to_int(rec.get("신규발행주식수")) or 0
-    pr = _to_int(rec.get("확정발행가(원)")) or 0
-    calc_amt = sh * pr
+    # [핵심 픽스] 확정발행금액 계산 무결성 우선순위 적용
+    sh = _to_int(rec["신규발행주식수"])
+    pr = _to_int(rec["확정발행가(원)"])
     
-    final_fund_amt = total_fund_amt
-    if final_fund_amt == 0 and calc_amt > 0 and calc_amt < 5000000000000: # 5조원 이상의 터무니없는 뻥튀기값 자동차단
-        final_fund_amt = calc_amt
+    if sh and pr: 
+        # 절대 1순위 공식: 신규발행주식수 * 확정발행가액
+        rec["확정발행금액(억원)"] = f"{(sh * pr) / 100_000_000:,.2f}"
+    elif total_fund_amt > 0: 
+        # 주식수나 발행가가 빵꾸난 경우에만 자금용도표 합산값 사용
+        rec["확정발행금액(억원)"] = f"{total_fund_amt / 100_000_000:,.2f}"
 
-    if final_fund_amt > 0: 
-        rec["확정발행금액(억원)"] = f"{final_fund_amt / 100_000_000:,.2f}"
-
-    if sh > 0 and prev_shares and prev_shares > 0: 
-        rec["증자비율"] = f"{sh / prev_shares * 100:.2f}%"
+    pv = _to_int(rec["증자전 주식수"])
+    if sh and pv and pv > 0: rec["증자비율"] = f"{sh / pv * 100:.2f}%"
 
     return rec
 
@@ -683,6 +715,7 @@ def parse_rights_issue_record(dfs, t: Target, corr_after, html_raw, company_mark
 # ==========================================================
 def run():
     sh, rights_ws, seen_ws = gs_open()
+
     values = load_sheet_values(rights_ws, RIGHTS_COLUMNS)
     last_row_ref = [len(values)]
     rights_index, event_index = build_indices(values, RIGHTS_COLUMNS)
@@ -719,16 +752,36 @@ def run():
         link_val = get_val(row, "링크")
         investor_val = get_val(row, "투자자")
         comp_name = get_val(row, "회사명")
+        prev_shares = get_val(row, "증자전 주식수")
+        product_val = get_val(row, "발행상품")
         
-        # [자가치유 강력 트리거] 틀린 값이 있으면 무조건 다시 스캔하도록 강제 집행
+        div_date = get_val(row, "신주의 배당기산일")
+        list_date = get_val(row, "신주의 상장 예정일")
+        board_date = get_val(row, "이사회결의일")
+        
+        bad_date_kws = ["상장", "총수", "교부", "추가", "사항", "항목"]
+        date_needs_fix = (
+            any(k in div_date for k in bad_date_kws) or
+            any(k in list_date for k in bad_date_kws) or
+            any(k in board_date for k in bad_date_kws)
+        )
+        
+        bad_inv_kws = ["관계", "최대주주", "지분", "%", "정정", "주1", "합계", "소계", "출자자", "소재지", "명"]
+        investor_needs_fix = any(k in investor_val for k in bad_inv_kws) or bool(re.search(r'\d{4,}', investor_val))
+        
         needs_fix = (
             not link_val or 
             not fund or "(원)" in fund or
-            not price or price in ["2,024", "2,025", "2,026", "2,027"] or 
-            not fund_amt or float(fund_amt.replace(",", "") or 0) > 50000 or 
+            not price or (price.replace(",","").isdigit() and int(price.replace(",","")) <= 50) or 
+            not fund_amt or len(fund_amt.replace(",", "").replace(".", "")) >= 8 or 
             not market or
+            not re.search(r'\d', pay_date) or "정정" in pay_date or "변경" in pay_date or "요청" in pay_date or
             not first_date or
-            not comp_name or comp_name in ["상장 여부", "상장여부"]
+            investor_needs_fix or
+            date_needs_fix or  
+            not comp_name or comp_name in ["유", "코", "넥"] or
+            prev_shares == "3" or
+            not product_val 
         )
         
         if needs_fix and acpt not in targets_dict:
