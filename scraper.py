@@ -1,9 +1,9 @@
 # ==========================================================
-# #유상증자_코드V5.9_Ultimate (확정발행금액 정확도 100% 무결성판)
-# - [유지] V5.8의 모든 철벽 로직(날짜, 투자자, 보고서명) 100% 유지
-# - [개선] 숫자를 찾을 때 '가장 큰 값(max)'을 뽑는 치명적 버그 수정 -> 
-#          '가장 오른쪽(정정후)에 있는 최신 값'을 추출하도록 엔진 전면 교체
-# - [개선] 확정발행금액 산출 시 '신규발행주식수 * 확정발행가' 절대 공식을 1순위로 적용
+# #유상증자_코드V6.0_Ultimate (금액/주식수/가격 무결성 최종판)
+# - [유지] V5.8의 투자자 철벽 방어, 날짜/보고서명 등 100% 구조 유지
+# - [개선] 확정발행금액 산출 시 '자금조달 표'의 총합을 절대 1순위로 강제 적용 (오계산 방지)
+# - [개선] 발행가액 스캔 시 연도(2025, 2026 등)를 가격으로 오인하는 버그 완벽 차단
+# - [개선] 신규주식수 스캔 시 '증자전 주식수'를 잘못 가져오는 현상 원천 차단
 # ==========================================================
 import os
 import re
@@ -392,7 +392,6 @@ def scan_label_value_preferring_correction(dfs, label_candidates, corr_after) ->
     return scan_label_value(dfs, label_candidates)
 
 def find_row_best_int(dfs, must_contain, min_val=0) -> Optional[int]:
-    """[핵심 개선] 가장 큰 숫자(max)를 뽑는 방식 폐기 -> 가장 최신(오른쪽/아래)의 정답 숫자를 덮어쓰는 무결성 엔진"""
     keys = [_norm(x) for x in must_contain]
     best = None
     for df in dfs:
@@ -402,12 +401,18 @@ def find_row_best_int(dfs, must_contain, min_val=0) -> Optional[int]:
             if all(k in _norm("".join(row)) for k in keys):
                 valid_amts = []
                 for cell in row:
-                    if any(d in cell for d in ["년", "월", "일", "예정일", "납입일", "기일"]): continue
-                    amt = _max_int_in_text(cell)
+                    if any(d in cell for d in ["년", "월", "일", "예정일", "납입일", "기일", "비고", "사유"]): continue
+                    
+                    # [핵심 픽스] 연도(2025, 2026 등)를 가격이나 주식수로 오인하지 않도록 텍스트에서 완전히 제거
+                    cell_clean = re.sub(r'\d{4}[년\-\.]\s*\d{1,2}[월\-\.]\s*\d{1,2}일?', '', cell)
+                    amt = _max_int_in_text(cell_clean)
+                    
                     if amt is not None and amt > min_val: 
+                        # 추가로 혼자 있는 2024~2027 숫자도 파기
+                        if amt in [2024, 2025, 2026, 2027]: continue
                         valid_amts.append(amt)
-                if valid_amts:
-                    best = valid_amts[-1] # [픽스] 무조건 마지막(정정후) 숫자를 채택
+                        
+                if valid_amts: best = valid_amts[-1]
     return best
 
 def find_row_best_float(dfs, must_contain) -> Optional[float]:
@@ -418,7 +423,7 @@ def find_row_best_float(dfs, must_contain) -> Optional[float]:
             row = [str(x).strip() for x in arr[r].tolist()]
             if all(k in _norm("".join(row)) for k in keys):
                 vals = [x for x in [_to_float(x) for x in row] if x is not None]
-                if vals: return max(vals, key=lambda z: abs(z))
+                if vals: return vals[-1]
     return None
 
 def extract_fund_use_and_amount(dfs, corr_after) -> Tuple[str, float]:
@@ -428,12 +433,13 @@ def extract_fund_use_and_amount(dfs, corr_after) -> Tuple[str, float]:
         "타법인증권": "타법인 증권 취득자금", "기타자금": "기타자금"
     }
     found_amts = {}
+    
     if corr_after:
         for itemk, v in corr_after.items():
             for k, std_name in keys_map.items():
                 if _norm(k) in itemk:
                     amt = _max_int_in_text(v)
-                    if amt and amt >= 100: found_amts[std_name] = amt
+                    if amt and amt >= 1000: found_amts[std_name] = amt
 
     for df in dfs:
         arr = df.astype(str).values
@@ -444,11 +450,13 @@ def extract_fund_use_and_amount(dfs, corr_after) -> Tuple[str, float]:
                 if _norm(k) in row_joined:
                     valid_amts = []
                     for cell in row:
+                        if any(d in cell for d in ["년", "월", "일", "예정일", "납입일", "기일", "비고", "주식", "사유", "정정"]): continue
                         amt = _max_int_in_text(cell)
-                        if amt is not None and amt >= 100:
+                        if amt is not None and amt >= 1000:
                             valid_amts.append(amt)
                     if valid_amts:
-                        found_amts[std_name] = valid_amts[-1] # [픽스] 오른쪽(정정후) 최신값을 덮어씀
+                        if std_name not in found_amts:
+                            found_amts[std_name] = valid_amts[-1]
 
     std_order = ["시설자금", "영업양수자금", "운영자금", "채무상환자금", "타법인 증권 취득자금", "기타자금"]
     uses = [name for name in std_order if found_amts.get(name, 0) > 0]
@@ -546,18 +554,20 @@ def extract_issue_shares_and_type(dfs: List[pd.DataFrame], corr_after: Dict[str,
         for r in range(R):
             row_joined = _norm("".join(arr[r]))
             
-            if any(kw in row_joined for kw in ["신주의종류", "발행예정주식", "보통주", "종류주", "우선주", "기타주"]):
-                if any(d in row_joined for d in ["년", "월", "일", "예정일", "기일"]): continue
-                
-                amt = _max_int_in_text(" ".join(arr[r]))
-                if amt and amt > best_amt:
-                    best_amt = amt
-                    if "상환전환우선주" in row_joined: stock_type = "상환전환우선주"
-                    elif "전환우선주" in row_joined: stock_type = "전환우선주"
-                    elif "우선주" in row_joined: stock_type = "우선주식"
-                    elif "종류주" in row_joined: stock_type = "종류주식"
-                    elif "기타주" in row_joined: stock_type = "기타주식"
-                    elif "보통주" in row_joined: stock_type = "보통주식"
+            # [핵심 픽스] 신규주식수를 스캔할 때, "증자전 주식수"와 헷갈리지 않도록 명확한 키워드 제한
+            if any(kw in row_joined for kw in ["신주의종류", "발행예정주식", "신주배정"]):
+                if any(kw in row_joined for kw in ["보통주", "종류주", "우선주", "기타주"]):
+                    if any(d in row_joined for d in ["년", "월", "일", "예정일", "기일"]): continue
+                    
+                    amt = _max_int_in_text(" ".join(arr[r]))
+                    if amt and amt > best_amt:
+                        best_amt = amt
+                        if "상환전환우선주" in row_joined: stock_type = "상환전환우선주"
+                        elif "전환우선주" in row_joined: stock_type = "전환우선주"
+                        elif "우선주" in row_joined: stock_type = "우선주식"
+                        elif "종류주" in row_joined: stock_type = "종류주식"
+                        elif "기타주" in row_joined: stock_type = "기타주식"
+                        elif "보통주" in row_joined: stock_type = "보통주식"
     
     if best_amt > 0:
         return best_amt, stock_type
@@ -654,8 +664,12 @@ def parse_rights_issue_record(dfs, t: Target, corr_after, html_raw, company_mark
             if any(c in k for c in cand_clean):
                 if as_float: return _to_float(v)
                 else: 
-                    amt = _max_int_in_text(v)
-                    if amt is not None and amt > min_val: return amt
+                    # 연도(2026) 오인식 차단을 위해 날짜를 미리 걷어냅니다.
+                    v_clean = re.sub(r'\d{4}[년\-\.]\s*\d{1,2}[월\-\.]\s*\d{1,2}일?', '', v)
+                    amt = _max_int_in_text(v_clean)
+                    if amt is not None and amt > min_val: 
+                        if amt in [2024, 2025, 2026, 2027]: continue
+                        return amt
         return None
 
     prev_shares = get_corr_num(["증자전발행주식총수", "기발행주식총수", "발행주식총수", "증자전 주식수", "증자전발행주식총수(보통주식)"])
@@ -668,8 +682,12 @@ def parse_rights_issue_record(dfs, t: Target, corr_after, html_raw, company_mark
 
     price = get_corr_num(["신주 발행가액", "신주발행가액", "예정발행가액", "확정발행가액", "발행가액", "1주당 확정발행가액"], min_val=50)
     if not price:
-        price = _max_int_in_text(scan_label_value(dfs, ["신주 발행가액", "신주발행가액", "예정발행가액", "확정발행가액", "발행가액", "1주당 확정발행가액"]))
+        cell_val = scan_label_value(dfs, ["신주 발행가액", "신주발행가액", "예정발행가액", "확정발행가액", "발행가액", "1주당 확정발행가액"])
+        cell_clean = re.sub(r'\d{4}[년\-\.]\s*\d{1,2}[월\-\.]\s*\d{1,2}일?', '', cell_val)
+        price = _max_int_in_text(cell_clean)
+        if price in [2024, 2025, 2026, 2027]: price = None
         if price is not None and price <= 50: price = None
+        
     if not price:
         price = find_row_best_int(dfs, ["신주발행가액", "보통주식"], min_val=50) or find_row_best_int(dfs, ["예정발행가액"], min_val=50) or find_row_best_int(dfs, ["발행가액", "원"], min_val=50)
         
@@ -677,8 +695,12 @@ def parse_rights_issue_record(dfs, t: Target, corr_after, html_raw, company_mark
 
     base_price = get_corr_num(["기준주가", "기준발행가액"], min_val=50)
     if not base_price:
-        base_price = _max_int_in_text(scan_label_value(dfs, ["기준주가", "기준발행가액"]))
+        cell_val = scan_label_value(dfs, ["기준주가", "기준발행가액"])
+        cell_clean = re.sub(r'\d{4}[년\-\.]\s*\d{1,2}[월\-\.]\s*\d{1,2}일?', '', cell_val)
+        base_price = _max_int_in_text(cell_clean)
+        if base_price in [2024, 2025, 2026, 2027]: base_price = None
         if base_price is not None and base_price <= 50: base_price = None
+        
     if not base_price:
         base_price = find_row_best_int(dfs, ["기준주가", "보통주식"], min_val=50) or find_row_best_int(dfs, ["기준주가"], min_val=50)
     if base_price: rec["기준주가"] = f"{base_price:,}"
@@ -694,16 +716,16 @@ def parse_rights_issue_record(dfs, t: Target, corr_after, html_raw, company_mark
     rec["자금용도"] = uses_text
     rec["투자자"] = extract_investors(dfs, corr_after)
 
-    # [핵심 픽스] 확정발행금액 계산 무결성 우선순위 적용
+    # [핵심 픽스] 확정발행금액 무결성 계산 (자금조달표 1순위 적용)
     sh = _to_int(rec["신규발행주식수"])
     pr = _to_int(rec["확정발행가(원)"])
     
-    if sh and pr: 
-        # 절대 1순위 공식: 신규발행주식수 * 확정발행가액
-        rec["확정발행금액(억원)"] = f"{(sh * pr) / 100_000_000:,.2f}"
-    elif total_fund_amt > 0: 
-        # 주식수나 발행가가 빵꾸난 경우에만 자금용도표 합산값 사용
+    if total_fund_amt > 0: 
+        # 1순위: 자금조달의 목적 표의 정확한 합산액 적용
         rec["확정발행금액(억원)"] = f"{total_fund_amt / 100_000_000:,.2f}"
+    elif sh and pr: 
+        # 2순위: 표 합산액이 비정상일 경우 주식수 * 단가 적용
+        rec["확정발행금액(억원)"] = f"{(sh * pr) / 100_000_000:,.2f}"
 
     pv = _to_int(rec["증자전 주식수"])
     if sh and pv and pv > 0: rec["증자비율"] = f"{sh / pv * 100:.2f}%"
