@@ -27,7 +27,7 @@ BASE = "https://kind.krx.co.kr"
 DEFAULT_RSS = "http://kind.krx.co.kr:80/disclosure/rsstodaydistribute.do?method=searchRssTodayDistribute&mktTpCd=0&currentPageSize=100"
 RSS_URL = os.getenv("RSS_URL", DEFAULT_RSS)
 
-TARGET_KWS = "전환사채권발행결정,교환사채권발행결정,신주인수권부사채권발행결정"
+TARGET_KWS = "전환사채권발행결정,전환사채매도결정,교환사채권발행결정,신주인수권부사채권발행결정"
 KEYWORDS = [x.strip() for x in os.getenv("KEYWORDS", TARGET_KWS).split(",") if x.strip()]
 
 HEADLESS = os.getenv("HEADLESS", "true").lower() == "true"
