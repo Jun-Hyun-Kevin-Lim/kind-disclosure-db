@@ -1,9 +1,10 @@
 # ==========================================================
-# #유상증자_코드V5.9_Ultimate (확정발행금액 정확도 100% 무결성판)
+# #유상증자_코드V5.9_Ultimate (확정발행금액 정확도 100% 무결성판 + 회사명 필터링 개선)
 # - [유지] V5.8의 모든 철벽 로직(날짜, 투자자, 보고서명) 100% 유지
 # - [개선] 숫자를 찾을 때 '가장 큰 값(max)'을 뽑는 치명적 버그 수정 -> 
 #          '가장 오른쪽(정정후)에 있는 최신 값'을 추출하도록 엔진 전면 교체
 # - [개선] 확정발행금액 산출 시 '신규발행주식수 * 확정발행가' 절대 공식을 1순위로 적용
+# - [개선] 회사명 파싱 시 '상장 여부', '해당사항' 등의 오인출 텍스트 강제 필터링 추가
 # ==========================================================
 import os
 import re
@@ -577,10 +578,19 @@ def parse_rights_issue_record(dfs, t: Target, corr_after, html_raw, company_mark
     
     comp_cands = ["회사명", "회사 명", "발행회사", "발행회사명", "법인명", "종속회사명"]
     table_comp = scan_label_value_preferring_correction(dfs, comp_cands, corr_after)
-    if table_comp and (re.search(r'[A-Za-z]', table_comp) or len(table_comp) > 15):
-        table_comp = ""
     
+    # [버그 수정] 테이블 파서가 '상장 여부', '해당사항' 등의 주변 텍스트를 오인출한 경우 강제 필터링
+    if table_comp:
+        table_comp_clean = table_comp.replace(" ", "")
+        bad_kws = ["상장여부", "여부", "해당사항", "해당없음", "본점", "소재지"]
+        
+        if len(table_comp) > 20 or any(k in table_comp_clean for k in bad_kws) or table_comp in ("-", "."):
+            table_comp = ""
+        elif re.search(r'[A-Za-z]', table_comp) and len(table_comp) > 15:
+            table_comp = ""
+            
     rec["회사명"] = table_comp or company_from_title(title_clean) or title_clean
+    
     if not rec["회사명"] or rec["회사명"] in ["유", "코", "넥"]:
         rec["회사명"] = title_clean
     
