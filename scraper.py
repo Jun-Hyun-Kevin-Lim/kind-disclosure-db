@@ -5,6 +5,7 @@
 #          '가장 오른쪽(정정후)에 있는 최신 값'을 추출하도록 엔진 전면 교체
 # - [개선] 확정발행금액 산출 시 '신규발행주식수 * 확정발행가' 절대 공식을 1순위로 적용
 # - [추가] "유상증자결정"이 포함된 보고서만 엄격하게 수집/처리하도록 필터링 강화
+# - [개선] 회사명(종속회사 포함) 파싱 로직 고도화 및 길이 제한 완화, 불순물 완벽 제거
 # ==========================================================
 import os
 import re
@@ -147,7 +148,6 @@ def viewer_url(acpt_no: str, docno: str = "") -> str:
 def match_keyword(title: str) -> bool:
     if not title: return False
     title_clean = title.replace(" ", "")
-    # [강제 필터링] 보고서명에 "유상증자결정"이 무조건 포함되어야 함
     return "유상증자결정" in title_clean
 
 def is_correction_title(title: str) -> bool:
@@ -578,12 +578,26 @@ def parse_rights_issue_record(dfs, t: Target, corr_after, html_raw, company_mark
     title_clean = t.title.replace("[자동복구대상]", "").strip()
     rec["보고서명"] = title_clean
     
-    comp_cands = ["회사명", "회사 명", "발행회사", "발행회사명", "법인명", "종속회사명"]
+    # [핵심 개선] 종속회사명까지 완벽히 잡아내도록 탐색 풀 확대
+    comp_cands = ["회사명", "회사 명", "발행회사", "발행회사명", "법인명", "종속회사명", "종속회사", "종속회사인"]
     table_comp = scan_label_value_preferring_correction(dfs, comp_cands, corr_after)
-    if table_comp and (re.search(r'[A-Za-z]', table_comp) or len(table_comp) > 15):
-        table_comp = ""
     
+    if table_comp:
+        # [핵심 개선] 첫 줄만 남겨 각주 및 쓰레기 문자열 사전 차단
+        table_comp = table_comp.split('\n')[0].strip()
+        table_comp_clean = table_comp.replace(" ", "")
+        
+        # [핵심 개선] '신고', '경영사항' 등을 추가해 종속회사명 옆에 적힌 잡다한 텍스트 배제
+        bad_kws = ["상장여부", "여부", "해당사항", "해당없음", "본점", "소재지", "신고", "경영사항", "결정"]
+        
+        # [핵심 개선] 아주 긴 글로벌/자회사명('씨엑스아이헬스케어테크놀리지그룹리미티드' 등)이 짤리지 않게 40자로 길이 제한 대폭 완화
+        if len(table_comp) > 40 or any(k in table_comp_clean for k in bad_kws) or table_comp in ("-", "."):
+            table_comp = ""
+        elif re.search(r'[A-Za-z]', table_comp) and len(table_comp) > 30:
+            table_comp = ""
+            
     rec["회사명"] = table_comp or company_from_title(title_clean) or title_clean
+    
     if not rec["회사명"] or rec["회사명"] in ["유", "코", "넥"]:
         rec["회사명"] = title_clean
     
