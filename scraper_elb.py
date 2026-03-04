@@ -1,9 +1,9 @@
 # ==========================================================
-# #주식연계채권_코드V11.2_Clean_Master (발행상품 & 납입일 100% 정제판)
-# 1. [집중개선] 발행상품: 텍스트 중복을 막기 위해 1차 절단, 쓰레기 문장 방지를 위해 2차 필터(길이제한) 도입
-# 2. [집중개선] 납입일: '청약일'을 오인하여 잘못된 날짜를 가져오던 버그 완벽 픽스 (오직 납입일만 추적)
-# 3. [유지] V11.1의 독립된 정정표 역방향 스캔(Reverse), 전환청구기간 상하 병합셀 타격 로직 유지
-# 4. [유지] Call 비율 / YTC 문맥 정밀 추출, Put/Call 옵션 본문 절단기 100% 보존
+# #주식연계채권_코드V11.3_Date_Master_Fixed (전환청구 종료일 누락 완벽 픽스판)
+# 1. [완벽수정] 전환청구기간: '시작일'과 '종료일'이 상하로 멀리 떨어져 있거나 병합되어 있어도 최대 5줄을 훑어 완벽히 캡처
+# 2. [유지] 발행상품: 1차 절단 및 2차 필터를 통한 쓰레기값 완전 배제 로직 100% 유지
+# 3. [유지] 납입일: '청약일' 오인 방지 및 정정 후 데이터(역방향 스캔) 최우선 타격 100% 유지
+# 4. [유지] Put/Call Option 본문 절단기, 자금용도 라벨 추출기, Call비율/YTC 정밀 스캐너 유지
 # ==========================================================
 import os
 import re
@@ -208,9 +208,7 @@ def scrape_one(context, acpt_no: str) -> Tuple[List[pd.DataFrame], str, str]:
     try:
         page.goto(url, wait_until="networkidle", timeout=60000)
         page.wait_for_timeout(1500) 
-        
         all_frames_html = page.content() + " " + " ".join([fr.content() for fr in page.frames])
-        
         best_html = pick_best_frame_html(page) or ""
         if best_html.count("<table") == 0: raise RuntimeError("table 못 찾음")
         return extract_tables_from_html_robust(best_html), url, all_frames_html
@@ -219,7 +217,7 @@ def scrape_one(context, acpt_no: str) -> Tuple[List[pd.DataFrame], str, str]:
         except: pass
 
 # ==========================================================
-# 4. 정정사항 엔진 및 역방향 스캔
+# 4. 정정사항 엔진 및 기본 스캔
 # ==========================================================
 def extract_correction_after_map(dfs: List[pd.DataFrame]) -> Dict[str, str]:
     out: Dict[str, str] = {}
@@ -312,39 +310,30 @@ def find_row_best_float(dfs, must_contain) -> Optional[float]:
     return None
 
 # ==========================================================
-# 5. 핵심 4대 컬럼 전용 추출기 (V11.2 핵심 개조)
+# 5. 핵심 4대 컬럼 전용 추출기
 # ==========================================================
 
-# 1) [V11.2 완벽수정] 발행상품 2중 절단 및 필터 (중복/쓰레기값 완전 배제)
 def extract_product_type(dfs: List[pd.DataFrame], corr_after: Dict) -> str:
     labels = ["1. 사채의 종류", "1.사채의종류", "사채의 종류", "사체의 종류", "사태의 종류", "사케의 종류", "사채종류", "종류"]
     
     def clean_product(text: str) -> str:
         if not text: return ""
-        # 1차 노이즈 제거
         t = re.sub(r'\s+', ' ', text).strip()
         t = re.sub(r'(?:1\.\s*)?(?:사채|사체|사태|사케)의\s*종류', '', t)
         t = re.sub(r'\b종류\b', '', t) 
         t = t.replace('발행결정', '').strip()
         
-        # 1차 절단: 첫 번째 등장하는 "사채" 명칭에서 문장을 칼같이 잘라냄 (중복 및 뒤섞인 텍스트 방지)
         match = re.search(r'(전환사채|교환사채|신주인수권부사채|사채)', t)
         if not match: return "" 
-        t = t[:match.end()].strip() # 여기서 자름으로써 뒤에 반복되는 문장 제거 완료
+        t = t[:match.end()].strip() 
         
-        # 2차 정밀 추출 및 필터: 잘라낸 문장에서 수식어가 온전히 붙어있는 덩어리만 캡처
         pattern = r'((?:제\s*\d+\s*회차?|회차\s*\d+|제?\d+회차?)?\s*(?:제\s*\d+\s*회차?)?\s*(?:(?:무기명식?|기명식?|이권부|무이권부|보증|무보증|사모|공모|비분리형?|분리형?)\s*)+(?:전환사채|교환사채|신주인수권부사채|사채))'
         m2 = re.search(pattern, t)
         
         if m2:
             res = m2.group(1).strip()
-            # DART 포맷팅 (회차 5 -> 제5회차)
             res = re.sub(r'^회차\s*(\d+)', r'제\1회차', res)
-            
-            # 쓰레기 문장이 매칭된 경우 방지 (정상적인 상품명 길이는 4~40자 이내)
-            if 3 < len(res) < 40: 
-                return _single_line(res)
-                
+            if 3 < len(res) < 40: return _single_line(res)
         return ""
 
     if corr_after:
@@ -425,7 +414,6 @@ def extract_option_details(dfs: List[pd.DataFrame], html_raw: str, option_type: 
                 cell_norm = _norm(arr[r][c]).lower()
                 if any(_norm(kw).lower() in cell_norm for kw in kws):
                     self_text = str(arr[r][c]).strip()
-                    
                     idx = -1
                     for kw in kws:
                         idx = self_text.lower().find(kw.lower())
@@ -455,7 +443,6 @@ def extract_option_details(dfs: List[pd.DataFrame], html_raw: str, option_type: 
             for match in re.finditer(stop, best_table_text, re.IGNORECASE):
                 if match.start() > 15 and match.start() < best_idx:
                     best_idx = match.start()
-                    
         return _single_line(best_table_text[:best_idx])
 
     soup = BeautifulSoup(html_raw, 'lxml')
@@ -478,7 +465,6 @@ def extract_option_details(dfs: List[pd.DataFrame], html_raw: str, option_type: 
         m = re.search(stop_pattern, snippet[30:], re.IGNORECASE)
         if m: snippet = snippet[:30+m.start()]
         return _single_line(snippet)
-        
     return ""
 
 def extract_call_ratio_and_ytc(call_text: str, html_raw: str) -> Tuple[str, str]:
@@ -545,6 +531,7 @@ def extract_call_ratio_and_ytc(call_text: str, html_raw: str) -> Tuple[str, str]
 
     return ratio, ytc
 
+# [V11.3 핵심수정] 전환청구기간(날짜) 위아래 병합셀 완벽 타격기 (종료일 누락 픽스)
 def extract_period_dates(dfs, corr_after, period_kws) -> Tuple[str, str]:
     s_date, e_date = "", ""
     for df in reversed(dfs): # 역방향 스캔
@@ -554,6 +541,7 @@ def extract_period_dates(dfs, corr_after, period_kws) -> Tuple[str, str]:
             row_str = _norm("".join(arr[r]))
             if any(p in row_str for p in period_kws) or "시작일" in row_str or "종료일" in row_str:
                 dates = re.findall(r'\d{4}[-년\.\s]+\d{1,2}[-월\.\s]+\d{1,2}', " ".join(arr[r]))
+                
                 if len(dates) >= 2:
                     return _format_date(dates[0]), _format_date(dates[-1])
                 elif len(dates) == 1:
@@ -561,12 +549,28 @@ def extract_period_dates(dfs, corr_after, period_kws) -> Tuple[str, str]:
                     elif "종료" in row_str and not e_date: e_date = _format_date(dates[0])
                     elif not s_date: s_date = _format_date(dates[0])
                     
-                    if not e_date:
-                        for rr in range(r, min(R, r + 3)):
-                            rr_dates = re.findall(r'\d{4}[-년\.\s]+\d{1,2}[-월\.\s]+\d{1,2}', " ".join(arr[rr]))
-                            if rr_dates and _format_date(rr_dates[-1]) != s_date:
+                # [핵심] 시작일과 종료일이 위아래로 떨어져 있는 경우 최대 5줄을 스캔하여 완벽히 캡처
+                if not s_date or not e_date:
+                    for rr in range(r, min(R, r + 5)):
+                        rr_str = _norm("".join(arr[rr]))
+                        rr_dates = re.findall(r'\d{4}[-년\.\s]+\d{1,2}[-월\.\s]+\d{1,2}', " ".join(arr[rr]))
+                        
+                        if rr_dates:
+                            if "시작" in rr_str and not s_date:
+                                s_date = _format_date(rr_dates[0])
+                            elif "종료" in rr_str and not e_date:
                                 e_date = _format_date(rr_dates[-1])
-                                break
+                            else:
+                                # 라벨(시작/종료) 없이 날짜만 달랑 있는 경우도 포획
+                                for d in rr_dates:
+                                    fd = _format_date(d)
+                                    if not s_date:
+                                        s_date = fd
+                                    elif not e_date and fd != s_date:
+                                        e_date = fd
+                                        break
+                        if s_date and e_date:
+                            break
                         
         if s_date and e_date: return s_date, e_date
     return s_date, e_date
@@ -624,8 +628,6 @@ def parse_bond_record(dfs, t: Target, corr_after, html_raw, company_market_map) 
     if rec["상장시장"]: company_market_map[norm_company_name(rec["회사명"])] = rec["상장시장"]
 
     rec["최초 이사회결의일"] = _format_date(scan_label_value_preferring_correction(dfs, ["이사회결의일(결정일)", "이사회결의일", "최초이사회결의일"], corr_after))
-    
-    # [V11.2 핵심수정] 납입일 후보군에서 '청약일' 완전히 제거하여 잘못된 날짜 추출 원천 차단
     rec["납입일"] = _format_date(scan_label_value_preferring_correction(dfs, ["사채납입기일", "납입기일", "납입일"], corr_after))
     rec["만기"] = _format_date(scan_label_value_preferring_correction(dfs, ["사채만기일", "만기일", "상환기일"], corr_after))
     
@@ -657,6 +659,7 @@ def parse_bond_record(dfs, t: Target, corr_after, html_raw, company_market_map) 
     rec["주식총수대비 비율"] = scan_label_value_preferring_correction(dfs, ["주식총수 대비 비율(%)", "총수 대비 비율"], corr_after)
     rec["Refixing Floor"] = get_corr_num(["최저 조정가액 (원)", "최저조정가액", "리픽싱하한"], ["최저조정가액", "원"], 50)
 
+    # [호출] V11.3 날짜(시작일/종료일) 완벽 매칭 엔진
     s_date, e_date = extract_period_dates(dfs, corr_after, ["전환청구기간", "교환청구기간", "권리행사기간"])
     rec["전환청구 시작"], rec["전환청구 종료"] = s_date, e_date
 
@@ -732,6 +735,7 @@ def run():
 
     targets_dict = {t.acpt_no: t for t in parse_rss_targets()}
 
+    # [복구 시스템] 빈칸/오류 감지 시 강제 재파싱
     for row in values[1:]:
         acpt = row[BOND_COLUMNS.index("접수번호")] if len(row) > BOND_COLUMNS.index("접수번호") else ""
         if not acpt.isdigit(): continue
