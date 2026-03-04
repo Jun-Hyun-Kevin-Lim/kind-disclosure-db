@@ -1,9 +1,9 @@
 # ==========================================================
-# #주식연계채권_코드V11.0_Reverse_Scan_Master (독립된 정정표 완벽 타격판)
-# 1. [대규모업데이트] 역방향 스캔(Reverse Scanning): 표를 아래서부터 위로 스캔하여 문서 하단의 '정정 후' 독립 표를 1순위로 추출
-# 2. [완벽수정] 숫자 4대 컬럼(행사가액, 주식수, 비율, 리픽싱)이 코아스처럼 독립된 표에 있어도 완벽하게 덮어쓰기 적용
-# 3. [유지] Call 비율 / YTC 문맥 정밀 추출 엔진
-# 4. [유지] 발행상품: '제O회차' 포맷 유지, 자금용도 라벨 추출 및 옵션 본문 절단기 100% 보존
+# #주식연계채권_코드V11.2_Clean_Master (발행상품 & 납입일 100% 정제판)
+# 1. [집중개선] 발행상품: 텍스트 중복을 막기 위해 1차 절단, 쓰레기 문장 방지를 위해 2차 필터(길이제한) 도입
+# 2. [집중개선] 납입일: '청약일'을 오인하여 잘못된 날짜를 가져오던 버그 완벽 픽스 (오직 납입일만 추적)
+# 3. [유지] V11.1의 독립된 정정표 역방향 스캔(Reverse), 전환청구기간 상하 병합셀 타격 로직 유지
+# 4. [유지] Call 비율 / YTC 문맥 정밀 추출, Put/Call 옵션 본문 절단기 100% 보존
 # ==========================================================
 import os
 import re
@@ -219,7 +219,7 @@ def scrape_one(context, acpt_no: str) -> Tuple[List[pd.DataFrame], str, str]:
         except: pass
 
 # ==========================================================
-# 4. 정정사항 엔진 및 [핵심] 역방향 스캔(Reverse)
+# 4. 정정사항 엔진 및 역방향 스캔
 # ==========================================================
 def extract_correction_after_map(dfs: List[pd.DataFrame]) -> Dict[str, str]:
     out: Dict[str, str] = {}
@@ -264,8 +264,7 @@ def scan_label_value_preferring_correction(dfs, label_candidates, corr_after) ->
         for k, v in corr_after.items():
             if str(v).strip() and any(c in k for c in cand_clean): return _single_line(str(v))
             
-    # [핵심 변경] 역방향 스캔: 문서 맨 밑(정정 후 테이블)부터 위로 올라가며 검색
-    for df in reversed(dfs):
+    for df in reversed(dfs): # 역방향 스캔
         arr = df.astype(str).values
         R, C = arr.shape
         for r in range(R):
@@ -283,8 +282,7 @@ def scan_label_value_preferring_correction(dfs, label_candidates, corr_after) ->
 
 def find_row_best_int(dfs, must_contain, min_val=-1) -> Optional[int]:
     keys = [_norm(x) for x in must_contain]
-    # [핵심 변경] 역방향 스캔: 문서 맨 밑의 최신 표부터 검색 후 발견 즉시 종료
-    for df in reversed(dfs):
+    for df in reversed(dfs): # 역방향 스캔
         arr = df.astype(str).values
         best_in_df = None
         for r in range(arr.shape[0]):
@@ -301,8 +299,7 @@ def find_row_best_int(dfs, must_contain, min_val=-1) -> Optional[int]:
 
 def find_row_best_float(dfs, must_contain) -> Optional[float]:
     keys = [_norm(x) for x in must_contain]
-    # [핵심 변경] 역방향 스캔
-    for df in reversed(dfs):
+    for df in reversed(dfs): # 역방향 스캔
         arr = df.astype(str).values
         best_in_df = None
         for r in range(arr.shape[0]):
@@ -315,35 +312,51 @@ def find_row_best_float(dfs, must_contain) -> Optional[float]:
     return None
 
 # ==========================================================
-# 5. 핵심 4대 컬럼 전용 추출기 (역방향 스캔 반영)
+# 5. 핵심 4대 컬럼 전용 추출기 (V11.2 핵심 개조)
 # ==========================================================
 
+# 1) [V11.2 완벽수정] 발행상품 2중 절단 및 필터 (중복/쓰레기값 완전 배제)
 def extract_product_type(dfs: List[pd.DataFrame], corr_after: Dict) -> str:
     labels = ["1. 사채의 종류", "1.사채의종류", "사채의 종류", "사체의 종류", "사태의 종류", "사케의 종류", "사채종류", "종류"]
+    
     def clean_product(text: str) -> str:
         if not text: return ""
+        # 1차 노이즈 제거
         t = re.sub(r'\s+', ' ', text).strip()
         t = re.sub(r'(?:1\.\s*)?(?:사채|사체|사태|사케)의\s*종류', '', t)
-        t = re.sub(r'^\s*종류\s*|\s*종류\s*$', '', t)
+        t = re.sub(r'\b종류\b', '', t) 
         t = t.replace('발행결정', '').strip()
-        pattern = r'((?:제\s*\d+\s*회차?|회차\s*\d+|제?\d+회차?)?\s*(?:제\s*\d+\s*회차?)?\s*(?:(?:무기명식|기명식|무기명|기명|이권부|무이권부|보증|무보증|사모|공모|비분리형|분리형|비분리|분리)\s*)*(?:전환사채|교환사채|신주인수권부사채|사채))'
-        m = re.search(pattern, t)
-        if m:
-            res = m.group(1).strip()
+        
+        # 1차 절단: 첫 번째 등장하는 "사채" 명칭에서 문장을 칼같이 잘라냄 (중복 및 뒤섞인 텍스트 방지)
+        match = re.search(r'(전환사채|교환사채|신주인수권부사채|사채)', t)
+        if not match: return "" 
+        t = t[:match.end()].strip() # 여기서 자름으로써 뒤에 반복되는 문장 제거 완료
+        
+        # 2차 정밀 추출 및 필터: 잘라낸 문장에서 수식어가 온전히 붙어있는 덩어리만 캡처
+        pattern = r'((?:제\s*\d+\s*회차?|회차\s*\d+|제?\d+회차?)?\s*(?:제\s*\d+\s*회차?)?\s*(?:(?:무기명식?|기명식?|이권부|무이권부|보증|무보증|사모|공모|비분리형?|분리형?)\s*)+(?:전환사채|교환사채|신주인수권부사채|사채))'
+        m2 = re.search(pattern, t)
+        
+        if m2:
+            res = m2.group(1).strip()
+            # DART 포맷팅 (회차 5 -> 제5회차)
             res = re.sub(r'^회차\s*(\d+)', r'제\1회차', res)
-            if len(res) > 3: return _single_line(res)
-        return _single_line(t)
+            
+            # 쓰레기 문장이 매칭된 경우 방지 (정상적인 상품명 길이는 4~40자 이내)
+            if 3 < len(res) < 40: 
+                return _single_line(res)
+                
+        return ""
 
     if corr_after:
         for k, v in corr_after.items():
             if any(_norm(lb) in _norm(k) for lb in labels):
                 cleaned = clean_product(v)
-                if cleaned and "사채" in cleaned: return cleaned
+                if cleaned: return cleaned
 
     val = scan_label_value_preferring_correction(dfs, labels, {})
-    if val and "사채" in val:
+    if val:
         cleaned = clean_product(val)
-        if cleaned and "사채" in cleaned: return cleaned
+        if cleaned: return cleaned
         
     for df in reversed(dfs): # 역방향 스캔
         arr = df.astype(str).values
@@ -351,13 +364,12 @@ def extract_product_type(dfs: List[pd.DataFrame], corr_after: Dict) -> str:
             row_str = " ".join([str(x) for x in arr[r] if str(x).lower() != 'nan'])
             if "사채" in row_str and any(kw in row_str for kw in ["무기명", "사모", "공모", "보증", "이권부"]):
                 cleaned = clean_product(row_str)
-                if cleaned and "사채" in cleaned: return cleaned
+                if cleaned: return cleaned
     return ""
 
 def extract_fund_usage(dfs: List[pd.DataFrame], corr_after: Dict) -> str:
     target_keys = ["시설자금", "영업양수자금", "운영자금", "채무상환자금", "타법인 증권 취득자금", "타법인증권취득자금", "기타자금"]
-    
-    for df in reversed(dfs): # 역방향 스캔
+    for df in reversed(dfs): 
         found_funds = {}
         arr = df.astype(str).values
         R, C = arr.shape
@@ -405,7 +417,7 @@ def extract_option_details(dfs: List[pd.DataFrame], html_raw: str, option_type: 
                 return _single_line(v)
                 
     best_table_text = ""
-    for df in reversed(dfs): # 역방향 스캔
+    for df in reversed(dfs):
         arr = df.astype(str).values
         R, C = arr.shape
         for r in range(R):
@@ -537,14 +549,25 @@ def extract_period_dates(dfs, corr_after, period_kws) -> Tuple[str, str]:
     s_date, e_date = "", ""
     for df in reversed(dfs): # 역방향 스캔
         arr = df.astype(str).values
-        for r in range(arr.shape[0]):
+        R, C = arr.shape
+        for r in range(R):
             row_str = _norm("".join(arr[r]))
             if any(p in row_str for p in period_kws) or "시작일" in row_str or "종료일" in row_str:
                 dates = re.findall(r'\d{4}[-년\.\s]+\d{1,2}[-월\.\s]+\d{1,2}', " ".join(arr[r]))
-                if "시작" in row_str and not s_date and dates: s_date = _format_date(dates[0])
-                elif "종료" in row_str and not e_date and dates: e_date = _format_date(dates[-1])
-                elif len(dates) >= 2:
+                if len(dates) >= 2:
                     return _format_date(dates[0]), _format_date(dates[-1])
+                elif len(dates) == 1:
+                    if "시작" in row_str and not s_date: s_date = _format_date(dates[0])
+                    elif "종료" in row_str and not e_date: e_date = _format_date(dates[0])
+                    elif not s_date: s_date = _format_date(dates[0])
+                    
+                    if not e_date:
+                        for rr in range(r, min(R, r + 3)):
+                            rr_dates = re.findall(r'\d{4}[-년\.\s]+\d{1,2}[-월\.\s]+\d{1,2}', " ".join(arr[rr]))
+                            if rr_dates and _format_date(rr_dates[-1]) != s_date:
+                                e_date = _format_date(rr_dates[-1])
+                                break
+                        
         if s_date and e_date: return s_date, e_date
     return s_date, e_date
 
@@ -564,7 +587,7 @@ def extract_investors(dfs: List[pd.DataFrame], corr_after: Dict[str, str]) -> st
             if is_valid(chunk) and chunk.strip() not in investors: investors.append(chunk.strip())
             
     if not investors:
-        for df in reversed(dfs): # 역방향 스캔
+        for df in reversed(dfs):
             if any(kw in _norm(df.to_string()) for kw in ["발행대상자명", "대상자명"]):
                 arr = df.astype(str).values
                 for r in range(1, arr.shape[0]):
@@ -601,7 +624,9 @@ def parse_bond_record(dfs, t: Target, corr_after, html_raw, company_market_map) 
     if rec["상장시장"]: company_market_map[norm_company_name(rec["회사명"])] = rec["상장시장"]
 
     rec["최초 이사회결의일"] = _format_date(scan_label_value_preferring_correction(dfs, ["이사회결의일(결정일)", "이사회결의일", "최초이사회결의일"], corr_after))
-    rec["납입일"] = _format_date(scan_label_value_preferring_correction(dfs, ["납입일", "납입기일", "청약일"], corr_after))
+    
+    # [V11.2 핵심수정] 납입일 후보군에서 '청약일' 완전히 제거하여 잘못된 날짜 추출 원천 차단
+    rec["납입일"] = _format_date(scan_label_value_preferring_correction(dfs, ["사채납입기일", "납입기일", "납입일"], corr_after))
     rec["만기"] = _format_date(scan_label_value_preferring_correction(dfs, ["사채만기일", "만기일", "상환기일"], corr_after))
     
     rec["모집방식"] = scan_label_value_preferring_correction(dfs, ["사채발행방법", "모집방법", "발행방법"], corr_after)
@@ -627,7 +652,6 @@ def parse_bond_record(dfs, t: Target, corr_after, html_raw, company_market_map) 
     rec["Coupon"] = get_corr_num(["표면이자율(%)", "표면이자율", "표면금리"], ["표면이자율"], -1, True)
     rec["YTM"] = get_corr_num(["만기이자율(%)", "만기이자율", "만기보장수익률"], ["만기이자율"], -1, True)
     
-    # [V11.0 핵심] 정정후 데이터 최우선 타격 4대장
     rec["행사(전환)가액(원)"] = get_corr_num(["전환가액(원/주)", "교환가액(원/주)", "행사가액(원/주)", "전환가액", "교환가액", "행사가액"], ["가액", "원"], 50)
     rec["전환주식수"] = get_corr_num(["전환에 따라 발행할 주식수", "교환대상 주식수", "주식수"], ["주식수"], 50)
     rec["주식총수대비 비율"] = scan_label_value_preferring_correction(dfs, ["주식총수 대비 비율(%)", "총수 대비 비율"], corr_after)
@@ -708,7 +732,6 @@ def run():
 
     targets_dict = {t.acpt_no: t for t in parse_rss_targets()}
 
-    # [복구 시스템] 빈칸/오류 감지 시 강제 재파싱
     for row in values[1:]:
         acpt = row[BOND_COLUMNS.index("접수번호")] if len(row) > BOND_COLUMNS.index("접수번호") else ""
         if not acpt.isdigit(): continue
