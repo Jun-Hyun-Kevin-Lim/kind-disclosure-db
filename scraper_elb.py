@@ -1,9 +1,9 @@
 # ==========================================================
-# #주식연계채권_코드V11.6_Period_Master_Final (전환청구 종료일 완벽 픽스판)
-# 1. [집중개선] 전환청구기간: '시작일', '종료일' 라벨을 명시적으로 추적하여 중간에 함정 문장(날짜 1개짜리 문장)이 섞여있어도 무시하고 진짜 종료일 완벽 캡처
+# #주식연계채권_코드V11.7_Period_Block_Master (전환청구기간 블록 캡처판)
+# 1. [완벽개조] 전환청구기간: 라벨 위치에 의존하지 않고 6줄을 통째로 묶어 무조건 첫 번째/두 번째 날짜를 강제 캡처 (오류 원천 차단)
 # 2. [유지] 발행상품: '전환사채' 등으로 끝나는 덩어리만 캡처 후 1차 절단 (쓰레기값/중복 100% 차단)
 # 3. [유지] 납입일: 청약일 오인 방지 및 정정 후 역방향 스캔 최우선 타격 100% 유지
-# 4. [유지] 역방향 스캔(Reverse), Call 비율 / YTC 문맥 정밀 추출, Put/Call 옵션 절단기 유지
+# 4. [유지] Call 비율 / YTC 문맥 정밀 추출, Put/Call 옵션 본문 절단기 유지
 # ==========================================================
 import os
 import re
@@ -281,7 +281,7 @@ def scan_label_value_preferring_correction(dfs, label_candidates, corr_after) ->
 
 def find_row_best_int(dfs, must_contain, min_val=-1) -> Optional[int]:
     keys = [_norm(x) for x in must_contain]
-    for df in reversed(dfs): 
+    for df in reversed(dfs): # 역방향 스캔
         arr = df.astype(str).values
         best_in_df = None
         for r in range(arr.shape[0]):
@@ -298,7 +298,7 @@ def find_row_best_int(dfs, must_contain, min_val=-1) -> Optional[int]:
 
 def find_row_best_float(dfs, must_contain) -> Optional[float]:
     keys = [_norm(x) for x in must_contain]
-    for df in reversed(dfs): 
+    for df in reversed(dfs): # 역방향 스캔
         arr = df.astype(str).values
         best_in_df = None
         for r in range(arr.shape[0]):
@@ -312,9 +312,10 @@ def find_row_best_float(dfs, must_contain) -> Optional[float]:
 
 
 # ==========================================================
-# 5. 핵심 4대 컬럼 전용 추출기
+# 5. 핵심 4대 컬럼 전용 추출기 (V11.7 전환청구기간 블록 캡처 반영)
 # ==========================================================
 
+# 1) [유지] 발행상품 
 def extract_product_type(dfs: List[pd.DataFrame], corr_after: Dict) -> str:
     labels = ["1. 사채의 종류", "1.사채의종류", "사채의 종류", "사체의 종류", "사태의 종류", "사케의 종류", "사채종류", "종류"]
     
@@ -348,7 +349,7 @@ def extract_product_type(dfs: List[pd.DataFrame], corr_after: Dict) -> str:
                 cleaned = get_clean_product(v)
                 if cleaned: return cleaned
 
-    for df in reversed(dfs): # 역방향 스캔
+    for df in reversed(dfs): 
         arr = df.astype(str).values
         for r in range(arr.shape[0]):
             for c in range(arr.shape[1]):
@@ -365,6 +366,7 @@ def extract_product_type(dfs: List[pd.DataFrame], corr_after: Dict) -> str:
             if cleaned: return cleaned
     return ""
 
+# 2) [유지] 납입일 전용 타격기
 def extract_payment_date(dfs: List[pd.DataFrame], corr_after: Dict) -> str:
     if corr_after:
         for k, v in corr_after.items():
@@ -566,56 +568,45 @@ def extract_call_ratio_and_ytc(call_text: str, html_raw: str) -> Tuple[str, str]
                         break
     return ratio, ytc
 
-# [V11.6 완전 개조] 전환청구기간 라벨 명시적 타격 엔진
+# 5) [V11.7 신규] 전환청구기간 블록 캡처 엔진 (시작일/종료일 100% 한 쌍 추출)
 def extract_period_dates(dfs, corr_after, period_kws) -> Tuple[str, str]:
     if corr_after:
         for k, v in corr_after.items():
             if any(_norm(p) in _norm(k) for p in period_kws):
                 dates = re.findall(r'\d{4}[-년\.\s]+\d{1,2}[-월\.\s]+\d{1,2}', v)
                 if len(dates) >= 2:
-                    return _format_date(dates[0]), _format_date(dates[-1])
+                    return _format_date(dates[0]), _format_date(dates[1])
 
     s_date, e_date = "", ""
     for df in reversed(dfs): # 역방향 스캔
         arr = df.astype(str).values
         R, C = arr.shape
         for r in range(R):
-            row_str = _norm("".join(arr[r]))
+            row_str = _norm(" ".join(arr[r]))
+            # 라벨(전환청구기간 등)이 발견되면
             if any(p in row_str for p in period_kws) or "시작일" in row_str or "종료일" in row_str:
                 
-                # 1. 같은 줄에 날짜가 2개 이상 있는 가장 이상적인 경우
-                dates = re.findall(r'\d{4}[-년\.\s]+\d{1,2}[-월\.\s]+\d{1,2}', " ".join(arr[r]))
-                if len(dates) >= 2:
-                    return _format_date(dates[0]), _format_date(dates[-1])
+                # 해당 줄부터 무조건 아래로 6줄을 긁어서 '하나의 거대한 텍스트 덩어리'로 만듦
+                block_dates = []
+                for rr in range(r, min(R, r + 6)):
+                    rr_str = " ".join([str(x) for x in arr[rr] if str(x).lower() != 'nan'])
+                    dates = re.findall(r'\d{4}[-년\.\s]+\d{1,2}[-월\.\s]+\d{1,2}', rr_str)
+                    
+                    # 덩어리 안에서 고유한 날짜를 순서대로 수집
+                    for d in dates:
+                        fd = _format_date(d)
+                        if fd not in block_dates:
+                            block_dates.append(fd)
+                            
+                # 수집된 날짜 중 무조건 첫 번째가 시작일, 두 번째가 종료일!
+                if len(block_dates) >= 2:
+                    return block_dates[0], block_dates[1]
                 
-                # 2. '시작일' 라벨이 명확히 있는 줄에서 날짜 추출
-                if "시작" in row_str and not s_date and dates: 
-                    s_date = _format_date(dates[0])
+                # 날짜가 1개밖에 없다면 임시 저장해두고 스캔 계속
+                elif len(block_dates) == 1:
+                    if not s_date: s_date = block_dates[0]
+                    elif block_dates[0] != s_date and not e_date: e_date = block_dates[0]
                     
-                # 3. '종료일' 라벨이 명확히 있는 줄에서 날짜 추출
-                if "종료" in row_str and not e_date and dates: 
-                    e_date = _format_date(dates[0])
-                    
-                # 4. 시작일을 찾았는데 아직 종료일이 없는 경우, 아랫줄들을 넓게 파고들어 '종료일' 라벨 추적
-                if s_date and not e_date:
-                    for rr in range(r + 1, min(R, r + 6)): # 최대 6줄까지 깊게 스캔
-                        rr_str = _norm("".join(arr[rr]))
-                        rr_dates = re.findall(r'\d{4}[-년\.\s]+\d{1,2}[-월\.\s]+\d{1,2}', " ".join(arr[rr]))
-                        
-                        if rr_dates:
-                            # '종료일'이라는 글자가 포함된 줄이면 무조건 종료일로 캡처!
-                            if "종료" in rr_str:
-                                e_date = _format_date(rr_dates[-1])
-                                break
-                            else:
-                                # 라벨이 없더라도 시작일과 다른 날짜면 일단 종료일로 캡처
-                                for d in rr_dates:
-                                    fd = _format_date(d)
-                                    if fd != s_date: 
-                                        e_date = fd
-                                        break
-                            if e_date: break
-                        
         if s_date and e_date: return s_date, e_date
     return s_date, e_date
 
@@ -704,7 +695,7 @@ def parse_bond_record(dfs, t: Target, corr_after, html_raw, company_market_map) 
     rec["주식총수대비 비율"] = scan_label_value_preferring_correction(dfs, ["주식총수 대비 비율(%)", "총수 대비 비율"], corr_after)
     rec["Refixing Floor"] = get_corr_num(["최저 조정가액 (원)", "최저조정가액", "리픽싱하한"], ["최저조정가액", "원"], 50)
 
-    # [호출] V11.6 라벨 명시적 타격 엔진
+    # [호출] V11.7 블록 캡처 엔진 (시작일, 종료일 완벽 한 쌍 추출)
     s_date, e_date = extract_period_dates(dfs, corr_after, ["전환청구기간", "교환청구기간", "권리행사기간"])
     rec["전환청구 시작"], rec["전환청구 종료"] = s_date, e_date
 
