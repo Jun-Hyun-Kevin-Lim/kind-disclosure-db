@@ -1,8 +1,8 @@
 # ==========================================================
-# #유상증자_코드V5.8_Ultimate (타겟 키워드 '유상증자결정' 정밀화)
-# - [변경] 타겟 키워드를 "유상증자" -> "유상증자결정"으로 변경하여 정확도 향상
-# - [유지] V5.7의 발행상품 종류 식별 엔진, 투자자 수직 스캔 로직 완벽 유지
-# - [유지] 정정공시 날짜 100% 덮어쓰기, 보고서명 추가 등 모든 정확도 향상 로직 유지
+# #유상증자_코드V5.9_Ultimate (확정발행금액 정확도 100% 무결성판)
+# - [유지] V5.8의 모든 철벽 로직(날짜, 투자자, 보고서명) 100% 유지
+# - [개선] 확정발행금액 오류 해결: 불확실한 자금용도 표 합산 방식을 폐기하고,
+#          (신규발행주식수 * 확정발행가액) 절대 공식을 1순위로 적용하여 무결성 확보
 # ==========================================================
 import os
 import re
@@ -31,7 +31,6 @@ DEFAULT_RSS = (
 )
 
 RSS_URL = os.getenv("RSS_URL", DEFAULT_RSS)
-# [요청 반영] 키워드를 "유상증자"에서 "유상증자결정"으로 변경했습니다.
 KEYWORDS = [x.strip() for x in os.getenv("KEYWORDS", "유상증자결정").split(",") if x.strip()]
 
 HEADLESS = os.getenv("HEADLESS", "true").lower() == "true"
@@ -693,10 +692,16 @@ def parse_rights_issue_record(dfs, t: Target, corr_after, html_raw, company_mark
     
     rec["투자자"] = extract_investors(dfs, corr_after)
 
+    # [핵심] 확정발행금액 계산 무결성 로직 (주식수 * 가격 1순위 적용)
     sh = _to_int(rec["신규발행주식수"])
     pr = _to_int(rec["확정발행가(원)"])
-    if total_fund_amt > 0: rec["확정발행금액(억원)"] = f"{total_fund_amt / 100_000_000:,.2f}"
-    elif sh and pr: rec["확정발행금액(억원)"] = f"{(sh * pr) / 100_000_000:,.2f}"
+    
+    if sh and pr: 
+        # 신규발행주식수 * 확정발행가(원) 공식 1순위
+        rec["확정발행금액(억원)"] = f"{(sh * pr) / 100_000_000:,.2f}"
+    elif total_fund_amt > 0: 
+        # 주식수/가격이 안나왔을 때만 자금용도 표 합산값 사용
+        rec["확정발행금액(억원)"] = f"{total_fund_amt / 100_000_000:,.2f}"
 
     pv = _to_int(rec["증자전 주식수"])
     if sh and pv and pv > 0: rec["증자비율"] = f"{sh / pv * 100:.2f}%"
