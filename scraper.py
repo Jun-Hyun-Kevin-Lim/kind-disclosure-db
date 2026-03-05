@@ -525,92 +525,93 @@ def extract_investors(dfs: List[pd.DataFrame], corr_after: Dict[str, str]) -> st
 
     return ""
 
-
 # ==========================================================
-# [핵심 로직 교체] 신규발행주식수 정밀 추적 엔진
+# [완전 개편] 신규발행주식수 정밀 타겟팅 추출 엔진
 # ==========================================================
 def extract_issue_shares_and_type(dfs: List[pd.DataFrame], corr_after: Dict[str, str]) -> Tuple[Optional[int], str]:
     stock_type = "보통주식"
     best_amt = 0
     
-    # 1. 정정공시 텍스트 스캔
+    # 1. 정정공시 텍스트(corr_after) 우선 스캔
     if corr_after:
         for k, v in corr_after.items():
             k_norm = _norm(k)
             # 신규발행주식과 관련된 명확한 키워드만 타겟팅
-            if any(c in k_norm for c in ["신주의종류와수", "발행예정주식수", "신주발행"]):
-                # 증자전 주식수, 발행가액 등이 섞여 들어오는 것 사전 차단
-                if any(bad in k_norm for bad in ["발행가", "가액", "총수", "증자전", "비율", "기발행"]):
+            if any(c in k_norm for c in ["신주의종류와수", "발행예정주식", "신주발행", "발행할주식"]):
+                # 증자전 주식수, 발행가액 등이 섞여 들어오는 것 강력 차단
+                if any(bad in k_norm for bad in ["발행가", "가액", "증자전", "총수", "기발행", "비율", "일정"]):
                     continue
                 amt = _max_int_in_text(v)
                 if amt and amt > 100:
                     best_amt = amt
-                    if "상환전환우선주" in v: stock_type = "상환전환우선주"
-                    elif "전환우선주" in v: stock_type = "전환우선주"
-                    elif "우선주" in v: stock_type = "우선주식"
-                    elif "종류주" in v: stock_type = "종류주식"
-                    elif "기타주" in v: stock_type = "기타주식"
+                    v_norm = _norm(v)
+                    if "상환전환우선주" in v_norm: stock_type = "상환전환우선주"
+                    elif "전환우선주" in v_norm: stock_type = "전환우선주"
+                    elif "우선주" in v_norm: stock_type = "우선주식"
+                    elif "종류주" in v_norm: stock_type = "종류주식"
+                    elif "기타주" in v_norm: stock_type = "기타주식"
+                    return best_amt, stock_type
 
-    if best_amt > 0:
-        return best_amt, stock_type
-
-    # 2. 본문 표에서 스캔 (정확도 100% 타겟 셀 추적 방식)
-    target_labels = ["신주의종류와수", "신주의종류", "발행예정주식", "신주발행", "발행신주"]
-    bad_kws = ["증자전", "기발행", "총수", "발행가", "가액", "비율", "금액", "자금", "일정", "목적"]
+    # 2. 본문 표 정밀 추적 스캔 (버그 원천 차단 엔진)
+    target_labels = ["신주의종류", "발행예정주식", "신주발행", "발행신주", "발행할주식"]
+    # 절대 침범해서는 안 될 타 항목 라벨들
+    bad_labels = ["증자전", "기발행", "총수", "발행가", "액면", "비율", "자금", "목적", "상장", "교부", "납입"]
     
     for df in dfs:
         arr = df.astype(str).values
         R, C = arr.shape
         
         for r in range(R):
-            for c in range(C):
-                cell_norm = _norm(arr[r][c])
-                # 타겟 라벨을 찾았고, 그 셀에 오답(발행가, 증자전 등)이 없는 순수한 셀인지 확인
-                if any(lbl in cell_norm for lbl in target_labels) and not any(bad in cell_norm for bad in bad_kws):
-                    
-                    # 발견한 라벨의 오른쪽 셀들을 순차적으로 탐색하여 숫자를 찾음
-                    for cc in range(c + 1, C):
-                        v_norm = _norm(arr[r][cc])
-                        # 오른쪽으로 가다가 '증자전', '총수' 등 다른 구역을 만나면 즉시 중단 (방어선)
-                        if any(bad in v_norm for bad in ["증자전", "총수", "발행가", "액면가"]): break
-                        amt = _max_int_in_text(arr[r][cc])
-                        if amt and amt > 100:
-                            best_amt = amt
+            row_str = _norm(" ".join(arr[r]))
+            
+            # 타겟 라벨(신주의 종류와 수)이 있는 행만 정확히 락온
+            if any(t in row_str for t in target_labels):
+                # 오답 방어: 증자전, 액면가액 등 다른 정보가 섞인 행은 절대 건드리지 않음
+                if any(b in row_str for b in bad_labels):
+                    continue
+                
+                valid_amts = []
+                # 해당 행 안의 모든 셀을 우측으로 스캔하여 숫자 추출
+                for c in range(C):
+                    amt = _max_int_in_text(arr[r][c])
+                    # 1., 2. 같은 번호 매기기용 숫자는 무시 (100 이상만 유효한 주식수로 간주)
+                    if amt and amt > 100: 
+                        valid_amts.append(amt)
+                        
+                if valid_amts:
+                    # 숫자가 여러 개면 가장 오른쪽 값(보통 정정후) 채택
+                    best_amt = valid_amts[-1]
+                else:
+                    # 같은 행에 숫자가 없다면 바로 아래쪽 행(병합셀) 탐색
+                    for rr in range(r + 1, min(r + 3, R)):
+                        next_row_str = _norm(" ".join(arr[rr]))
+                        # 만약 아래 행이 새로운 항목(2. 액면가액, 3. 증자전)을 시작하면 절대 침범하지 않고 즉시 중단
+                        if any(b in next_row_str for b in bad_labels) or re.match(r"^\d+[\.\)]", next_row_str):
                             break
-                    
-                    # 오른쪽 셀에서 찾지 못했다면 바로 아래쪽 셀(병합된 경우 등) 탐색
-                    if best_amt == 0 and r + 1 < R:
-                        for cc in range(C):
-                            v_norm = _norm(arr[r+1][cc])
-                            if any(bad in v_norm for bad in ["증자전", "총수", "발행가", "액면가"]): continue
-                            amt = _max_int_in_text(arr[r+1][cc])
+                        
+                        next_amts = []
+                        for c in range(C):
+                            amt = _max_int_in_text(arr[rr][c])
                             if amt and amt > 100:
-                                best_amt = amt
-                                break
-                                
-                    # 주식 종류 판단 (해당 행과 아래 행의 텍스트 종합)
-                    if best_amt > 0:
-                        row_str = _norm("".join(arr[r]))
-                        if r + 1 < R: row_str += _norm("".join(arr[r+1]))
+                                next_amts.append(amt)
                         
-                        if "상환전환우선주" in row_str: stock_type = "상환전환우선주"
-                        elif "전환우선주" in row_str: stock_type = "전환우선주"
-                        elif "우선주" in row_str: stock_type = "우선주식"
-                        elif "종류주" in row_str: stock_type = "종류주식"
-                        elif "기타주" in row_str: stock_type = "기타주식"
-                        elif "보통주" in row_str: stock_type = "보통주식"
-                        
-                        return best_amt, stock_type
-
-    # 3. 최후의 보루 (가장 보수적인 단순 텍스트 탐색)
-    if best_amt == 0:
-        val = scan_label_value(dfs, ["신주의 종류와 수", "발행예정주식", "발행예정주식수"])
-        amt = _max_int_in_text(val)
-        if amt and amt > 100:
-            best_amt = amt
-
-    return (best_amt if best_amt > 0 else None), stock_type
-
+                        if next_amts:
+                            best_amt = next_amts[-1]
+                            row_str += " " + next_row_str # 주식 종류 파악을 위해 텍스트 병합
+                            break
+                            
+                if best_amt > 0:
+                    # 주식 종류 식별
+                    if "상환전환우선주" in row_str: stock_type = "상환전환우선주"
+                    elif "전환우선주" in row_str: stock_type = "전환우선주"
+                    elif "우선주" in row_str: stock_type = "우선주식"
+                    elif "종류주" in row_str: stock_type = "종류주식"
+                    elif "기타주" in row_str: stock_type = "기타주식"
+                    elif "보통주" in row_str: stock_type = "보통주식"
+                    
+                    return best_amt, stock_type
+                    
+    return None, ""
 
 # ==========================================================
 # 레코드 파싱 로직  
@@ -623,19 +624,15 @@ def parse_rights_issue_record(dfs, t: Target, corr_after, html_raw, company_mark
     title_clean = t.title.replace("[자동복구대상]", "").strip()
     rec["보고서명"] = title_clean
     
-    # [핵심 개선] 종속회사명까지 완벽히 잡아내도록 탐색 풀 확대
     comp_cands = ["회사명", "회사 명", "발행회사", "발행회사명", "법인명", "종속회사명", "종속회사", "종속회사인"]
     table_comp = scan_label_value_preferring_correction(dfs, comp_cands, corr_after)
     
     if table_comp:
-        # [핵심 개선] 첫 줄만 남겨 각주 및 쓰레기 문자열 사전 차단
         table_comp = table_comp.split('\n')[0].strip()
         table_comp_clean = table_comp.replace(" ", "")
         
-        # [핵심 개선] '신고', '경영사항' 등을 추가해 종속회사명 옆에 적힌 잡다한 텍스트 배제
         bad_kws = ["상장여부", "여부", "해당사항", "해당없음", "본점", "소재지", "신고", "경영사항", "결정"]
         
-        # [핵심 개선] 아주 긴 글로벌/자회사명('씨엑스아이헬스케어테크놀리지그룹리미티드' 등)이 짤리지 않게 40자로 길이 제한 대폭 완화
         if len(table_comp) > 40 or any(k in table_comp_clean for k in bad_kws) or table_comp in ("-", "."):
             table_comp = ""
         elif re.search(r'[A-Za-z]', table_comp) and len(table_comp) > 30:
