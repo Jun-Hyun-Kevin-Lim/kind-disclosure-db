@@ -1,13 +1,11 @@
 # ==========================================================
 # #유상증자_코드V5.9_Ultimate (확정발행금액 정확도 100% 무결성판)
 # - [유지] V5.8의 모든 철벽 로직(날짜, 투자자, 보고서명) 100% 유지
-# - [개선] 숫자를 찾을 때 '가장 큰 값(max)'을 뽑는 치명적 버그 수정 ->  
-#          '가장 오른쪽(정정후)에 있는 최신 값'을 추출하도록 엔진 전면 교체
 # - [개선] 확정발행금액 산출 시 '신규발행주식수 * 확정발행가' 절대 공식을 1순위로 적용
-# - [추가] "유상증자결정"이 포함된 보고서만 엄격하게 수집/처리하도록 필터링 강화
+# - [개선] "유상증자결정"이 포함된 보고서만 엄격하게 수집/처리하도록 필터링 강화
 # - [개선] 회사명(종속회사 포함) 파싱 로직 고도화 및 길이 제한 완화, 불순물 완벽 제거
-# - [최종개선] 신규발행주식수 및 증자전주식수 (보통주+기타주) 합산 엔진 탑재
-# - [긴급수정] 시트에 신규발행주식수/증자전주식수가 빈칸일 경우 무조건 강제 재파싱하도록 복구 로직(needs_fix) 추가
+# - [최종개선] 신규발행주식수 및 증자전주식수 (보통주+기타주) 완전 합산 방어막 탑재
+# - [긴급수정] 시트에 빈칸 발생 시 무조건 강제 복구(needs_fix)하도록 조치
 # ==========================================================
 import os
 import re
@@ -549,7 +547,7 @@ def get_shares_by_exact_section(dfs: List[pd.DataFrame], corr_after: Dict[str, s
                     if c_val + o_val > 0:
                         return c_val + o_val
                         
-    # 2. 본문 표 정밀 추적 (보통주 + 기타주 합산 엔진)
+    # 2. 본문 표 정밀 추적 (보통주 + 기타주 무조건 합산 엔진)
     for df in dfs:
         try: arr = df.astype(str).values
         except: continue
@@ -561,6 +559,7 @@ def get_shares_by_exact_section(dfs: List[pd.DataFrame], corr_after: Dict[str, s
             if any(t in row_str_norm for t in section_keywords):
                 common_val, other_val, total_val = 0, 0, 0
                 
+                # 라벨이 발견된 행부터 아래로 6칸까지 탐색하며 합산
                 for rr in range(r, min(r + 6, R)):
                     curr_row_norm = _norm("".join(arr[rr]))
                     
@@ -577,7 +576,7 @@ def get_shares_by_exact_section(dfs: List[pd.DataFrame], corr_after: Dict[str, s
                     for c in range(C):
                         cell_str_raw = _norm(arr[rr][c])
                         
-                        # [오염 차단] 타겟 라벨과 같은 행에 있더라도 다른 구역(예: 증자전, 액면가)을 뜻하는 셀이 있으면 그 셀의 숫자는 무시!
+                        # [오염 차단] 타겟 라벨과 같은 행에 있더라도 다른 구역(예: 증자전, 액면가)을 뜻하는 셀이 있으면 무시!
                         if any(s in cell_str_raw for s in stop_keywords):
                             continue
                             
@@ -593,17 +592,19 @@ def get_shares_by_exact_section(dfs: List[pd.DataFrame], corr_after: Dict[str, s
                                 
                     row_max = max(row_nums) if row_nums else 0
                     
-                    # 항목 분류하여 보통주와 기타주를 각각 추출
+                    # 항목 분류하여 보통주와 기타주를 각각 추출 후 절대 합산
                     if "합계" in curr_row_norm or "총계" in curr_row_norm:
-                        if row_max > 0: total_val = row_max
+                        if row_max > 0: total_val = max(total_val, row_max)
                     elif any(k in curr_row_norm for k in ["기타주", "종류주", "우선주", "상환전환"]):
                         if row_max > 0: other_val = max(other_val, row_max)
                     elif "보통주" in curr_row_norm:
                         if row_max > 0: common_val = max(common_val, row_max)
                     else:
-                        if rr == r and row_max > 0 and common_val == 0:
-                            common_val = row_max
+                        # 보통주, 기타주 명시가 없어도 숫자가 있으면 무조건 common_val로 간주하여 담아둠
+                        if row_max > 0:
+                            common_val = max(common_val, row_max)
                             
+                # 보통주와 기타주를 더한 값을 최우선 반환
                 calculated_total = common_val + other_val
                 if total_val > 0 and total_val >= calculated_total:
                     return total_val
@@ -844,8 +845,11 @@ def run():
 
     for row in values[1:]:
         acpt = get_val(row, "접수번호")
+        # 🚨 [매우 중요] 시트에 "접수번호"가 비어있으면 읽어올 대상이 없으므로 무조건 무시합니다! 
+        # (업데이트가 안되는 가장 큰 원인입니다)
         if not acpt.isdigit(): continue
         
+        # 구글 시트에서 복구 대상을 찾을 때도 "유상증자결정"이 포함되지 않은 보고서는 스킵
         rep_title = get_val(row, "보고서명")
         if rep_title and "유상증자결정" not in rep_title.replace(" ", ""):
             continue
@@ -859,11 +863,11 @@ def run():
         link_val = get_val(row, "링크")
         investor_val = get_val(row, "투자자")
         comp_name = get_val(row, "회사명")
+        
+        # 값 확인용
+        new_shares = get_val(row, "신규발행주식수")
         prev_shares = get_val(row, "증자전 주식수")
         product_val = get_val(row, "발행상품")
-        
-        # [긴급 수정] 신규발행주식수 값도 받아와서 빈칸인지 판단하도록 추가
-        new_shares = get_val(row, "신규발행주식수")
         
         div_date = get_val(row, "신주의 배당기산일")
         list_date = get_val(row, "신주의 상장 예정일")
@@ -879,7 +883,7 @@ def run():
         bad_inv_kws = ["관계", "최대주주", "지분", "%", "정정", "주1", "합계", "소계", "출자자", "소재지", "명"]
         investor_needs_fix = any(k in investor_val for k in bad_inv_kws) or bool(re.search(r'\d{4,}', investor_val))
         
-        # [긴급 수정] 시트에 신규발행주식수 또는 증자전 주식수가 빈칸(not new_shares / not prev_shares)일 경우 강제로 다시 파싱하도록 추가
+        # [긴급 수정] 시트에 신규발행주식수나 증자전 주식수가 아예 비어있으면 무조건 다시 파싱하도록 추가
         needs_fix = (
             not link_val or  
             not fund or "(원)" in fund or
