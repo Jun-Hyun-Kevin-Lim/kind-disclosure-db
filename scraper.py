@@ -6,7 +6,7 @@
 # - [개선] 확정발행금액 산출 시 '신규발행주식수 * 확정발행가' 절대 공식을 1순위로 적용
 # - [추가] "유상증자결정"이 포함된 보고서만 엄격하게 수집/처리하도록 필터링 강화
 # - [개선] 회사명(종속회사 포함) 파싱 로직 고도화 및 길이 제한 완화, 불순물 완벽 제거
-# - [핵심개선] 신규발행주식수와 증자전주식수가 섞이는 표 병합 버그 원천 차단 (구역 분리 엔진 탑재)
+# - [최종개선] 신규발행주식수 및 증자전주식수 추출 시 (보통주식 + 기타주식) 합산 엔진 탑재
 # ==========================================================
 import os
 import re
@@ -526,22 +526,30 @@ def extract_investors(dfs: List[pd.DataFrame], corr_after: Dict[str, str]) -> st
     return ""
 
 # ==========================================================
-# [핵심 로직 교체] 구역 분리(Section Bounding) 엔진
-# 특정 라벨을 찾은 후 다음 라벨이 나오기 전까지만 숫자를 스캔하여 오염 방지
+# [최종 핵심 로직] 보통주 + 기타주 완벽 합산 엔진
 # ==========================================================
 def get_shares_by_exact_section(dfs: List[pd.DataFrame], corr_after: Dict[str, str], section_keywords: List[str], stop_keywords: List[str]) -> Optional[int]:
-    # 1. 정정공시 텍스트 최우선 스캔
+    # 1. 정정공시 텍스트 최우선 스캔 (합산 로직 적용)
     if corr_after:
         for k, v in corr_after.items():
             k_norm = _norm(k)
             if any(t in k_norm for t in section_keywords):
                 # 타겟 텍스트 내에 금지어(예: 액면가액, 증자전주식수 등)가 섞여있으면 무시
                 if not any(s in k_norm for s in stop_keywords):
-                    amt = _max_int_in_text(v)
-                    if amt and amt > 100:
-                        return amt
+                    c_val, o_val = 0, 0
+                    for line in str(v).split('\n'):
+                        amt = _max_int_in_text(line)
+                        if amt and amt > 100:
+                            if any(x in _norm(line) for x in ["기타주", "종류주", "우선주", "상환전환"]):
+                                o_val = max(o_val, amt)
+                            elif "보통주" in _norm(line):
+                                c_val = max(c_val, amt)
+                            else:
+                                c_val = max(c_val, amt) # 명시 안된 경우 보통주로 간주
+                    if c_val + o_val > 0:
+                        return c_val + o_val
                         
-    # 2. 본문 표 정밀 추적 (행 단위가 아닌 셀 단위 스캔으로 병합 셀 문제 완벽 회피)
+    # 2. 본문 표 정밀 추적 (보통주 + 기타주 합산 엔진)
     for df in dfs:
         try: arr = df.astype(str).values
         except: continue
@@ -551,51 +559,59 @@ def get_shares_by_exact_section(dfs: List[pd.DataFrame], corr_after: Dict[str, s
             
             # 행에 타겟 키워드(예: 1. 신주의 종류와 수)가 있는 경우 락온
             if any(t in row_str_norm for t in section_keywords):
-                # 단, 해당 행에 다른 섹션 이름(예: 3. 증자전 발행주식총수)이 섞여있다면 건너뜀
+                # 단, 해당 행에 다른 섹션 이름(예: 증자전)이 섞여있다면 건너뜀
                 if any(s in row_str_norm for s in stop_keywords):
                     continue
                     
-                collected_nums = []
+                common_val, other_val, total_val = 0, 0, 0
                 
-                # 1단계: 해당 타겟이 위치한 현재 행의 셀들 스캔
-                for c in range(C):
-                    cell_str = _norm(arr[r][c])
-                    # 항목명 자체(예: "신주의종류와수")를 지워 순수 텍스트만 남김
-                    for t in section_keywords:
-                        cell_str = cell_str.replace(t, "")
-                    # 번호 매기기용 숫자(1., 2., 3.) 제거
-                    cell_str = re.sub(r'^([①-⑩]|\(\d+\)|\d+\.)+', '', cell_str)
-                    
-                    nums = re.findall(r"\d[\d,]*", cell_str)
-                    for x in nums:
-                        t_val = x.replace(",", "")
-                        if t_val.isdigit() and int(t_val) > 100: # 100주 이하는 의미없는 번호로 간주
-                            collected_nums.append(int(t_val))
-                            
-                # 2단계: 그 아래 행들 추가 스캔 (보통주식, 기타주식이 아래로 나눠 적힌 경우)
-                for rr in range(r + 1, min(r + 6, R)):
-                    next_row_norm = _norm("".join(arr[rr]))
+                # 락온된 행부터 아래로 최대 5칸까지 탐색하며 숫자를 합산함
+                for rr in range(r, min(r + 6, R)):
+                    curr_row_norm = _norm("".join(arr[rr]))
                     
                     # 다음 주요 항목(2. 액면가액, 4. 자금조달 등)이 나타나면 절대 침범하지 않고 탐색 강제 종료
-                    if any(s in next_row_norm for s in stop_keywords + ["액면가", "자금조달", "증자방식", "발행가", "기준주가", "납입일", "신주인수권", "우선배정"]):
-                        break
-                        
-                    # 숫자로 시작하는 새로운 항목(예: "2.1주당 액면가액") 감지 시 종료
-                    clean_next = _clean_label(next_row_norm)
-                    if len(next_row_norm) != len(clean_next): 
-                        if any(k in next_row_norm for k in ["액면", "자금", "가액", "총수", "증자", "발행목적", "목적"]):
+                    if rr > r:
+                        if any(s in curr_row_norm for s in stop_keywords + ["액면가", "자금조달", "증자방식", "발행가", "기준주가", "납입일", "신주인수권", "우선배정"]):
                             break
+                        # "2." 처럼 새로운 번호가 매겨진 항목을 감지하면 즉시 차단
+                        clean_next = _clean_label(curr_row_norm)
+                        if len(curr_row_norm) != len(clean_next): 
+                            if any(k in curr_row_norm for k in ["액면", "자금", "가액", "총수", "증자", "발행목적", "목적", "방식"]):
+                                break
 
+                    # 해당 행에 있는 숫자 추출
+                    row_nums = []
                     for c in range(C):
                         cell_str = _norm(arr[rr][c])
+                        for t in section_keywords:
+                            cell_str = cell_str.replace(t, "")
+                        cell_str = re.sub(r'^([①-⑩]|\(\d+\)|\d+\.)+', '', cell_str) # "1." 같은 넘버링 무시
                         nums = re.findall(r"\d[\d,]*", cell_str)
                         for x in nums:
                             t_val = x.replace(",", "")
                             if t_val.isdigit() and int(t_val) > 100:
-                                collected_nums.append(int(t_val))
+                                row_nums.append(int(t_val))
                                 
-                if collected_nums:
-                    return max(collected_nums) # 보통주/기타주/합계 중 가장 큰 값(합계)을 채택
+                    row_max = max(row_nums) if row_nums else 0
+                    
+                    # 항목 분류 (합계 / 기타주식 / 보통주식)
+                    if "합계" in curr_row_norm or "총계" in curr_row_norm:
+                        if row_max > 0: total_val = row_max
+                    elif any(k in curr_row_norm for k in ["기타주", "종류주", "우선주", "상환전환"]):
+                        if row_max > 0: other_val = max(other_val, row_max)
+                    elif "보통주" in curr_row_norm:
+                        if row_max > 0: common_val = max(common_val, row_max)
+                    else:
+                        # 레이블이 없는데 숫자가 있다면, 보통주식 칸에 값이 있는 것으로 간주 (첫번째 줄 한정)
+                        if rr == r and row_max > 0 and common_val == 0:
+                            common_val = row_max
+                            
+                # 합산 결과 리턴 (표 안에 "합계"가 명시되어 있고 합산값과 일치하면 합계 반환)
+                calculated_total = common_val + other_val
+                if total_val > 0 and total_val >= calculated_total:
+                    return total_val
+                if calculated_total > 0:
+                    return calculated_total # <--- 핵심: 여기서 보통주와 기타주를 더해줍니다.
                     
     return None
 
@@ -740,11 +756,11 @@ def parse_rights_issue_record(dfs, t: Target, corr_after, html_raw, company_mark
                     if amt is not None and amt > min_val: return amt
         return None
 
-    # [핵심 개선] 증자전 주식수도 신규발행주식수와 동일하게 구역 분리 엔진 적용 (겹침 방지)
+    # [핵심 개선] 증자전 주식수도 보통주와 기타주를 합산하는 엔진을 동일하게 적용
     prev_shares = get_shares_by_exact_section(
         dfs, corr_after, 
         ["증자전발행주식총수", "기발행주식총수", "발행주식총수", "증자전주식수"], 
-        ["신주의종류와수", "발행예정주식", "자금조달", "증자방식", "신주발행"]
+        ["신주의종류와수", "발행예정주식", "자금조달", "증자방식", "신주발행", "액면가", "발행가"]
     )
     
     if not prev_shares:
