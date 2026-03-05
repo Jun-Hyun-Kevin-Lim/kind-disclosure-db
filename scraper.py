@@ -1,11 +1,14 @@
 # ==========================================================
 # #유상증자_코드V5.9_Ultimate (확정발행금액 정확도 100% 무결성판)
 # - [유지] V5.8의 모든 철벽 로직(날짜, 투자자, 보고서명) 100% 유지
+# - [개선] 숫자를 찾을 때 '가장 큰 값(max)'을 뽑는 치명적 버그 수정 ->  
+#          '가장 오른쪽(정정후)에 있는 최신 값'을 추출하도록 엔진 전면 교체
 # - [개선] 확정발행금액 산출 시 '신규발행주식수 * 확정발행가' 절대 공식을 1순위로 적용
-# - [개선] "유상증자결정"이 포함된 보고서만 엄격하게 수집/처리하도록 필터링 강화
+# - [추가] "유상증자결정"이 포함된 보고서만 엄격하게 수집/처리하도록 필터링 강화
 # - [개선] 회사명(종속회사 포함) 파싱 로직 고도화 및 길이 제한 완화, 불순물 완벽 제거
-# - [최종개선] 신규발행주식수 및 증자전주식수 (보통주+기타주) 완전 합산 방어막 탑재
+# - [개선] 신규발행주식수 및 증자전주식수 (보통주+기타주) 완전 합산 방어막 탑재
 # - [긴급수정] 시트에 빈칸 발생 시 무조건 강제 복구(needs_fix)하도록 조치
+# - [최종완성] '접수번호 1개 = 시트 1칸' 원칙 적용. 새 정정공시가 기존 공시를 덮어쓰는 현상 제거 및 맨 아래 무조건 추가(APPEND)되도록 로직 변경
 # ==========================================================
 import os
 import re
@@ -153,9 +156,6 @@ def match_keyword(title: str) -> bool:
 def is_correction_title(title: str) -> bool:
     return "정정" in (title or "")
 
-def make_event_key(company: str, first_board_date: str, method: str) -> str:
-    return f"{_norm(company)}|{_norm_date(first_board_date)}|{_norm(method)}"
-
 # ==========================================================
 # 커스텀 HTML 표 파서
 # ==========================================================
@@ -288,23 +288,15 @@ def load_sheet_values(ws, headers):
         vals = ws.get_all_values()
     return vals
 
+# [수정됨] 오로지 "접수번호" 기준으로만 인덱스를 생성하여, 새로운 보고서(새 접수번호)는 무조건 새 줄로 추가되도록 수정
 def build_indices(values: List[List[str]], headers: List[str]):
     col_acpt = headers.index("접수번호")
-    col_comp = headers.index("회사명")
-    col_first = headers.index("최초 이사회결의일")
-    col_method = headers.index("증자방식")
-    
-    r_idx, e_idx = {}, {}
+    r_idx = {}
     for r, row in enumerate(values[1:], start=2):
         acpt = row[col_acpt].strip() if col_acpt < len(row) else ""
-        if acpt.isdigit(): r_idx[acpt] = r
-        
-        comp = row[col_comp].strip() if col_comp < len(row) else ""
-        first = row[col_first].strip() if col_first < len(row) else ""
-        method = row[col_method].strip() if col_method < len(row) else ""
-        k = make_event_key(comp, first, method)
-        if k.strip("|") and k not in e_idx: e_idx[k] = (r, acpt)
-    return r_idx, e_idx
+        if acpt.isdigit(): 
+            r_idx[acpt] = r
+    return r_idx
 
 def upsert(ws, headers, index, record, key_field, last_row_ref):
     key = str(record.get(key_field, "")).strip()
@@ -822,7 +814,9 @@ def run():
 
     values = load_sheet_values(rights_ws, RIGHTS_COLUMNS)
     last_row_ref = [len(values)]
-    rights_index, event_index = build_indices(values, RIGHTS_COLUMNS)
+    
+    # [수정 완료] 이벤트 묶음(회사명+날짜 등)이 아닌 오로지 '접수번호'로만 인덱스 생성
+    rights_index = build_indices(values, RIGHTS_COLUMNS)
 
     seen_values = load_sheet_values(seen_ws, SEEN_HEADERS)
     last_seen_row_ref = [len(seen_values)]
@@ -846,7 +840,6 @@ def run():
     for row in values[1:]:
         acpt = get_val(row, "접수번호")
         # 🚨 [매우 중요] 시트에 "접수번호"가 비어있으면 읽어올 대상이 없으므로 무조건 무시합니다! 
-        # (업데이트가 안되는 가장 큰 원인입니다)
         if not acpt.isdigit(): continue
         
         # 구글 시트에서 복구 대상을 찾을 때도 "유상증자결정"이 포함되지 않은 보고서는 스킵
@@ -928,19 +921,11 @@ def run():
                 corr_after = extract_correction_after_map(dfs) if is_correction_title(t.title) else None
                 rec = parse_rights_issue_record(dfs, t, corr_after, html_raw, company_market_map)
 
-                evk = make_event_key(
-                    rec.get("회사명", ""),
-                    rec.get("최초 이사회결의일", "") or rec.get("이사회결의일", ""),
-                    rec.get("증자방식", "")
-                )
-                
                 mode = "APPEND"
                 row = -1
                 
-                if evk in event_index:
-                    row, old_acpt = event_index[evk]
-                    mode = "UPDATE"
-                elif rec["접수번호"] in rights_index:
+                # [수정 완료] 오직 동일한 '접수번호'가 시트에 있을 때만 덮어쓰기(UPDATE). 그 외 새로운 공시는 무조건 APPEND
+                if rec["접수번호"] in rights_index:
                     row = rights_index[rec["접수번호"]]
                     mode = "UPDATE"
 
@@ -948,10 +933,8 @@ def run():
                     ws_row_vals = [rec.get(h, "") for h in RIGHTS_COLUMNS]
                     rights_ws.update(f"A{row}:{rowcol_to_a1(row, len(RIGHTS_COLUMNS))}", [ws_row_vals])
                     rights_index[rec["접수번호"]] = row
-                    event_index[evk] = (row, rec["접수번호"])
                 else:
                     mode, row = upsert(rights_ws, RIGHTS_COLUMNS, rights_index, rec, "접수번호", last_row_ref)
-                    event_index[evk] = (row, rec["접수번호"])
 
                 print(f"[OK] {t.acpt_no} mode={mode} row={row}")
                 touch_seen(seen_ws, seen_index, t.acpt_no, last_seen_row_ref)
