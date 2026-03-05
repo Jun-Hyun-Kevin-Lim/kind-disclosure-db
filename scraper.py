@@ -1,14 +1,13 @@
 # ==========================================================
 # #유상증자_코드V5.9_Ultimate (확정발행금액 정확도 100% 무결성판)
 # - [유지] V5.8의 모든 철벽 로직(날짜, 투자자, 보고서명) 100% 유지
-# - [개선] 숫자를 찾을 때 '가장 큰 값(max)'을 뽑는 치명적 버그 수정 ->  
-#          '가장 오른쪽(정정후)에 있는 최신 값'을 추출하도록 엔진 전면 교체
 # - [개선] 확정발행금액 산출 시 '신규발행주식수 * 확정발행가' 절대 공식을 1순위로 적용
 # - [추가] "유상증자결정"이 포함된 보고서만 엄격하게 수집/처리하도록 필터링 강화
-# - [개선] 회사명(종속회사 포함) 파싱 로직 고도화 및 길이 제한 완화, 불순물 완벽 제거
-# - [개선] 신규발행주식수 및 증자전주식수 (보통주+기타주) 완전 합산 방어막 탑재
+# - [최종개선] 신규발행주식수 및 증자전주식수 (보통주+기타주) 완전 합산 방어막 탑재
 # - [긴급수정] 시트에 빈칸 발생 시 무조건 강제 복구(needs_fix)하도록 조치
-# - [최종완성] '접수번호 1개 = 시트 1칸' 원칙 적용. 새 정정공시가 기존 공시를 덮어쓰는 현상 제거 및 맨 아래 무조건 추가(APPEND)되도록 로직 변경
+# - [완벽수정1] 쉼표(,) 대신 마침표(.)를 사용한 천단위 표기(예: 7.130) 완벽 인식 패치
+# - [완벽수정2] 라벨이 두 줄로 쪼개진 표(압타머사이언스 사례)에서 상단 행까지 입체 스캔하여 합산
+# - [완벽수정3] 확정발행가액 전용 정밀 타격 엔진 탑재
 # ==========================================================
 import os
 import re
@@ -102,13 +101,17 @@ def _to_float(s: str) -> Optional[float]:
     try: return float(t)
     except Exception: return None
 
+# [개선] 쉼표(,) 대신 마침표(.)를 사용한 천 단위 표기(예: 7.130)까지 완벽하게 잡아내는 정규식 적용
 def _max_int_in_text(s: str) -> Optional[int]:
     if not s: return None
     s_clean = re.sub(r'(^|\s)[\(①-⑩]?\s*\d+\s*[\.\)]\s+', ' ', str(s))
-    nums = re.findall(r"\d[\d,]*", s_clean)
+    
+    # 숫자, 쉼표, (천단위로 쓰인)마침표 덩어리를 추출
+    nums = re.findall(r"\d{1,3}(?:[,.]\d{3})+(?!\d)|\d+", s_clean)
+    
     vals = []
     for x in nums:
-        t = x.replace(",", "")
+        t = re.sub(r'[,.]', '', x) # 쉼표나 마침표 제거
         if t.isdigit():
             vals.append(int(t))
     return max(vals) if vals else None
@@ -288,7 +291,6 @@ def load_sheet_values(ws, headers):
         vals = ws.get_all_values()
     return vals
 
-# [수정됨] 오로지 "접수번호" 기준으로만 인덱스를 생성하여, 새로운 보고서(새 접수번호)는 무조건 새 줄로 추가되도록 수정
 def build_indices(values: List[List[str]], headers: List[str]):
     col_acpt = headers.index("접수번호")
     r_idx = {}
@@ -516,11 +518,44 @@ def extract_investors(dfs: List[pd.DataFrame], corr_after: Dict[str, str]) -> st
 
     return ""
 
+
 # ==========================================================
-# [최종 핵심 로직] 보통주 + 기타주 완벽 합산 엔진 (오염 차단벽 탑재)
+# [개선] 확정발행가 정밀 타격 엔진
+# ==========================================================
+def get_price_by_exact_section(dfs: List[pd.DataFrame], corr_after: Dict[str, str]) -> Optional[int]:
+    target_kws = ["신주발행가액", "예정발행가액", "확정발행가액", "발행가액"]
+    stop_kws = ["자금조달", "증자방식", "기준주가", "할인율", "증자전", "발행주식"]
+    
+    if corr_after:
+        for k, v in corr_after.items():
+            k_norm = _norm(k)
+            if any(t in k_norm for t in target_kws) and not any(s in k_norm for s in stop_kws):
+                amt = _max_int_in_text(v)
+                if amt and amt >= 50: return amt
+                
+    for df in dfs:
+        try: arr = df.astype(str).values
+        except: continue
+        R, C = arr.shape
+        for r in range(R):
+            row_str_norm = _norm("".join(arr[r]))
+            if any(t in row_str_norm for t in target_kws) and not any(s in row_str_norm for s in stop_kws):
+                for rr in range(r, min(r+2, R)):
+                    row_nums = []
+                    for c in range(C):
+                        cell_norm = _norm(arr[rr][c])
+                        if any(s in cell_norm for s in stop_kws): continue
+                        amt = _max_int_in_text(arr[rr][c])
+                        if amt and amt >= 50:
+                            row_nums.append(amt)
+                    if row_nums:
+                        return max(row_nums)
+    return None
+
+# ==========================================================
+# [개선] 보통주 + 기타주 완벽 합산 엔진 (입체 스캔 패치)
 # ==========================================================
 def get_shares_by_exact_section(dfs: List[pd.DataFrame], corr_after: Dict[str, str], section_keywords: List[str], stop_keywords: List[str]) -> Optional[int]:
-    # 1. 정정공시 텍스트 최우선 스캔 (합산 로직 적용)
     if corr_after:
         for k, v in corr_after.items():
             k_norm = _norm(k)
@@ -539,7 +574,6 @@ def get_shares_by_exact_section(dfs: List[pd.DataFrame], corr_after: Dict[str, s
                     if c_val + o_val > 0:
                         return c_val + o_val
                         
-    # 2. 본문 표 정밀 추적 (보통주 + 기타주 무조건 합산 엔진)
     for df in dfs:
         try: arr = df.astype(str).values
         except: continue
@@ -547,15 +581,22 @@ def get_shares_by_exact_section(dfs: List[pd.DataFrame], corr_after: Dict[str, s
         for r in range(R):
             row_str_norm = _norm("".join(arr[r]))
             
-            # 타겟 라벨(예: "1. 신주의 종류와 수") 발견 시 락온
+            # 락온! 타겟 라벨을 찾았거나, "증자전"과 "발행주식"이 두 줄로 나뉘어져 있는 경우까지 포착
             if any(t in row_str_norm for t in section_keywords):
                 common_val, other_val, total_val = 0, 0, 0
                 
-                # 라벨이 발견된 행부터 아래로 6칸까지 탐색하며 합산
-                for rr in range(r, min(r + 6, R)):
+                # [핵심] 한 칸 윗줄(r-1)부터 아래 5칸까지 입체 스캔하여 잘려나간 보통주식을 쓸어담습니다.
+                search_start = max(0, r - 1)
+                
+                for rr in range(search_start, min(r + 6, R)):
                     curr_row_norm = _norm("".join(arr[rr]))
                     
-                    # 현재 행이 타겟 라벨 행이 아닐 경우, 새로운 항목(액면가, 증자전 등)이 등장하면 즉시 스캔 중단
+                    # 지나간 윗줄(r-1)이 다른 구역(예: 액면가액)에 속하면 그냥 무시(continue)
+                    if rr < r:
+                        if any(s in curr_row_norm for s in stop_keywords + ["액면가", "자금조달", "증자방식"]):
+                            continue
+                            
+                    # 아래쪽을 탐색 중일 때 새로운 구역이 시작되면 즉시 차단(break)
                     if rr > r:
                         if any(s in curr_row_norm for s in stop_keywords + ["액면가", "자금조달", "증자방식", "발행가", "기준주가", "납입일", "신주인수권", "우선배정"]):
                             break
@@ -568,7 +609,7 @@ def get_shares_by_exact_section(dfs: List[pd.DataFrame], corr_after: Dict[str, s
                     for c in range(C):
                         cell_str_raw = _norm(arr[rr][c])
                         
-                        # [오염 차단] 타겟 라벨과 같은 행에 있더라도 다른 구역(예: 증자전, 액면가)을 뜻하는 셀이 있으면 무시!
+                        # 같은 행에 있더라도 오염된 셀(증자전 등)이 있으면 그 셀만 무시
                         if any(s in cell_str_raw for s in stop_keywords):
                             continue
                             
@@ -576,15 +617,15 @@ def get_shares_by_exact_section(dfs: List[pd.DataFrame], corr_after: Dict[str, s
                         for t in section_keywords:
                             cell_str = cell_str.replace(t, "")
                         cell_str = re.sub(r'^([①-⑩]|\(\d+\)|\d+\.)+', '', cell_str) 
-                        nums = re.findall(r"\d[\d,]*", cell_str)
+                        nums = re.findall(r"\d{1,3}(?:[,.]\d{3})+(?!\d)|\d+", cell_str)
                         for x in nums:
-                            t_val = x.replace(",", "")
+                            t_val = re.sub(r'[,.]', '', x)
                             if t_val.isdigit() and int(t_val) > 100:
                                 row_nums.append(int(t_val))
                                 
                     row_max = max(row_nums) if row_nums else 0
                     
-                    # 항목 분류하여 보통주와 기타주를 각각 추출 후 절대 합산
+                    # 합계, 기타주식, 보통주식을 철저히 분리
                     if "합계" in curr_row_norm or "총계" in curr_row_norm:
                         if row_max > 0: total_val = max(total_val, row_max)
                     elif any(k in curr_row_norm for k in ["기타주", "종류주", "우선주", "상환전환"]):
@@ -592,7 +633,6 @@ def get_shares_by_exact_section(dfs: List[pd.DataFrame], corr_after: Dict[str, s
                     elif "보통주" in curr_row_norm:
                         if row_max > 0: common_val = max(common_val, row_max)
                     else:
-                        # 보통주, 기타주 명시가 없어도 숫자가 있으면 무조건 common_val로 간주하여 담아둠
                         if row_max > 0:
                             common_val = max(common_val, row_max)
                             
@@ -607,15 +647,12 @@ def get_shares_by_exact_section(dfs: List[pd.DataFrame], corr_after: Dict[str, s
 
 def extract_issue_shares_and_type(dfs: List[pd.DataFrame], corr_after: Dict[str, str]) -> Tuple[Optional[int], str]:
     stock_type = "보통주식"
-    # 신규발행주식수 타겟 라벨
     target_kws = ["신주의종류와수", "발행예정주식", "신주발행", "발행할주식"]
-    # 절대 침범해서는 안되는 금지 라벨 (증자전, 액면가액 등)
     stop_kws = ["증자전", "기발행", "총수", "발행가", "액면가", "자금조달", "증자방식", "일정"]
     
     best_amt = get_shares_by_exact_section(dfs, corr_after, target_kws, stop_kws)
     
     if best_amt:
-        # 발행상품(stock_type) 탐색
         for df in dfs:
             arr = df.astype(str).values
             R, C = arr.shape
@@ -632,7 +669,6 @@ def extract_issue_shares_and_type(dfs: List[pd.DataFrame], corr_after: Dict[str,
                     elif "기타주" in combined_text: stock_type = "기타주식"
                     break
 
-    # 마지막 안전장치
     if not best_amt:
         val = scan_label_value(dfs, ["신주의 종류와 수", "발행예정주식", "발행예정주식수"])
         amt = _max_int_in_text(val)
@@ -746,7 +782,6 @@ def parse_rights_issue_record(dfs, t: Target, corr_after, html_raw, company_mark
                     if amt is not None and amt > min_val: return amt
         return None
 
-    # [핵심 개선] 증자전 주식수도 보통주와 기타주를 합산하는 엔진을 동일하게 적용
     prev_shares = get_shares_by_exact_section(
         dfs, corr_after, 
         ["증자전발행주식총수", "기발행주식총수", "발행주식총수", "증자전주식수"], 
@@ -762,7 +797,11 @@ def parse_rights_issue_record(dfs, t: Target, corr_after, html_raw, company_mark
 
     if prev_shares: rec["증자전 주식수"] = f"{prev_shares:,}"
 
-    price = get_corr_num(["신주 발행가액", "신주발행가액", "예정발행가액", "확정발행가액", "발행가액", "1주당 확정발행가액"], min_val=50)
+    # [핵심] 확정발행가 정밀 타격 엔진 탑재
+    price = get_price_by_exact_section(dfs, corr_after)
+    
+    if not price:
+        price = get_corr_num(["신주 발행가액", "신주발행가액", "예정발행가액", "확정발행가액", "발행가액", "1주당 확정발행가액"], min_val=50)
     if not price:
         price = _max_int_in_text(scan_label_value(dfs, ["신주 발행가액", "신주발행가액", "예정발행가액", "확정발행가액", "발행가액", "1주당 확정발행가액"]))
         if price is not None and price <= 50: price = None
@@ -790,15 +829,12 @@ def parse_rights_issue_record(dfs, t: Target, corr_after, html_raw, company_mark
     rec["자금용도"] = uses_text
     rec["투자자"] = extract_investors(dfs, corr_after)
 
-    # [핵심 픽스] 확정발행금액 계산 무결성 우선순위 적용
     sh = _to_int(rec["신규발행주식수"])
     pr = _to_int(rec["확정발행가(원)"])
     
     if sh and pr:  
-        # 절대 1순위 공식: 신규발행주식수 * 확정발행가액
         rec["확정발행금액(억원)"] = f"{(sh * pr) / 100_000_000:,.2f}"
     elif total_fund_amt > 0:  
-        # 주식수나 발행가가 빵꾸난 경우에만 자금용도표 합산값 사용
         rec["확정발행금액(억원)"] = f"{total_fund_amt / 100_000_000:,.2f}"
 
     pv = _to_int(rec["증자전 주식수"])
@@ -814,8 +850,6 @@ def run():
 
     values = load_sheet_values(rights_ws, RIGHTS_COLUMNS)
     last_row_ref = [len(values)]
-    
-    # [수정 완료] 이벤트 묶음(회사명+날짜 등)이 아닌 오로지 '접수번호'로만 인덱스 생성
     rights_index = build_indices(values, RIGHTS_COLUMNS)
 
     seen_values = load_sheet_values(seen_ws, SEEN_HEADERS)
@@ -839,10 +873,8 @@ def run():
 
     for row in values[1:]:
         acpt = get_val(row, "접수번호")
-        # 🚨 [매우 중요] 시트에 "접수번호"가 비어있으면 읽어올 대상이 없으므로 무조건 무시합니다! 
         if not acpt.isdigit(): continue
         
-        # 구글 시트에서 복구 대상을 찾을 때도 "유상증자결정"이 포함되지 않은 보고서는 스킵
         rep_title = get_val(row, "보고서명")
         if rep_title and "유상증자결정" not in rep_title.replace(" ", ""):
             continue
@@ -857,7 +889,6 @@ def run():
         investor_val = get_val(row, "투자자")
         comp_name = get_val(row, "회사명")
         
-        # 값 확인용
         new_shares = get_val(row, "신규발행주식수")
         prev_shares = get_val(row, "증자전 주식수")
         product_val = get_val(row, "발행상품")
@@ -876,7 +907,6 @@ def run():
         bad_inv_kws = ["관계", "최대주주", "지분", "%", "정정", "주1", "합계", "소계", "출자자", "소재지", "명"]
         investor_needs_fix = any(k in investor_val for k in bad_inv_kws) or bool(re.search(r'\d{4,}', investor_val))
         
-        # [긴급 수정] 시트에 신규발행주식수나 증자전 주식수가 아예 비어있으면 무조건 다시 파싱하도록 추가
         needs_fix = (
             not link_val or  
             not fund or "(원)" in fund or
@@ -920,11 +950,10 @@ def run():
 
                 corr_after = extract_correction_after_map(dfs) if is_correction_title(t.title) else None
                 rec = parse_rights_issue_record(dfs, t, corr_after, html_raw, company_market_map)
-
+                
                 mode = "APPEND"
                 row = -1
                 
-                # [수정 완료] 오직 동일한 '접수번호'가 시트에 있을 때만 덮어쓰기(UPDATE). 그 외 새로운 공시는 무조건 APPEND
                 if rec["접수번호"] in rights_index:
                     row = rights_index[rec["접수번호"]]
                     mode = "UPDATE"
