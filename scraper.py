@@ -6,7 +6,8 @@
 # - [개선] 확정발행금액 산출 시 '신규발행주식수 * 확정발행가' 절대 공식을 1순위로 적용
 # - [추가] "유상증자결정"이 포함된 보고서만 엄격하게 수집/처리하도록 필터링 강화
 # - [개선] 회사명(종속회사 포함) 파싱 로직 고도화 및 길이 제한 완화, 불순물 완벽 제거
-# - [최종개선] 신규발행주식수 및 증자전주식수 추출 시 (보통주식 + 기타주식) 합산 엔진 탑재
+# - [최종개선] 신규발행주식수 및 증자전주식수 (보통주+기타주) 합산 엔진 탑재
+# - [긴급수정] 시트에 신규발행주식수/증자전주식수가 빈칸일 경우 무조건 강제 재파싱하도록 복구 로직(needs_fix) 추가
 # ==========================================================
 import os
 import re
@@ -526,7 +527,7 @@ def extract_investors(dfs: List[pd.DataFrame], corr_after: Dict[str, str]) -> st
     return ""
 
 # ==========================================================
-# [최종 핵심 로직] 보통주 + 기타주 완벽 합산 엔진
+# [최종 핵심 로직] 보통주 + 기타주 완벽 합산 엔진 (오염 차단벽 탑재)
 # ==========================================================
 def get_shares_by_exact_section(dfs: List[pd.DataFrame], corr_after: Dict[str, str], section_keywords: List[str], stop_keywords: List[str]) -> Optional[int]:
     # 1. 정정공시 텍스트 최우선 스캔 (합산 로직 적용)
@@ -534,7 +535,6 @@ def get_shares_by_exact_section(dfs: List[pd.DataFrame], corr_after: Dict[str, s
         for k, v in corr_after.items():
             k_norm = _norm(k)
             if any(t in k_norm for t in section_keywords):
-                # 타겟 텍스트 내에 금지어(예: 액면가액, 증자전주식수 등)가 섞여있으면 무시
                 if not any(s in k_norm for s in stop_keywords):
                     c_val, o_val = 0, 0
                     for line in str(v).split('\n'):
@@ -545,7 +545,7 @@ def get_shares_by_exact_section(dfs: List[pd.DataFrame], corr_after: Dict[str, s
                             elif "보통주" in _norm(line):
                                 c_val = max(c_val, amt)
                             else:
-                                c_val = max(c_val, amt) # 명시 안된 경우 보통주로 간주
+                                c_val = max(c_val, amt) 
                     if c_val + o_val > 0:
                         return c_val + o_val
                         
@@ -557,35 +557,34 @@ def get_shares_by_exact_section(dfs: List[pd.DataFrame], corr_after: Dict[str, s
         for r in range(R):
             row_str_norm = _norm("".join(arr[r]))
             
-            # 행에 타겟 키워드(예: 1. 신주의 종류와 수)가 있는 경우 락온
+            # 타겟 라벨(예: "1. 신주의 종류와 수") 발견 시 락온
             if any(t in row_str_norm for t in section_keywords):
-                # 단, 해당 행에 다른 섹션 이름(예: 증자전)이 섞여있다면 건너뜀
-                if any(s in row_str_norm for s in stop_keywords):
-                    continue
-                    
                 common_val, other_val, total_val = 0, 0, 0
                 
-                # 락온된 행부터 아래로 최대 5칸까지 탐색하며 숫자를 합산함
                 for rr in range(r, min(r + 6, R)):
                     curr_row_norm = _norm("".join(arr[rr]))
                     
-                    # 다음 주요 항목(2. 액면가액, 4. 자금조달 등)이 나타나면 절대 침범하지 않고 탐색 강제 종료
+                    # 현재 행이 타겟 라벨 행이 아닐 경우, 새로운 항목(액면가, 증자전 등)이 등장하면 즉시 스캔 중단
                     if rr > r:
                         if any(s in curr_row_norm for s in stop_keywords + ["액면가", "자금조달", "증자방식", "발행가", "기준주가", "납입일", "신주인수권", "우선배정"]):
                             break
-                        # "2." 처럼 새로운 번호가 매겨진 항목을 감지하면 즉시 차단
                         clean_next = _clean_label(curr_row_norm)
                         if len(curr_row_norm) != len(clean_next): 
                             if any(k in curr_row_norm for k in ["액면", "자금", "가액", "총수", "증자", "발행목적", "목적", "방식"]):
                                 break
 
-                    # 해당 행에 있는 숫자 추출
                     row_nums = []
                     for c in range(C):
-                        cell_str = _norm(arr[rr][c])
+                        cell_str_raw = _norm(arr[rr][c])
+                        
+                        # [오염 차단] 타겟 라벨과 같은 행에 있더라도 다른 구역(예: 증자전, 액면가)을 뜻하는 셀이 있으면 그 셀의 숫자는 무시!
+                        if any(s in cell_str_raw for s in stop_keywords):
+                            continue
+                            
+                        cell_str = cell_str_raw
                         for t in section_keywords:
                             cell_str = cell_str.replace(t, "")
-                        cell_str = re.sub(r'^([①-⑩]|\(\d+\)|\d+\.)+', '', cell_str) # "1." 같은 넘버링 무시
+                        cell_str = re.sub(r'^([①-⑩]|\(\d+\)|\d+\.)+', '', cell_str) 
                         nums = re.findall(r"\d[\d,]*", cell_str)
                         for x in nums:
                             t_val = x.replace(",", "")
@@ -594,7 +593,7 @@ def get_shares_by_exact_section(dfs: List[pd.DataFrame], corr_after: Dict[str, s
                                 
                     row_max = max(row_nums) if row_nums else 0
                     
-                    # 항목 분류 (합계 / 기타주식 / 보통주식)
+                    # 항목 분류하여 보통주와 기타주를 각각 추출
                     if "합계" in curr_row_norm or "총계" in curr_row_norm:
                         if row_max > 0: total_val = row_max
                     elif any(k in curr_row_norm for k in ["기타주", "종류주", "우선주", "상환전환"]):
@@ -602,17 +601,15 @@ def get_shares_by_exact_section(dfs: List[pd.DataFrame], corr_after: Dict[str, s
                     elif "보통주" in curr_row_norm:
                         if row_max > 0: common_val = max(common_val, row_max)
                     else:
-                        # 레이블이 없는데 숫자가 있다면, 보통주식 칸에 값이 있는 것으로 간주 (첫번째 줄 한정)
                         if rr == r and row_max > 0 and common_val == 0:
                             common_val = row_max
                             
-                # 합산 결과 리턴 (표 안에 "합계"가 명시되어 있고 합산값과 일치하면 합계 반환)
                 calculated_total = common_val + other_val
                 if total_val > 0 and total_val >= calculated_total:
                     return total_val
                 if calculated_total > 0:
-                    return calculated_total # <--- 핵심: 여기서 보통주와 기타주를 더해줍니다.
-                    
+                    return calculated_total 
+                            
     return None
 
 def extract_issue_shares_and_type(dfs: List[pd.DataFrame], corr_after: Dict[str, str]) -> Tuple[Optional[int], str]:
@@ -849,7 +846,6 @@ def run():
         acpt = get_val(row, "접수번호")
         if not acpt.isdigit(): continue
         
-        # [강제 필터링] 구글 시트에서 복구 대상을 찾을 때도 "유상증자결정"이 포함되지 않은 보고서는 무조건 스킵
         rep_title = get_val(row, "보고서명")
         if rep_title and "유상증자결정" not in rep_title.replace(" ", ""):
             continue
@@ -866,6 +862,9 @@ def run():
         prev_shares = get_val(row, "증자전 주식수")
         product_val = get_val(row, "발행상품")
         
+        # [긴급 수정] 신규발행주식수 값도 받아와서 빈칸인지 판단하도록 추가
+        new_shares = get_val(row, "신규발행주식수")
+        
         div_date = get_val(row, "신주의 배당기산일")
         list_date = get_val(row, "신주의 상장 예정일")
         board_date = get_val(row, "이사회결의일")
@@ -880,6 +879,7 @@ def run():
         bad_inv_kws = ["관계", "최대주주", "지분", "%", "정정", "주1", "합계", "소계", "출자자", "소재지", "명"]
         investor_needs_fix = any(k in investor_val for k in bad_inv_kws) or bool(re.search(r'\d{4,}', investor_val))
         
+        # [긴급 수정] 시트에 신규발행주식수 또는 증자전 주식수가 빈칸(not new_shares / not prev_shares)일 경우 강제로 다시 파싱하도록 추가
         needs_fix = (
             not link_val or  
             not fund or "(원)" in fund or
@@ -891,7 +891,8 @@ def run():
             investor_needs_fix or
             date_needs_fix or   
             not comp_name or comp_name in ["유", "코", "넥"] or
-            prev_shares == "3" or
+            not prev_shares or prev_shares == "3" or
+            not new_shares or
             not product_val  
         )
         
