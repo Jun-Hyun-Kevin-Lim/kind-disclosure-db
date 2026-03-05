@@ -6,7 +6,7 @@
 # - [개선] 확정발행금액 산출 시 '신규발행주식수 * 확정발행가' 절대 공식을 1순위로 적용
 # - [추가] "유상증자결정"이 포함된 보고서만 엄격하게 수집/처리하도록 필터링 강화
 # - [개선] 회사명(종속회사 포함) 파싱 로직 고도화 및 길이 제한 완화, 불순물 완벽 제거
-# - [핵심개선] 신규발행주식수 추출 시 '증자전 주식총수'와 혼동되지 않도록 타겟 셀 정밀 추적 엔진 탑재
+# - [핵심개선] 신규발행주식수와 증자전주식수가 섞이는 표 병합 버그 원천 차단 (구역 분리 엔진 탑재)
 # ==========================================================
 import os
 import re
@@ -526,92 +526,115 @@ def extract_investors(dfs: List[pd.DataFrame], corr_after: Dict[str, str]) -> st
     return ""
 
 # ==========================================================
-# [완전 개편] 신규발행주식수 정밀 타겟팅 추출 엔진
+# [핵심 로직 교체] 구역 분리(Section Bounding) 엔진
+# 특정 라벨을 찾은 후 다음 라벨이 나오기 전까지만 숫자를 스캔하여 오염 방지
 # ==========================================================
-def extract_issue_shares_and_type(dfs: List[pd.DataFrame], corr_after: Dict[str, str]) -> Tuple[Optional[int], str]:
-    stock_type = "보통주식"
-    best_amt = 0
-    
-    # 1. 정정공시 텍스트(corr_after) 우선 스캔
+def get_shares_by_exact_section(dfs: List[pd.DataFrame], corr_after: Dict[str, str], section_keywords: List[str], stop_keywords: List[str]) -> Optional[int]:
+    # 1. 정정공시 텍스트 최우선 스캔
     if corr_after:
         for k, v in corr_after.items():
             k_norm = _norm(k)
-            # 신규발행주식과 관련된 명확한 키워드만 타겟팅
-            if any(c in k_norm for c in ["신주의종류와수", "발행예정주식", "신주발행", "발행할주식"]):
-                # 증자전 주식수, 발행가액 등이 섞여 들어오는 것 강력 차단
-                if any(bad in k_norm for bad in ["발행가", "가액", "증자전", "총수", "기발행", "비율", "일정"]):
-                    continue
-                amt = _max_int_in_text(v)
-                if amt and amt > 100:
-                    best_amt = amt
-                    v_norm = _norm(v)
-                    if "상환전환우선주" in v_norm: stock_type = "상환전환우선주"
-                    elif "전환우선주" in v_norm: stock_type = "전환우선주"
-                    elif "우선주" in v_norm: stock_type = "우선주식"
-                    elif "종류주" in v_norm: stock_type = "종류주식"
-                    elif "기타주" in v_norm: stock_type = "기타주식"
-                    return best_amt, stock_type
-
-    # 2. 본문 표 정밀 추적 스캔 (버그 원천 차단 엔진)
-    target_labels = ["신주의종류", "발행예정주식", "신주발행", "발행신주", "발행할주식"]
-    # 절대 침범해서는 안 될 타 항목 라벨들
-    bad_labels = ["증자전", "기발행", "총수", "발행가", "액면", "비율", "자금", "목적", "상장", "교부", "납입"]
-    
+            if any(t in k_norm for t in section_keywords):
+                # 타겟 텍스트 내에 금지어(예: 액면가액, 증자전주식수 등)가 섞여있으면 무시
+                if not any(s in k_norm for s in stop_keywords):
+                    amt = _max_int_in_text(v)
+                    if amt and amt > 100:
+                        return amt
+                        
+    # 2. 본문 표 정밀 추적 (행 단위가 아닌 셀 단위 스캔으로 병합 셀 문제 완벽 회피)
     for df in dfs:
-        arr = df.astype(str).values
+        try: arr = df.astype(str).values
+        except: continue
         R, C = arr.shape
-        
         for r in range(R):
-            row_str = _norm(" ".join(arr[r]))
+            row_str_norm = _norm("".join(arr[r]))
             
-            # 타겟 라벨(신주의 종류와 수)이 있는 행만 정확히 락온
-            if any(t in row_str for t in target_labels):
-                # 오답 방어: 증자전, 액면가액 등 다른 정보가 섞인 행은 절대 건드리지 않음
-                if any(b in row_str for b in bad_labels):
+            # 행에 타겟 키워드(예: 1. 신주의 종류와 수)가 있는 경우 락온
+            if any(t in row_str_norm for t in section_keywords):
+                # 단, 해당 행에 다른 섹션 이름(예: 3. 증자전 발행주식총수)이 섞여있다면 건너뜀
+                if any(s in row_str_norm for s in stop_keywords):
                     continue
+                    
+                collected_nums = []
                 
-                valid_amts = []
-                # 해당 행 안의 모든 셀을 우측으로 스캔하여 숫자 추출
+                # 1단계: 해당 타겟이 위치한 현재 행의 셀들 스캔
                 for c in range(C):
-                    amt = _max_int_in_text(arr[r][c])
-                    # 1., 2. 같은 번호 매기기용 숫자는 무시 (100 이상만 유효한 주식수로 간주)
-                    if amt and amt > 100: 
-                        valid_amts.append(amt)
-                        
-                if valid_amts:
-                    # 숫자가 여러 개면 가장 오른쪽 값(보통 정정후) 채택
-                    best_amt = valid_amts[-1]
-                else:
-                    # 같은 행에 숫자가 없다면 바로 아래쪽 행(병합셀) 탐색
-                    for rr in range(r + 1, min(r + 3, R)):
-                        next_row_str = _norm(" ".join(arr[rr]))
-                        # 만약 아래 행이 새로운 항목(2. 액면가액, 3. 증자전)을 시작하면 절대 침범하지 않고 즉시 중단
-                        if any(b in next_row_str for b in bad_labels) or re.match(r"^\d+[\.\)]", next_row_str):
-                            break
-                        
-                        next_amts = []
-                        for c in range(C):
-                            amt = _max_int_in_text(arr[rr][c])
-                            if amt and amt > 100:
-                                next_amts.append(amt)
-                        
-                        if next_amts:
-                            best_amt = next_amts[-1]
-                            row_str += " " + next_row_str # 주식 종류 파악을 위해 텍스트 병합
-                            break
+                    cell_str = _norm(arr[r][c])
+                    # 항목명 자체(예: "신주의종류와수")를 지워 순수 텍스트만 남김
+                    for t in section_keywords:
+                        cell_str = cell_str.replace(t, "")
+                    # 번호 매기기용 숫자(1., 2., 3.) 제거
+                    cell_str = re.sub(r'^([①-⑩]|\(\d+\)|\d+\.)+', '', cell_str)
+                    
+                    nums = re.findall(r"\d[\d,]*", cell_str)
+                    for x in nums:
+                        t_val = x.replace(",", "")
+                        if t_val.isdigit() and int(t_val) > 100: # 100주 이하는 의미없는 번호로 간주
+                            collected_nums.append(int(t_val))
                             
-                if best_amt > 0:
-                    # 주식 종류 식별
-                    if "상환전환우선주" in row_str: stock_type = "상환전환우선주"
-                    elif "전환우선주" in row_str: stock_type = "전환우선주"
-                    elif "우선주" in row_str: stock_type = "우선주식"
-                    elif "종류주" in row_str: stock_type = "종류주식"
-                    elif "기타주" in row_str: stock_type = "기타주식"
-                    elif "보통주" in row_str: stock_type = "보통주식"
+                # 2단계: 그 아래 행들 추가 스캔 (보통주식, 기타주식이 아래로 나눠 적힌 경우)
+                for rr in range(r + 1, min(r + 6, R)):
+                    next_row_norm = _norm("".join(arr[rr]))
                     
-                    return best_amt, stock_type
+                    # 다음 주요 항목(2. 액면가액, 4. 자금조달 등)이 나타나면 절대 침범하지 않고 탐색 강제 종료
+                    if any(s in next_row_norm for s in stop_keywords + ["액면가", "자금조달", "증자방식", "발행가", "기준주가", "납입일", "신주인수권", "우선배정"]):
+                        break
+                        
+                    # 숫자로 시작하는 새로운 항목(예: "2.1주당 액면가액") 감지 시 종료
+                    clean_next = _clean_label(next_row_norm)
+                    if len(next_row_norm) != len(clean_next): 
+                        if any(k in next_row_norm for k in ["액면", "자금", "가액", "총수", "증자", "발행목적", "목적"]):
+                            break
+
+                    for c in range(C):
+                        cell_str = _norm(arr[rr][c])
+                        nums = re.findall(r"\d[\d,]*", cell_str)
+                        for x in nums:
+                            t_val = x.replace(",", "")
+                            if t_val.isdigit() and int(t_val) > 100:
+                                collected_nums.append(int(t_val))
+                                
+                if collected_nums:
+                    return max(collected_nums) # 보통주/기타주/합계 중 가장 큰 값(합계)을 채택
                     
-    return None, ""
+    return None
+
+def extract_issue_shares_and_type(dfs: List[pd.DataFrame], corr_after: Dict[str, str]) -> Tuple[Optional[int], str]:
+    stock_type = "보통주식"
+    # 신규발행주식수 타겟 라벨
+    target_kws = ["신주의종류와수", "발행예정주식", "신주발행", "발행할주식"]
+    # 절대 침범해서는 안되는 금지 라벨 (증자전, 액면가액 등)
+    stop_kws = ["증자전", "기발행", "총수", "발행가", "액면가", "자금조달", "증자방식", "일정"]
+    
+    best_amt = get_shares_by_exact_section(dfs, corr_after, target_kws, stop_kws)
+    
+    if best_amt:
+        # 발행상품(stock_type) 탐색
+        for df in dfs:
+            arr = df.astype(str).values
+            R, C = arr.shape
+            for r in range(R):
+                row_str = _norm("".join(arr[r]))
+                if any(t in row_str for t in target_kws) and not any(s in row_str for s in stop_kws):
+                    combined_text = row_str
+                    for rr in range(r + 1, min(r + 5, R)):
+                        combined_text += _norm("".join(arr[rr]))
+                    if "상환전환우선주" in combined_text: stock_type = "상환전환우선주"
+                    elif "전환우선주" in combined_text: stock_type = "전환우선주"
+                    elif "우선주" in combined_text: stock_type = "우선주식"
+                    elif "종류주" in combined_text: stock_type = "종류주식"
+                    elif "기타주" in combined_text: stock_type = "기타주식"
+                    break
+
+    # 마지막 안전장치
+    if not best_amt:
+        val = scan_label_value(dfs, ["신주의 종류와 수", "발행예정주식", "발행예정주식수"])
+        amt = _max_int_in_text(val)
+        if amt and amt > 100:
+            best_amt = amt
+            
+    return best_amt, stock_type
+
 
 # ==========================================================
 # 레코드 파싱 로직  
@@ -717,7 +740,15 @@ def parse_rights_issue_record(dfs, t: Target, corr_after, html_raw, company_mark
                     if amt is not None and amt > min_val: return amt
         return None
 
-    prev_shares = get_corr_num(["증자전발행주식총수", "기발행주식총수", "발행주식총수", "증자전 주식수", "증자전발행주식총수(보통주식)"])
+    # [핵심 개선] 증자전 주식수도 신규발행주식수와 동일하게 구역 분리 엔진 적용 (겹침 방지)
+    prev_shares = get_shares_by_exact_section(
+        dfs, corr_after, 
+        ["증자전발행주식총수", "기발행주식총수", "발행주식총수", "증자전주식수"], 
+        ["신주의종류와수", "발행예정주식", "자금조달", "증자방식", "신주발행"]
+    )
+    
+    if not prev_shares:
+        prev_shares = get_corr_num(["증자전발행주식총수", "기발행주식총수", "발행주식총수", "증자전 주식수", "증자전발행주식총수(보통주식)"])
     if not prev_shares:
         prev_shares = _max_int_in_text(scan_label_value(dfs, ["증자전발행주식총수", "기발행주식총수", "발행주식총수", "증자전 주식수", "증자전발행주식총수(보통주식)"]))
     if not prev_shares:
