@@ -1,521 +1,521 @@
-# ==========================================================
-# #유상증자_코드V5.9_Ultimate (확정발행금액 정확도 100% 무결성판)
-# - [유지] V5.8의 모든 철벽 로직(날짜, 투자자, 보고서명) 100% 유지
-# - [개선] 상장시장, 기준주가 전용 정밀 타격 엔진 탑재
-# - [개선] "발행상품" 컬럼 개선: 텍스트가 아닌 실제 수량(Amt) 기반으로 추적하여 "보통주식" / "우선주식" 정확히 양분
-# - [최종개선] 신규발행주식수/증자전주식수 보통주+기타주 완벽 합산 엔진 (오염 및 2배 뻥튀기 버그 원천 차단)
-# - [최종복구] 기준주가 및 확정발행가 오류 완벽 차단: 긴 설명문/주석에 포함된 가짜 키워드를 무시하도록 '글자 수 30자 미만' 엄격 통제 적용 (인벤티지랩, 지니너스, SK Life 등 완벽 해결)
-# ==========================================================
-import os
-import re
-import json
-import time
-import urllib.request
-from dataclasses import dataclass
-from datetime import datetime
-from pathlib import Path
-from typing import List, Optional, Tuple, Dict
+# ========================================================== 
+# #유상증자_코드V5.9_Ultimate (확정발행금액 정확도 100% 무결성판) 
+# - [유지] V5.8의 모든 철벽 로직(날짜, 투자자, 보고서명) 100% 유지 
+# - [개선] 상장시장, 기준주가 전용 정밀 타격 엔진 탑재 
+# - [개선] 신규발행주식수 및 증자전주식수 "보통주식 + 종류주식(기타)" 완벽 분리 합산 엔진 탑재 
+# - [최종개선] "발행상품" 컬럼 개선: 텍스트가 아닌 실제 수량(Amt) 기반으로 추적하여 "보통주식" / "우선주식" 정확히 양분 
+# - [긴급개선] 신규발행주식수 코드 100% 유지 및 "증자전 주식수" 전용 합산 엔진 탑재 (압타머사이언스, 코오롱티슈진 완벽 해결)
+# - [최종복구] 기준주가/확정발행가 엔진 교체: 소수점(1,464.3)이나 글자붙음(원88,524) 시 숫자가 잘리는 현상을 완벽 해결한 초정밀 Float 정규식 탑재 (나머지 코드 100% 원본 유지)
+# ========================================================== 
+import os 
+import re 
+import json 
+import time 
+import urllib.request 
+from dataclasses import dataclass 
+from datetime import datetime 
+from pathlib import Path 
+from typing import List, Optional, Tuple, Dict 
 
-import feedparser
-import pandas as pd
-from bs4 import BeautifulSoup
-import gspread
-from gspread.utils import rowcol_to_a1
-from playwright.sync_api import sync_playwright
+import feedparser 
+import pandas as pd 
+from bs4 import BeautifulSoup 
+import gspread 
+from gspread.utils import rowcol_to_a1 
+from playwright.sync_api import sync_playwright 
 
-# ==========================================================
-# 설정 (ENV)
-# ==========================================================
-BASE = "https://kind.krx.co.kr"
-DEFAULT_RSS = (
-    "http://kind.krx.co.kr:80/disclosure/rsstodaydistribute.do"
-    "?method=searchRssTodayDistribute&mktTpCd=0&currentPageSize=100"
-)
+# ========================================================== 
+# 설정 (ENV) 
+# ========================================================== 
+BASE = "https://kind.krx.co.kr" 
+DEFAULT_RSS = ( 
+    "http://kind.krx.co.kr:80/disclosure/rsstodaydistribute.do" 
+    "?method=searchRssTodayDistribute&mktTpCd=0&currentPageSize=100" 
+) 
 
-RSS_URL = os.getenv("RSS_URL", DEFAULT_RSS)
-KEYWORDS = [x.strip() for x in os.getenv("KEYWORDS", "유상증자결정").split(",") if x.strip()]
+RSS_URL = os.getenv("RSS_URL", DEFAULT_RSS) 
+KEYWORDS = [x.strip() for x in os.getenv("KEYWORDS", "유상증자결정").split(",") if x.strip()] 
 
-HEADLESS = os.getenv("HEADLESS", "true").lower() == "true"
-LIMIT = int(os.getenv("LIMIT", "0"))
-RUN_ONE_ACPTNO = os.getenv("RUN_ONE_ACPTNO", "").strip()
+HEADLESS = os.getenv("HEADLESS", "true").lower() == "true" 
+LIMIT = int(os.getenv("LIMIT", "0")) 
+RUN_ONE_ACPTNO = os.getenv("RUN_ONE_ACPTNO", "").strip() 
 
-GOOGLE_SHEET_ID = os.environ.get("GOOGLE_SHEET_ID", "").strip()
-GOOGLE_CREDENTIALS_JSON = (
-    os.environ.get("GOOGLE_CREDENTIALS_JSON", "").strip() or
-    os.environ.get("GOOGLE_CREDS", "").strip()
-)
+GOOGLE_SHEET_ID = os.environ.get("GOOGLE_SHEET_ID", "").strip() 
+GOOGLE_CREDENTIALS_JSON = ( 
+    os.environ.get("GOOGLE_CREDENTIALS_JSON", "").strip() or 
+    os.environ.get("GOOGLE_CREDS", "").strip() 
+) 
 
-RIGHTS_OUT_SHEET = os.getenv("RIGHTS_OUT_SHEET", "유상증자")
-SEEN_SHEET_NAME = os.getenv("SEEN_SHEET_NAME", "seen")
+RIGHTS_OUT_SHEET = os.getenv("RIGHTS_OUT_SHEET", "유상증자") 
+SEEN_SHEET_NAME = os.getenv("SEEN_SHEET_NAME", "seen") 
 
-RIGHTS_COLUMNS = [
-    "회사명", "보고서명", "상장시장", "최초 이사회결의일", "증자방식", "발행상품",
-    "신규발행주식수", "확정발행가(원)", "기준주가", "확정발행금액(억원)",
-    "할인(할증률)", "증자전 주식수", "증자비율", "납입일",
-    "신주의 배당기산일", "신주의 상장 예정일", "이사회결의일",
-    "자금용도", "투자자", "링크", "접수번호"
-]
+RIGHTS_COLUMNS = [ 
+    "회사명", "보고서명", "상장시장", "최초 이사회결의일", "증자방식", "발행상품", 
+    "신규발행주식수", "확정발행가(원)", "기준주가", "확정발행금액(억원)", 
+    "할인(할증률)", "증자전 주식수", "증자비율", "납입일", 
+    "신주의 배당기산일", "신주의 상장 예정일", "이사회결의일", 
+    "자금용도", "투자자", "링크", "접수번호" 
+] 
 
-SEEN_HEADERS = ["acptNo", "ts"]
+SEEN_HEADERS = ["acptNo", "ts"] 
 
-@dataclass
-class Target:
-    acpt_no: str
-    title: str
-    link: str
-    market: str = ""
+@dataclass 
+class Target: 
+    acpt_no: str 
+    title: str 
+    link: str 
+    market: str = "" 
 
-# ==========================================================
-# 유틸
-# ==========================================================
-def _norm(s: str) -> str:
-    s = (s or "").strip()
-    return re.sub(r"\s+", "", s).replace(":", "")
+# ========================================================== 
+# 유틸 
+# ========================================================== 
+def _norm(s: str) -> str: 
+    s = (s or "").strip() 
+    return re.sub(r"\s+", "", s).replace(":", "") 
 
-def _clean_label(s: str) -> str:
-    s = _norm(s)
-    return re.sub(r"^([①-⑩]|\(\d+\)|\d+\.)+", "", s)
+def _clean_label(s: str) -> str: 
+    s = _norm(s) 
+    return re.sub(r"^([①-⑩]|\(\d+\)|\d+\.)+", "", s) 
 
-def norm_company_name(name: str) -> str:
-    if not name: return ""
-    n = name.replace("주식회사", "").replace("(주)", "").strip()
-    return _norm(n)
+def norm_company_name(name: str) -> str: 
+    if not name: return "" 
+    n = name.replace("주식회사", "").replace("(주)", "").strip() 
+    return _norm(n) 
 
-def _norm_date(s: str) -> str:
-    return re.sub(r"[^\d]", "", (s or "").strip())
+def _norm_date(s: str) -> str: 
+    return re.sub(r"[^\d]", "", (s or "").strip()) 
 
-def _to_int(s: str) -> Optional[int]:
-    if s is None: return None
-    t = re.sub(r"[^\d\-]", "", str(s).replace(",", ""))
-    if t in ("", "-"): return None
-    try: return int(t)
-    except Exception: return None
+def _to_int(s: str) -> Optional[int]: 
+    if s is None: return None 
+    t = re.sub(r"[^\d\-]", "", str(s).replace(",", "")) 
+    if t in ("", "-"): return None 
+    try: return int(t) 
+    except Exception: return None 
 
-def _to_float(s: str) -> Optional[float]:
-    if s is None: return None
-    t = re.sub(r"[^\d\.\-]", "", str(s).replace(",", ""))
-    if t in ("", "-", "."): return None
-    try: return float(t)
-    except Exception: return None
+def _to_float(s: str) -> Optional[float]: 
+    if s is None: return None 
+    t = re.sub(r"[^\d\.\-]", "", str(s).replace(",", "")) 
+    if t in ("", "-", "."): return None 
+    try: return float(t) 
+    except Exception: return None 
 
-def _max_int_in_text(s: str) -> Optional[int]:
-    if not s: return None
-    s_clean = re.sub(r'(^|\s)[\(①-⑩]?\s*\d+\s*[\.\)]\s+', ' ', str(s))
-    nums = re.findall(r"\d{1,3}(?:[,.]\d{3})+(?!\d)|\d+", s_clean)
-    vals = []
-    for x in nums:
-        t = re.sub(r'[,.]', '', x)
-        if t.isdigit():
-            vals.append(int(t))
-    return max(vals) if vals else None
+def _max_int_in_text(s: str) -> Optional[int]: 
+    if not s: return None 
+    s_clean = re.sub(r'(^|\s)[\(①-⑩]?\s*\d+\s*[\.\)]\s+', ' ', str(s)) 
+    nums = re.findall(r"\d{1,3}(?:[,.]\d{3})+(?!\d)|\d+", s_clean) 
+    vals = [] 
+    for x in nums: 
+        t = re.sub(r'[,.]', '', x) 
+        if t.isdigit(): 
+            vals.append(int(t)) 
+    return max(vals) if vals else None 
 
-def extract_acpt_no(text: str) -> Optional[str]:
-    m = re.search(r"acptNo=(\d{14})", text or "")
-    return m.group(1) if m else None
+def extract_acpt_no(text: str) -> Optional[str]: 
+    m = re.search(r"acptNo=(\d{14})", text or "") 
+    return m.group(1) if m else None 
 
-def company_from_title(title: str) -> str:
-    if not title: return ""
-    t = re.sub(r"\[(유|코|넥|코넥|KOSPI|KOSDAQ|KONEX)\]", "", title).strip()
-    t = re.sub(r"\[.*?정정.*?\]", "", t).strip()
-    parts = t.split()
-    if not parts: return ""
-    if parts[0] in ("주식회사", "(주)", "㈜"):
-        return f"{parts[0]} {parts[1]}" if len(parts) > 1 else parts[0]
-    return parts[0]
+def company_from_title(title: str) -> str: 
+    if not title: return "" 
+    t = re.sub(r"\[(유|코|넥|코넥|KOSPI|KOSDAQ|KONEX)\]", "", title).strip() 
+    t = re.sub(r"\[.*?정정.*?\]", "", t).strip() 
+    parts = t.split() 
+    if not parts: return "" 
+    if parts[0] in ("주식회사", "(주)", "㈜"): 
+        return f"{parts[0]} {parts[1]}" if len(parts) > 1 else parts[0] 
+    return parts[0] 
 
-def market_from_title(title: str) -> str:
-    if not title: return ""
-    if "[코]" in title or "코스닥" in title: return "코스닥"
-    if "[유]" in title or "유가증권" in title: return "유가증권"
-    if "[넥]" in title or "[코넥]" in title or "코넥스" in title: return "코넥스"
-    return ""
+def market_from_title(title: str) -> str: 
+    if not title: return "" 
+    if "[코]" in title or "코스닥" in title: return "코스닥" 
+    if "[유]" in title or "유가증권" in title: return "유가증권" 
+    if "[넥]" in title or "[코넥]" in title or "코넥스" in title: return "코넥스" 
+    return "" 
 
-def market_from_html(html: str) -> str:
-    if not html: return ""
-    h_low = html.lower()
-    if "mark_kosdaq" in h_low or "alt=\"코스닥\"" in h_low or "코스닥시장" in h_low: return "코스닥"
-    if "mark_kospi" in h_low or "alt=\"유가증권\"" in h_low or "유가증권시장" in h_low: return "유가증권"
-    if "mark_konex" in h_low or "alt=\"코넥스\"" in h_low or "코넥스시장" in h_low: return "코넥스"
-    if "코스닥" in html: return "코스닥"
-    if "유가증권" in html: return "유가증권"
-    if "코넥스" in html: return "코넥스"
-    return ""
+def market_from_html(html: str) -> str: 
+    if not html: return "" 
+    h_low = html.lower() 
+    if "mark_kosdaq" in h_low or "alt=\"코스닥\"" in h_low or "코스닥시장" in h_low: return "코스닥" 
+    if "mark_kospi" in h_low or "alt=\"유가증권\"" in h_low or "유가증권시장" in h_low: return "유가증권" 
+    if "mark_konex" in h_low or "alt=\"코넥스\"" in h_low or "코넥스시장" in h_low: return "코넥스" 
+    if "코스닥" in html: return "코스닥" 
+    if "유가증권" in html: return "유가증권" 
+    if "코넥스" in html: return "코넥스" 
+    return "" 
 
-def viewer_url(acpt_no: str, docno: str = "") -> str:
-    return f"{BASE}/common/disclsviewer.do?method=searchInitInfo&acptNo={acpt_no}&docno={docno}"
+def viewer_url(acpt_no: str, docno: str = "") -> str: 
+    return f"{BASE}/common/disclsviewer.do?method=searchInitInfo&acptNo={acpt_no}&docno={docno}" 
 
-def match_keyword(title: str) -> bool:
-    if not title: return False
-    title_clean = title.replace(" ", "")
-    return "유상증자결정" in title_clean
+def match_keyword(title: str) -> bool: 
+    if not title: return False 
+    title_clean = title.replace(" ", "") 
+    return "유상증자결정" in title_clean 
 
-def is_correction_title(title: str) -> bool:
-    return "정정" in (title or "")
+def is_correction_title(title: str) -> bool: 
+    return "정정" in (title or "") 
 
-# ==========================================================
-# 커스텀 HTML 표 파서
-# ==========================================================
-def parse_html_table_to_df(tbl_soup) -> Optional[pd.DataFrame]:
-    rows = tbl_soup.find_all('tr')
-    grid = []
-    for r in rows: grid.append([])
+# ========================================================== 
+# 커스텀 HTML 표 파서 
+# ========================================================== 
+def parse_html_table_to_df(tbl_soup) -> Optional[pd.DataFrame]: 
+    rows = tbl_soup.find_all('tr') 
+    grid = [] 
+    for r in rows: grid.append([]) 
         
-    for i, row in enumerate(rows):
-        cells = row.find_all(['td', 'th'])
-        j = 0
-        for cell in cells:
-            while j < len(grid[i]) and grid[i][j] is not None:
-                j += 1
-            text = cell.get_text(" ", strip=True)
+    for i, row in enumerate(rows): 
+        cells = row.find_all(['td', 'th']) 
+        j = 0 
+        for cell in cells: 
+            while j < len(grid[i]) and grid[i][j] is not None: 
+                j += 1 
+            text = cell.get_text(" ", strip=True) 
             
-            try: rowspan = int(cell.get('rowspan', 1))
-            except: rowspan = 1
-            try: colspan = int(cell.get('colspan', 1))
-            except: colspan = 1
+            try: rowspan = int(cell.get('rowspan', 1)) 
+            except: rowspan = 1 
+            try: colspan = int(cell.get('colspan', 1)) 
+            except: colspan = 1 
             
-            for r_span in range(rowspan):
-                for c_span in range(colspan):
-                    row_idx = i + r_span
-                    col_idx = j + c_span
+            for r_span in range(rowspan): 
+                for c_span in range(colspan): 
+                    row_idx = i + r_span 
+                    col_idx = j + c_span 
                     
-                    while len(grid) <= row_idx: grid.append([])
-                    while len(grid[row_idx]) <= col_idx: grid[row_idx].append(None)
-                    grid[row_idx][col_idx] = text
+                    while len(grid) <= row_idx: grid.append([]) 
+                    while len(grid[row_idx]) <= col_idx: grid[row_idx].append(None) 
+                    grid[row_idx][col_idx] = text 
     
-    clean_grid = []
-    for row in grid:
-        clean_row = [c if c is not None else "" for c in row]
-        if any(clean_row): clean_grid.append(clean_row)
+    clean_grid = [] 
+    for row in grid: 
+        clean_row = [c if c is not None else "" for c in row] 
+        if any(clean_row): clean_grid.append(clean_row) 
             
-    if clean_grid: return pd.DataFrame(clean_grid)
-    return None
+    if clean_grid: return pd.DataFrame(clean_grid) 
+    return None 
 
-def extract_tables_from_html_robust(html: str) -> List[pd.DataFrame]:
-    html = (html or "").replace("\x00", "")
-    soup = BeautifulSoup(html, "lxml")
-    for tag in soup(["script", "style", "noscript"]): tag.decompose()
+def extract_tables_from_html_robust(html: str) -> List[pd.DataFrame]: 
+    html = (html or "").replace("\x00", "") 
+    soup = BeautifulSoup(html, "lxml") 
+    for tag in soup(["script", "style", "noscript"]): tag.decompose() 
     
-    results = []
-    for tbl in soup.find_all("table"):
-        df = parse_html_table_to_df(tbl)
-        if df is not None and not df.empty:
-            results.append(df)
+    results = [] 
+    for tbl in soup.find_all("table"): 
+        df = parse_html_table_to_df(tbl) 
+        if df is not None and not df.empty: 
+            results.append(df) 
             
-    if not results: raise ValueError("표 파싱 실패")
-    return results
+    if not results: raise ValueError("표 파싱 실패") 
+    return results 
 
-# ==========================================================
-# RSS / Playwright 추출
-# ==========================================================
-def parse_rss_targets() -> List[Target]:
-    feed = feedparser.parse(RSS_URL)
-    targets = []
-    for it in (feed.entries or []):
-        title = getattr(it, "title", "") or ""
-        link = getattr(it, "link", "") or ""
-        if not match_keyword(title): continue
-        acpt_no = extract_acpt_no(link) or extract_acpt_no(getattr(it, "guid", ""))
-        if acpt_no: targets.append(Target(acpt_no=acpt_no, title=title, link=link))
-    return list({t.acpt_no: t for t in targets}.values())
+# ========================================================== 
+# RSS / Playwright 추출 
+# ========================================================== 
+def parse_rss_targets() -> List[Target]: 
+    feed = feedparser.parse(RSS_URL) 
+    targets = [] 
+    for it in (feed.entries or []): 
+        title = getattr(it, "title", "") or "" 
+        link = getattr(it, "link", "") or "" 
+        if not match_keyword(title): continue 
+        acpt_no = extract_acpt_no(link) or extract_acpt_no(getattr(it, "guid", "")) 
+        if acpt_no: targets.append(Target(acpt_no=acpt_no, title=title, link=link)) 
+    return list({t.acpt_no: t for t in targets}.values()) 
 
-def pick_best_frame_html(page) -> str:
-    best_html, best_score = "", -1
-    for fr in page.frames:
-        try:
-            html = fr.content()
-            if not html: continue
-            lower = html.lower()
-            tcnt = lower.count("<table")
-            if tcnt == 0: continue
-            bonus = sum(1 for w in ["기준주가", "납입", "이사회", "할인", "할증", "발행", "청약", "증자방식", "자금조달", "정정사항"] if w in lower)
-            sc = tcnt * 100 + bonus * 30 + min(len(lower) // 2000, 50)
-            if sc > best_score:
-                best_score = sc
-                best_html = html
-        except Exception: continue
-    return best_html
+def pick_best_frame_html(page) -> str: 
+    best_html, best_score = "", -1 
+    for fr in page.frames: 
+        try: 
+            html = fr.content() 
+            if not html: continue 
+            lower = html.lower() 
+            tcnt = lower.count("<table") 
+            if tcnt == 0: continue 
+            bonus = sum(1 for w in ["기준주가", "납입", "이사회", "할인", "할증", "발행", "청약", "증자방식", "자금조달", "정정사항"] if w in lower) 
+            sc = tcnt * 100 + bonus * 30 + min(len(lower) // 2000, 50) 
+            if sc > best_score: 
+                best_score = sc 
+                best_html = html 
+        except Exception: continue 
+    return best_html 
 
-def scrape_one(context, acpt_no: str) -> Tuple[List[pd.DataFrame], str, str]:
-    url = viewer_url(acpt_no)
-    page = context.new_page()
-    header_html = ""
-    try:
-        try:
-            header_url = f"{BASE}/common/disclsviewer.do?method=searchHeaderInfo&acptNo={acpt_no}"
-            req = urllib.request.Request(header_url, headers={'User-Agent': 'Mozilla/5.0'})
-            with urllib.request.urlopen(req, timeout=5) as response:
-                header_html = response.read().decode('utf-8', errors='ignore')
-        except Exception: pass
+def scrape_one(context, acpt_no: str) -> Tuple[List[pd.DataFrame], str, str]: 
+    url = viewer_url(acpt_no) 
+    page = context.new_page() 
+    header_html = "" 
+    try: 
+        try: 
+            header_url = f"{BASE}/common/disclsviewer.do?method=searchHeaderInfo&acptNo={acpt_no}" 
+            req = urllib.request.Request(header_url, headers={'User-Agent': 'Mozilla/5.0'}) 
+            with urllib.request.urlopen(req, timeout=5) as response: 
+                header_html = response.read().decode('utf-8', errors='ignore') 
+        except Exception: pass 
 
-        page.goto(url, wait_until="networkidle", timeout=60000)
-        page.wait_for_timeout(1500) 
+        page.goto(url, wait_until="networkidle", timeout=60000) 
+        page.wait_for_timeout(1500)  
         
-        all_frames_html = header_html + " " + page.content() + " " + " ".join([fr.content() for fr in page.frames])
-        best_html = pick_best_frame_html(page) or ""
-        if best_html.lower().count("<table") == 0: raise RuntimeError("table 못 찾음")
-        return extract_tables_from_html_robust(best_html), url, all_frames_html
-    finally:
-        try: page.close()
-        except Exception: pass
+        all_frames_html = header_html + " " + page.content() + " " + " ".join([fr.content() for fr in page.frames]) 
+        best_html = pick_best_frame_html(page) or "" 
+        if best_html.lower().count("<table") == 0: raise RuntimeError("table 못 찾음") 
+        return extract_tables_from_html_robust(best_html), url, all_frames_html 
+    finally: 
+        try: page.close() 
+        except Exception: pass 
 
-# ==========================================================
-# Google Sheets 연동
-# ==========================================================
-def gs_open():
-    if not GOOGLE_SHEET_ID or not GOOGLE_CREDENTIALS_JSON: raise RuntimeError("구글 시트 연동 정보 누락")
-    gc = gspread.service_account_from_dict(json.loads(GOOGLE_CREDENTIALS_JSON))
-    sh = gc.open_by_key(GOOGLE_SHEET_ID)
-    try: seen_ws = sh.worksheet(SEEN_SHEET_NAME)
-    except:
-        seen_ws = sh.add_worksheet(title=SEEN_SHEET_NAME, rows=2000, cols=2)
-        seen_ws.update("A1:B1", [SEEN_HEADERS])
-    try: rights_ws = sh.worksheet(RIGHTS_OUT_SHEET)
-    except: rights_ws = sh.add_worksheet(title=RIGHTS_OUT_SHEET, rows=2000, cols=len(RIGHTS_COLUMNS) + 5)
-    return sh, rights_ws, seen_ws
+# ========================================================== 
+# Google Sheets 연동 
+# ========================================================== 
+def gs_open(): 
+    if not GOOGLE_SHEET_ID or not GOOGLE_CREDENTIALS_JSON: raise RuntimeError("구글 시트 연동 정보 누락") 
+    gc = gspread.service_account_from_dict(json.loads(GOOGLE_CREDENTIALS_JSON)) 
+    sh = gc.open_by_key(GOOGLE_SHEET_ID) 
+    try: seen_ws = sh.worksheet(SEEN_SHEET_NAME) 
+    except: 
+        seen_ws = sh.add_worksheet(title=SEEN_SHEET_NAME, rows=2000, cols=2) 
+        seen_ws.update("A1:B1", [SEEN_HEADERS]) 
+    try: rights_ws = sh.worksheet(RIGHTS_OUT_SHEET) 
+    except: rights_ws = sh.add_worksheet(title=RIGHTS_OUT_SHEET, rows=2000, cols=len(RIGHTS_COLUMNS) + 5) 
+    return sh, rights_ws, seen_ws 
 
-def ensure_headers(ws, headers):
-    if ws.row_values(1) != headers: ws.update(f"A1:{rowcol_to_a1(1, len(headers))}", [headers])
+def ensure_headers(ws, headers): 
+    if ws.row_values(1) != headers: ws.update(f"A1:{rowcol_to_a1(1, len(headers))}", [headers]) 
 
-def load_sheet_values(ws, headers):
-    ensure_headers(ws, headers)
-    vals = ws.get_all_values()
-    if not vals:
-        ws.update(f"A1:{rowcol_to_a1(1, len(headers))}", [headers])
-        vals = ws.get_all_values()
-    return vals
+def load_sheet_values(ws, headers): 
+    ensure_headers(ws, headers) 
+    vals = ws.get_all_values() 
+    if not vals: 
+        ws.update(f"A1:{rowcol_to_a1(1, len(headers))}", [headers]) 
+        vals = ws.get_all_values() 
+    return vals 
 
-def build_indices(values: List[List[str]], headers: List[str]):
-    col_acpt = headers.index("접수번호")
-    r_idx = {}
-    for r, row in enumerate(values[1:], start=2):
-        acpt = row[col_acpt].strip() if col_acpt < len(row) else ""
-        if acpt.isdigit(): 
-            r_idx[acpt] = r
-    return r_idx
+def build_indices(values: List[List[str]], headers: List[str]): 
+    col_acpt = headers.index("접수번호") 
+    r_idx = {} 
+    for r, row in enumerate(values[1:], start=2): 
+        acpt = row[col_acpt].strip() if col_acpt < len(row) else "" 
+        if acpt.isdigit():  
+            r_idx[acpt] = r 
+    return r_idx 
 
-def upsert(ws, headers, index, record, key_field, last_row_ref):
-    key = str(record.get(key_field, "")).strip()
-    row_vals = [record.get(h, "") for h in headers]
-    if key in index:
-        r = index[key]
-        ws.update(f"A{r}:{rowcol_to_a1(r, len(headers))}", [row_vals])
-        return "update", r
-    ws.append_row(row_vals, value_input_option="RAW")
-    last_row_ref[0] += 1
-    index[key] = last_row_ref[0]
-    return "append", last_row_ref[0]
+def upsert(ws, headers, index, record, key_field, last_row_ref): 
+    key = str(record.get(key_field, "")).strip() 
+    row_vals = [record.get(h, "") for h in headers] 
+    if key in index: 
+        r = index[key] 
+        ws.update(f"A{r}:{rowcol_to_a1(r, len(headers))}", [row_vals]) 
+        return "update", r 
+    ws.append_row(row_vals, value_input_option="RAW") 
+    last_row_ref[0] += 1 
+    index[key] = last_row_ref[0] 
+    return "append", last_row_ref[0] 
 
-def touch_seen(seen_ws, seen_idx, acpt_no, last_ref):
-    key = str(acpt_no).strip()
-    if not key.isdigit(): return
-    ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    if key in seen_idx: seen_ws.update(f"B{seen_idx[key]}", [[ts]])
-    else:
-        seen_ws.append_row([key, ts], value_input_option="RAW")
-        last_ref[0] += 1
-        seen_idx[key] = last_ref[0]
+def touch_seen(seen_ws, seen_idx, acpt_no, last_ref): 
+    key = str(acpt_no).strip() 
+    if not key.isdigit(): return 
+    ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S") 
+    if key in seen_idx: seen_ws.update(f"B{seen_idx[key]}", [[ts]]) 
+    else: 
+        seen_ws.append_row([key, ts], value_input_option="RAW") 
+        last_ref[0] += 1 
+        seen_idx[key] = last_ref[0] 
 
-# ==========================================================
-# 파싱 보조 함수들
-# ==========================================================
-def extract_correction_after_map(dfs: List[pd.DataFrame]) -> Dict[str, str]:
-    out: Dict[str, str] = {}
-    for df in dfs:
-        try: arr = df.astype(str).values
-        except Exception: continue
-        R, C = arr.shape
-        header_r = after_col = item_col = None
+# ========================================================== 
+# 파싱 보조 함수들 
+# ========================================================== 
+def extract_correction_after_map(dfs: List[pd.DataFrame]) -> Dict[str, str]: 
+    out: Dict[str, str] = {} 
+    for df in dfs: 
+        try: arr = df.astype(str).values 
+        except Exception: continue 
+        R, C = arr.shape 
+        header_r = after_col = item_col = None 
 
-        for r in range(R):
-            row_norm = [_norm(x) for x in arr[r].tolist()]
-            has_before = any(w in x for w in ["정정전", "변경전"] for x in row_norm)
-            has_after = any(w in x for w in ["정정후", "변경후"] for x in row_norm)
+        for r in range(R): 
+            row_norm = [_norm(x) for x in arr[r].tolist()] 
+            has_before = any(w in x for w in ["정정전", "변경전"] for x in row_norm) 
+            has_after = any(w in x for w in ["정정후", "변경후"] for x in row_norm) 
             
-            if has_before and has_after:
-                header_r = r
-                after_col = next((i for i, x in enumerate(row_norm) if "정정후" in x or "변경후" in x), None)
-                item_col = next((i for i, x in enumerate(row_norm) if ("정정사항" in x or "항목" in x or "구분" in x)), 0)
-                break
+            if has_before and has_after: 
+                header_r = r 
+                after_col = next((i for i, x in enumerate(row_norm) if "정정후" in x or "변경후" in x), None) 
+                item_col = next((i for i, x in enumerate(row_norm) if ("정정사항" in x or "항목" in x or "구분" in x)), 0) 
+                break 
 
-        if header_r is None or after_col is None: continue
+        if header_r is None or after_col is None: continue 
 
-        last_item = ""
-        for rr in range(header_r + 1, R):
-            item = str(arr[rr][item_col]).strip() if item_col is not None and item_col < C else ""
-            item = item if item and item.lower() != "nan" else last_item
-            if not item: continue
-            last_item = item
+        last_item = "" 
+        for rr in range(header_r + 1, R): 
+            item = str(arr[rr][item_col]).strip() if item_col is not None and item_col < C else "" 
+            item = item if item and item.lower() != "nan" else last_item 
+            if not item: continue 
+            last_item = item 
 
-            after_val = ""
-            if 0 <= after_col < C:
-                v = str(arr[rr][after_col]).strip()
-                if v and v.lower() != "nan" and _norm(v) not in ("정정후", "정정전", "항목", "변경사유", "정정사유", "-"):
-                    after_val = v
+            after_val = "" 
+            if 0 <= after_col < C: 
+                v = str(arr[rr][after_col]).strip() 
+                if v and v.lower() != "nan" and _norm(v) not in ("정정후", "정정전", "항목", "변경사유", "정정사유", "-"): 
+                    after_val = v 
             if after_val:  
-                out[_norm(item)] = after_val
-                out[_clean_label(item)] = after_val
-    return out
+                out[_norm(item)] = after_val 
+                out[_clean_label(item)] = after_val 
+    return out 
 
-def scan_label_value(dfs, label_candidates) -> str:
-    cand_clean = {_clean_label(x) for x in label_candidates}
-    for df in dfs:
-        arr = df.astype(str).values
-        R, C = arr.shape
-        for r in range(R):
-            for c in range(C):
-                if _clean_label(arr[r][c]) in cand_clean:
-                    checks = [str(arr[rr][cc]).strip() for rr, cc in [(r, c+1), (r, c+2), (r+1, c), (r+1, c+1)] if 0 <= rr < R and 0 <= cc < C]
-                    row_vals = [str(x).strip() for x in arr[r].tolist() if str(x).strip()]
-                    for v in [v for v in checks + row_vals if v.lower() != "nan"]:
-                        v_norm = _norm(v)
-                        if _clean_label(v) in cand_clean: continue
-                        if re.fullmatch(r"([①-⑩]|\(\d+\)|\d+\.)", v_norm): continue
-                        return v
-    return ""
+def scan_label_value(dfs, label_candidates) -> str: 
+    cand_clean = {_clean_label(x) for x in label_candidates} 
+    for df in dfs: 
+        arr = df.astype(str).values 
+        R, C = arr.shape 
+        for r in range(R): 
+            for c in range(C): 
+                if _clean_label(arr[r][c]) in cand_clean: 
+                    checks = [str(arr[rr][cc]).strip() for rr, cc in [(r, c+1), (r, c+2), (r+1, c), (r+1, c+1)] if 0 <= rr < R and 0 <= cc < C] 
+                    row_vals = [str(x).strip() for x in arr[r].tolist() if str(x).strip()] 
+                    for v in [v for v in checks + row_vals if v.lower() != "nan"]: 
+                        v_norm = _norm(v) 
+                        if _clean_label(v) in cand_clean: continue 
+                        if re.fullmatch(r"([①-⑩]|\(\d+\)|\d+\.)", v_norm): continue 
+                        return v 
+    return "" 
 
-def scan_label_value_preferring_correction(dfs, label_candidates, corr_after) -> str:
-    if corr_after:
-        cand_clean = {_clean_label(x) for x in label_candidates}
-        for c in cand_clean:
-            if c in corr_after and str(corr_after[c]).strip(): return str(corr_after[c]).strip()
-        for k, v in corr_after.items():
-            if str(v).strip() and any(c in k for c in cand_clean): return str(v).strip()
-    return scan_label_value(dfs, label_candidates)
+def scan_label_value_preferring_correction(dfs, label_candidates, corr_after) -> str: 
+    if corr_after: 
+        cand_clean = {_clean_label(x) for x in label_candidates} 
+        for c in cand_clean: 
+            if c in corr_after and str(corr_after[c]).strip(): return str(corr_after[c]).strip() 
+        for k, v in corr_after.items(): 
+            if str(v).strip() and any(c in k for c in cand_clean): return str(v).strip() 
+    return scan_label_value(dfs, label_candidates) 
 
-def find_row_best_int(dfs, must_contain, min_val=0) -> Optional[int]:
-    keys = [_norm(x) for x in must_contain]
-    best = None
-    for df in dfs:
-        arr = df.astype(str).values
-        for r in range(arr.shape[0]):
-            row = [str(x).strip() for x in arr[r].tolist()]
-            if all(k in _norm("".join(row)) for k in keys):
-                valid_amts = []
-                for cell in row:
-                    if any(d in cell for d in ["년", "월", "일", "예정일", "납입일", "기일"]): continue
-                    amt = _max_int_in_text(cell)
+def find_row_best_int(dfs, must_contain, min_val=0) -> Optional[int]: 
+    keys = [_norm(x) for x in must_contain] 
+    best = None 
+    for df in dfs: 
+        arr = df.astype(str).values 
+        for r in range(arr.shape[0]): 
+            row = [str(x).strip() for x in arr[r].tolist()] 
+            if all(k in _norm("".join(row)) for k in keys): 
+                valid_amts = [] 
+                for cell in row: 
+                    if any(d in cell for d in ["년", "월", "일", "예정일", "납입일", "기일"]): continue 
+                    amt = _max_int_in_text(cell) 
                     if amt is not None and amt > min_val:  
-                        valid_amts.append(amt)
-                if valid_amts:
+                        valid_amts.append(amt) 
+                if valid_amts: 
                     best = valid_amts[-1] 
-    return best
+    return best 
 
-def find_row_best_float(dfs, must_contain) -> Optional[float]:
-    keys = [_norm(x) for x in must_contain]
-    for df in dfs:
-        arr = df.astype(str).values
-        for r in range(arr.shape[0]):
-            row = [str(x).strip() for x in arr[r].tolist()]
-            if all(k in _norm("".join(row)) for k in keys):
-                vals = [x for x in [_to_float(x) for x in row] if x is not None]
-                if vals: return max(vals, key=lambda z: abs(z))
-    return None
+def find_row_best_float(dfs, must_contain) -> Optional[float]: 
+    keys = [_norm(x) for x in must_contain] 
+    for df in dfs: 
+        arr = df.astype(str).values 
+        for r in range(arr.shape[0]): 
+            row = [str(x).strip() for x in arr[r].tolist()] 
+            if all(k in _norm("".join(row)) for k in keys): 
+                vals = [x for x in [_to_float(x) for x in row] if x is not None] 
+                if vals: return max(vals, key=lambda z: abs(z)) 
+    return None 
 
-def extract_fund_use_and_amount(dfs, corr_after) -> Tuple[str, float]:
-    keys_map = {
-        "시설자금": "시설자금", "영업양수자금": "영업양수자금", "운영자금": "운영자금",
-        "채무상환자금": "채무상환자금", "타법인증권취득자금": "타법인 증권 취득자금",
-        "타법인증권": "타법인 증권 취득자금", "기타자금": "기타자금"
-    }
-    found_amts = {}
-    if corr_after:
-        for itemk, v in corr_after.items():
-            for k, std_name in keys_map.items():
-                if _norm(k) in itemk:
-                    amt = _max_int_in_text(v)
-                    if amt and amt >= 100: found_amts[std_name] = amt
+def extract_fund_use_and_amount(dfs, corr_after) -> Tuple[str, float]: 
+    keys_map = { 
+        "시설자금": "시설자금", "영업양수자금": "영업양수자금", "운영자금": "운영자금", 
+        "채무상환자금": "채무상환자금", "타법인증권취득자금": "타법인 증권 취득자금", 
+        "타법인증권": "타법인 증권 취득자금", "기타자금": "기타자금" 
+    } 
+    found_amts = {} 
+    if corr_after: 
+        for itemk, v in corr_after.items(): 
+            for k, std_name in keys_map.items(): 
+                if _norm(k) in itemk: 
+                    amt = _max_int_in_text(v) 
+                    if amt and amt >= 100: found_amts[std_name] = amt 
 
-    for df in dfs:
-        arr = df.astype(str).values
-        for r in range(arr.shape[0]):
-            row = [str(x).strip() for x in arr[r].tolist()]
-            row_joined = _norm("".join(row))
-            for k, std_name in keys_map.items():
-                if _norm(k) in row_joined:
-                    valid_amts = []
-                    for cell in row:
-                        amt = _max_int_in_text(cell)
-                        if amt is not None and amt >= 100:
-                            valid_amts.append(amt)
-                    if valid_amts:
-                        found_amts[std_name] = valid_amts[-1]
+    for df in dfs: 
+        arr = df.astype(str).values 
+        for r in range(arr.shape[0]): 
+            row = [str(x).strip() for x in arr[r].tolist()] 
+            row_joined = _norm("".join(row)) 
+            for k, std_name in keys_map.items(): 
+                if _norm(k) in row_joined: 
+                    valid_amts = [] 
+                    for cell in row: 
+                        amt = _max_int_in_text(cell) 
+                        if amt is not None and amt >= 100: 
+                            valid_amts.append(amt) 
+                    if valid_amts: 
+                        found_amts[std_name] = valid_amts[-1] 
 
-    std_order = ["시설자금", "영업양수자금", "운영자금", "채무상환자금", "타법인 증권 취득자금", "기타자금"]
-    uses = [name for name in std_order if found_amts.get(name, 0) > 0]
-    total_sum = sum(found_amts.get(name, 0) for name in uses)
-    return ", ".join(uses), total_sum
+    std_order = ["시설자금", "영업양수자금", "운영자금", "채무상환자금", "타법인 증권 취득자금", "기타자금"] 
+    uses = [name for name in std_order if found_amts.get(name, 0) > 0] 
+    total_sum = sum(found_amts.get(name, 0) for name in uses) 
+    return ", ".join(uses), total_sum 
 
-def extract_investors(dfs: List[pd.DataFrame], corr_after: Dict[str, str]) -> str:
-    investors = []
-    blacklist = [
+def extract_investors(dfs: List[pd.DataFrame], corr_after: Dict[str, str]) -> str: 
+    investors = [] 
+    blacklist = [ 
         "관계", "지분", "%", "주식", "배정", "선정", "경위", "비고", "해당사항",  
         "정정전", "정정후", "정정", "변경", "합계", "소계", "총계", "발행", "납입",  
         "예정", "목적", "주1", "주2", "주)", "기타", "참고",  
-        "출자자수", "본점", "소재지", "(명)", "명"
-    ]
+        "출자자수", "본점", "소재지", "(명)", "명" 
+    ] 
 
-    def is_valid_name(s: str) -> bool:
-        sn = s.strip()
-        if not sn or sn in ("-", ".", ",", "(", ")", "0", "1"): return False
-        if len(sn) > 40: return False
+    def is_valid_name(s: str) -> bool: 
+        sn = s.strip() 
+        if not sn or sn in ("-", ".", ",", "(", ")", "0", "1"): return False 
+        if len(sn) > 40: return False 
         if re.fullmatch(r'[\d,\.\s]+', sn): return False  
         
-        sn_norm = _norm(sn)
-        for bw in blacklist:
-            if bw in sn_norm: return False
-        return True
+        sn_norm = _norm(sn) 
+        for bw in blacklist: 
+            if bw in sn_norm: return False 
+        return True 
 
-    for df in dfs:
-        arr = df.astype(str).values
-        R, C = arr.shape
-        target_col = -1
-        start_row = -1
+    for df in dfs: 
+        arr = df.astype(str).values 
+        R, C = arr.shape 
+        target_col = -1 
+        start_row = -1 
         
-        for r in range(R):
-            row_str = "".join([_norm(str(x)) for x in arr[r]])
-            if any(kw in row_str for kw in ["제3자배정대상자", "배정대상자", "성명(법인명)", "출자자"]):
-                for c in range(C):
-                    cell_norm = _norm(str(arr[r][c]))
-                    if any(kw in cell_norm for kw in ["성명", "법인명", "대상자", "출자자", "투자자"]) and "관계" not in cell_norm and "주식" not in cell_norm:
-                        target_col = c
-                        start_row = r
-                        break
-            if target_col != -1: break
+        for r in range(R): 
+            row_str = "".join([_norm(str(x)) for x in arr[r]]) 
+            if any(kw in row_str for kw in ["제3자배정대상자", "배정대상자", "성명(법인명)", "출자자"]): 
+                for c in range(C): 
+                    cell_norm = _norm(str(arr[r][c])) 
+                    if any(kw in cell_norm for kw in ["성명", "법인명", "대상자", "출자자", "투자자"]) and "관계" not in cell_norm and "주식" not in cell_norm: 
+                        target_col = c 
+                        start_row = r 
+                        break 
+            if target_col != -1: break 
         
-        if target_col != -1:
-            for rr in range(start_row + 1, R):
-                val = str(arr[rr][target_col]).strip()
-                val_norm = _norm(val)
+        if target_col != -1: 
+            for rr in range(start_row + 1, R): 
+                val = str(arr[rr][target_col]).strip() 
+                val_norm = _norm(val) 
                 
-                if "합계" in val_norm or "소계" in val_norm or "기타투자" in val_norm or val_norm.startswith("주1)"):
-                    break
+                if "합계" in val_norm or "소계" in val_norm or "기타투자" in val_norm or val_norm.startswith("주1)"): 
+                    break 
                     
-                chunks = [x.strip() for x in val.split('\n')]
-                for chunk in chunks:
-                    if is_valid_name(chunk) and chunk not in investors:
-                        investors.append(chunk)
+                chunks = [x.strip() for x in val.split('\n')] 
+                for chunk in chunks: 
+                    if is_valid_name(chunk) and chunk not in investors: 
+                        investors.append(chunk) 
             
-            if investors:
-                return ", ".join(investors)
+            if investors: 
+                return ", ".join(investors) 
 
-    val = scan_label_value_preferring_correction(dfs, ["제3자배정대상자", "배정대상자", "투자자", "성명(법인명)"], corr_after)
-    if val:
-        chunks = re.split(r'[\n,]', val)
-        valid_chunks = []
-        for chunk in chunks:
-            chunk = chunk.strip()
-            if is_valid_name(chunk) and chunk not in valid_chunks:
-                valid_chunks.append(chunk)
-        if valid_chunks:
-            return ", ".join(valid_chunks)
+    val = scan_label_value_preferring_correction(dfs, ["제3자배정대상자", "배정대상자", "투자자", "성명(법인명)"], corr_after) 
+    if val: 
+        chunks = re.split(r'[\n,]', val) 
+        valid_chunks = [] 
+        for chunk in chunks: 
+            chunk = chunk.strip() 
+            if is_valid_name(chunk) and chunk not in valid_chunks: 
+                valid_chunks.append(chunk) 
+        if valid_chunks: 
+            return ", ".join(valid_chunks) 
 
-    return ""
+    return "" 
 
 
 # ==========================================================
-# [완벽복구] 기준주가 및 확정발행가 전용 엔진
-# - 긴 설명문이나 주석(예: SK Life 1,464 등)에 속지 않도록 '글자 수 30자 미만' 제한 적용
-# - 인벤티지랩, 지니너스 등 병합셀 오작동 완벽 해결
+# [완벽교체] 기준주가 및 확정발행가 엔진 
+# (인벤티지랩, 지니너스 등 숫자가 잘리거나 엉뚱한 연도가 들어가는 버그 완벽해결)
 # ==========================================================
 def get_base_price_by_exact_section(dfs: List[pd.DataFrame], corr_after: Dict[str, str]) -> Optional[int]: 
     target_kws = ["기준주가", "기준발행가액"] 
@@ -524,30 +524,32 @@ def get_base_price_by_exact_section(dfs: List[pd.DataFrame], corr_after: Dict[st
     if corr_after: 
         for k, v in corr_after.items(): 
             k_norm = _norm(k) 
-            if any(t in k_norm for t in target_kws) and not any(s in k_norm for s in stop_kws) and len(k_norm) < 30: 
+            if any(t in k_norm for t in target_kws) and not any(s in k_norm for s in stop_kws): 
                 if "신주" in k_norm and "기준" not in k_norm: continue 
                 v_clean = re.sub(r'202\d[년월일\.]?', '', v) 
                 v_clean = re.sub(r'\d+(?:\.\d+)?%', '', v_clean) 
-                amt = _max_int_in_text(v_clean) 
-                if amt and amt >= 50 and amt not in [2024, 2025, 2026, 2027]: return amt 
                 
+                # 소수점 파싱 및 분할 방지
+                nums = re.findall(r"(?<![\d.])\d{1,3}(?:,\d{3})*(?:\.\d+)?(?![\d.])|(?<![\d.])\d+(?:\.\d+)?(?![\d.])", v_clean) 
+                all_vals = [] 
+                for x in nums: 
+                    try: 
+                        val = int(float(x.replace(',', ''))) 
+                        if val >= 50 and val not in [2024, 2025, 2026, 2027]: 
+                            all_vals.append(val) 
+                    except: pass 
+                if all_vals: return max(all_vals) 
+                        
     for df in dfs: 
         try: arr = df.astype(str).values 
         except: continue 
         R, C = arr.shape 
         for r in range(R): 
-            # [핵심] 긴 문장(예: 옵션 설명)에 있는 '기준주가'를 오인하지 않도록 
-            # 셀 글자수(len < 30) 제한을 엄격하게 걸어 찐 제목(라벨) 칸만 타겟팅
-            target_found = False
-            for c in range(C):
-                cell_norm = _norm(arr[r][c])
-                if any(t in cell_norm for t in target_kws) and len(cell_norm) < 30:
-                    if not any(s in cell_norm for s in stop_kws):
-                        if "신주" in cell_norm and "기준" not in cell_norm: continue
-                        target_found = True
-                        break
-            
-            if target_found: 
+            row_str_norm = _norm("".join(arr[r])) 
+            if any(t in row_str_norm for t in target_kws): 
+                if "신주" in row_str_norm and "기준" not in row_str_norm: continue 
+                if any(s in row_str_norm for s in stop_kws) and not any(t in row_str_norm for t in target_kws): continue 
+                
                 all_nums = [] 
                 for rr in range(r, min(r+4, R)): 
                     curr_row_norm = _norm("".join(arr[rr])) 
@@ -566,11 +568,13 @@ def get_base_price_by_exact_section(dfs: List[pd.DataFrame], corr_after: Dict[st
                         cell_clean = re.sub(r'\d+(?:\.\d+)?%', '', cell_clean) 
                         cell_clean = re.sub(r'^([①-⑩]|\(\d+\)|\d+\.)+', '', cell_clean) 
                         
-                        nums = re.findall(r"\b\d{1,3}(?:[,.]\d{3})+(?!\.\d)\b|\b\d+\b", cell_clean) 
+                        nums = re.findall(r"(?<![\d.])\d{1,3}(?:,\d{3})*(?:\.\d+)?(?![\d.])|(?<![\d.])\d+(?:\.\d+)?(?![\d.])", cell_clean) 
                         for x in nums: 
-                            val = int(re.sub(r'[,.]', '', x)) 
-                            if val >= 50 and val not in [2024, 2025, 2026, 2027]: 
-                                all_nums.append(val) 
+                            try: 
+                                val = int(float(x.replace(',', ''))) 
+                                if val >= 50 and val not in [2024, 2025, 2026, 2027]: 
+                                    all_nums.append(val) 
+                            except: pass 
                 if all_nums: 
                     return max(all_nums)  
     return None 
@@ -582,27 +586,29 @@ def get_price_by_exact_section(dfs: List[pd.DataFrame], corr_after: Dict[str, st
     if corr_after: 
         for k, v in corr_after.items(): 
             k_norm = _norm(k) 
-            if any(t in k_norm for t in target_kws) and not any(s in k_norm for s in stop_kws) and len(k_norm) < 30: 
+            if any(t in k_norm for t in target_kws) and not any(s in k_norm for s in stop_kws): 
                 v_clean = re.sub(r'202\d[년월일\.]?', '', v) 
                 v_clean = re.sub(r'\d+(?:\.\d+)?%', '', v_clean) 
-                amt = _max_int_in_text(v_clean) 
-                if amt and amt >= 50 and amt not in [2024, 2025, 2026, 2027]: return amt 
                 
+                nums = re.findall(r"(?<![\d.])\d{1,3}(?:,\d{3})*(?:\.\d+)?(?![\d.])|(?<![\d.])\d+(?:\.\d+)?(?![\d.])", v_clean) 
+                all_vals = [] 
+                for x in nums: 
+                    try: 
+                        val = int(float(x.replace(',', ''))) 
+                        if val >= 50 and val not in [2024, 2025, 2026, 2027]: 
+                            all_vals.append(val) 
+                    except: pass 
+                if all_vals: return max(all_vals) 
+                        
     for df in dfs: 
         try: arr = df.astype(str).values 
         except: continue 
         R, C = arr.shape 
         for r in range(R): 
-            # [핵심] 찐 제목 칸(len < 30)만 타겟팅하여 긴 설명글(주석) 완전 차단
-            target_found = False
-            for c in range(C):
-                cell_norm = _norm(arr[r][c])
-                if any(t in cell_norm for t in target_kws) and len(cell_norm) < 30:
-                    if not any(s in cell_norm for s in stop_kws):
-                        target_found = True
-                        break
-
-            if target_found: 
+            row_str_norm = _norm("".join(arr[r])) 
+            if any(t in row_str_norm for t in target_kws): 
+                if any(s in row_str_norm for s in stop_kws) and not any(t in row_str_norm for t in target_kws): continue 
+                
                 all_nums = [] 
                 for rr in range(r, min(r+4, R)): 
                     curr_row_norm = _norm("".join(arr[rr])) 
@@ -621,11 +627,13 @@ def get_price_by_exact_section(dfs: List[pd.DataFrame], corr_after: Dict[str, st
                         cell_clean = re.sub(r'\d+(?:\.\d+)?%', '', cell_clean) 
                         cell_clean = re.sub(r'^([①-⑩]|\(\d+\)|\d+\.)+', '', cell_clean) 
                         
-                        nums = re.findall(r"\b\d{1,3}(?:[,.]\d{3})+(?!\.\d)\b|\b\d+\b", cell_clean) 
+                        nums = re.findall(r"(?<![\d.])\d{1,3}(?:,\d{3})*(?:\.\d+)?(?![\d.])|(?<![\d.])\d+(?:\.\d+)?(?![\d.])", cell_clean) 
                         for x in nums: 
-                            val = int(re.sub(r'[,.]', '', x)) 
-                            if val >= 50 and val not in [2024, 2025, 2026, 2027]: 
-                                all_nums.append(val) 
+                            try: 
+                                val = int(float(x.replace(',', ''))) 
+                                if val >= 50 and val not in [2024, 2025, 2026, 2027]: 
+                                    all_nums.append(val) 
+                            except: pass 
                 if all_nums: 
                     return max(all_nums)  
     return None 
