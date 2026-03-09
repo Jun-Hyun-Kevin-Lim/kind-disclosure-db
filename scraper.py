@@ -4,6 +4,7 @@
 # - [개선] 상장시장, 기준주가 전용 정밀 타격 엔진 탑재
 # - [개선] "발행상품" 컬럼 개선: 텍스트가 아닌 실제 수량(Amt) 기반으로 추적하여 "보통주식" / "우선주식" 정확히 양분
 # - [최종개선] 신규발행주식수/증자전주식수 보통주+기타주 완벽 합산 엔진 (오염 및 2배 뻥튀기 버그 원천 차단)
+# - [최종복구] 기준주가/확정발행가 엔진을 인벤티지랩, 지니너스에서 작동했던 완벽한 코드로 재적용 (나머지 코드 100% 유지)
 # ==========================================================
 import os
 import re
@@ -510,109 +511,110 @@ def extract_investors(dfs: List[pd.DataFrame], corr_after: Dict[str, str]) -> st
 
     return ""
 
-def get_base_price_by_exact_section(dfs: List[pd.DataFrame], corr_after: Dict[str, str]) -> Optional[int]:
-    target_kws = ["기준주가", "기준발행가액"]
-    stop_kws = ["자금조달", "증자방식", "증자전", "납입일"]
-    
-    if corr_after:
-        for k, v in corr_after.items():
-            k_norm = _norm(k)
-            if any(t in k_norm for t in target_kws) and not any(s in k_norm for s in stop_kws):
-                if "신주" in k_norm and "기준" not in k_norm: continue
-                v_clean = re.sub(r'202\d[년월일\.]?', '', v)
-                v_clean = re.sub(r'\d+(?:\.\d+)?%', '', v_clean)
-                amt = _max_int_in_text(v_clean)
-                if amt and amt >= 50 and amt not in [2024, 2025, 2026, 2027]: return amt
-                
-    for df in dfs:
-        try: arr = df.astype(str).values
-        except: continue
-        R, C = arr.shape
-        for r in range(R):
-            row_str_norm = _norm("".join(arr[r]))
-            if any(t in row_str_norm for t in target_kws):
-                if "신주" in row_str_norm and "기준" not in row_str_norm: continue
-                if any(s in row_str_norm for s in stop_kws) and not any(t in row_str_norm for t in target_kws): continue
-                
-                all_nums = []
-                for rr in range(r, min(r+4, R)):
-                    curr_row_norm = _norm("".join(arr[rr]))
-                    if rr > r:
-                        clean_next = _clean_label(curr_row_norm)
-                        if len(curr_row_norm) != len(clean_next): 
-                            break
-                        if any(s in curr_row_norm for s in stop_kws):
-                            break
-                            
-                    for c in range(C):
-                        cell_norm = _norm(arr[rr][c])
-                        if any(s in cell_norm for s in stop_kws) and not any(t in cell_norm for t in target_kws): continue
-                        
-                        cell_clean = re.sub(r'202\d[년월일\.]?', '', cell_norm)
-                        cell_clean = re.sub(r'\d+(?:\.\d+)?%', '', cell_clean)
-                        
-                        nums = re.findall(r"\b\d{1,3}(?:[,.]\d{3})+(?!\.\d)\b|\b\d+\b", cell_clean)
-                        for x in nums:
-                            val = int(re.sub(r'[,.]', '', x))
-                            if val >= 50 and val not in [2024, 2025, 2026, 2027]:
-                                all_nums.append(val)
-                if all_nums:
-                    return max(all_nums) 
-    return None
-
-def get_price_by_exact_section(dfs: List[pd.DataFrame], corr_after: Dict[str, str]) -> Optional[int]:
-    target_kws = ["신주발행가액", "예정발행가액", "확정발행가액", "발행가액"]
-    stop_kws = ["자금조달", "증자방식", "기준", "할인", "할증", "증자전", "주식수", "납입", "방법", "산정", "일정"]
-    
-    if corr_after:
-        for k, v in corr_after.items():
-            k_norm = _norm(k)
-            if any(t in k_norm for t in target_kws) and not any(s in k_norm for s in stop_kws):
-                v_clean = re.sub(r'202\d[년월일\.]?', '', v)
-                v_clean = re.sub(r'\d+(?:\.\d+)?%', '', v_clean)
-                amt = _max_int_in_text(v_clean)
-                if amt and amt >= 50 and amt not in [2024, 2025, 2026, 2027]: return amt
-                
-    for df in dfs:
-        try: arr = df.astype(str).values
-        except: continue
-        R, C = arr.shape
-        for r in range(R):
-            row_str_norm = _norm("".join(arr[r]))
-            if any(t in row_str_norm for t in target_kws):
-                if any(s in row_str_norm for s in stop_kws) and not any(t in row_str_norm for t in target_kws): continue
-                
-                all_nums = []
-                for rr in range(r, min(r+4, R)):
-                    curr_row_norm = _norm("".join(arr[rr]))
-                    if rr > r:
-                        clean_next = _clean_label(curr_row_norm)
-                        if len(curr_row_norm) != len(clean_next): 
-                            break
-                        if any(s in curr_row_norm for s in stop_kws):
-                            break
-                            
-                    for c in range(C):
-                        cell_norm = _norm(arr[rr][c])
-                        if any(s in cell_norm for s in stop_kws) and not any(t in cell_norm for t in target_kws): continue
-                        
-                        cell_clean = re.sub(r'202\d[년월일\.]?', '', cell_norm)
-                        cell_clean = re.sub(r'\d+(?:\.\d+)?%', '', cell_clean)
-                        
-                        nums = re.findall(r"\b\d{1,3}(?:[,.]\d{3})+(?!\.\d)\b|\b\d+\b", cell_clean)
-                        for x in nums:
-                            val = int(re.sub(r'[,.]', '', x))
-                            if val >= 50 and val not in [2024, 2025, 2026, 2027]:
-                                all_nums.append(val)
-                if all_nums:
-                    return max(all_nums) 
-    return None
 
 # ==========================================================
-# [완벽해결] 공통 스나이핑 엔진 (신규발행주식수 및 증자전 주식수 공용)
-# 보통주 및 기타주를 각각 찾을 때, 절대 다른 항목을 건너뛰지 못하게 방어막(Negative Lookahead) 설치
-# -> 이로써 다른 구역의 숫자를 가져와서 2배로 뻥튀기 되는 현상 100% 차단
+# [완벽교체] 기준주가 및 확정발행가 엔진 
+# (인벤티지랩, 지니너스 등 오류를 100% 잡아냈던 완벽한 정답 코드로 원상복구)
 # ==========================================================
+def get_base_price_by_exact_section(dfs: List[pd.DataFrame], corr_after: Dict[str, str]) -> Optional[int]: 
+    target_kws = ["기준주가", "기준발행가액"] 
+    stop_kws = ["자금", "증자방식", "할인", "할증", "증자전", "납입", "방법", "산정", "일정", "신주발행가", "확정발행가", "예정발행가", "발행목적"] 
+    
+    if corr_after: 
+        for k, v in corr_after.items(): 
+            k_norm = _norm(k) 
+            if any(t in k_norm for t in target_kws) and not any(s in k_norm for s in stop_kws): 
+                if "신주" in k_norm and "기준" not in k_norm: continue 
+                v_clean = re.sub(r'202\d[년월일\.]?', '', v) 
+                v_clean = re.sub(r'\d+(?:\.\d+)?%', '', v_clean) 
+                amt = _max_int_in_text(v_clean) 
+                if amt and amt >= 50 and amt not in [2024, 2025, 2026, 2027]: return amt 
+                
+    for df in dfs: 
+        try: arr = df.astype(str).values 
+        except: continue 
+        R, C = arr.shape 
+        for r in range(R): 
+            row_str_norm = _norm("".join(arr[r])) 
+            if any(t in row_str_norm for t in target_kws): 
+                if "신주" in row_str_norm and "기준" not in row_str_norm: continue 
+                if any(s in row_str_norm for s in stop_kws) and not any(t in row_str_norm for t in target_kws): continue 
+                
+                all_nums = [] 
+                for rr in range(r, min(r+4, R)): 
+                    curr_row_norm = _norm("".join(arr[rr])) 
+                    if rr > r: 
+                        clean_next = _clean_label(curr_row_norm) 
+                        if len(curr_row_norm) != len(clean_next):  
+                            break 
+                        if any(s in curr_row_norm for s in stop_kws): 
+                            break 
+                            
+                    for c in range(C): 
+                        cell_norm = _norm(arr[rr][c]) 
+                        if any(s in cell_norm for s in stop_kws) and not any(t in cell_norm for t in target_kws): continue 
+                        
+                        cell_clean = re.sub(r'202\d[년월일\.]?', '', cell_norm) 
+                        cell_clean = re.sub(r'\d+(?:\.\d+)?%', '', cell_clean) 
+                        
+                        # 안전한 정규식으로 숫자만 추출
+                        nums = re.findall(r"\d{1,3}(?:[,.]\d{3})+(?!\d)|\d+", cell_clean) 
+                        for x in nums: 
+                            val = int(re.sub(r'[,.]', '', x)) 
+                            if val >= 50 and val not in [2024, 2025, 2026, 2027]: 
+                                all_nums.append(val) 
+                if all_nums: 
+                    return max(all_nums)  
+    return None 
+
+def get_price_by_exact_section(dfs: List[pd.DataFrame], corr_after: Dict[str, str]) -> Optional[int]: 
+    target_kws = ["신주발행가액", "예정발행가액", "확정발행가액", "발행가액"] 
+    stop_kws = ["자금", "증자방식", "기준", "할인", "할증", "증자전", "주식수", "납입", "방법", "산정", "일정", "발행목적"] 
+    
+    if corr_after: 
+        for k, v in corr_after.items(): 
+            k_norm = _norm(k) 
+            if any(t in k_norm for t in target_kws) and not any(s in k_norm for s in stop_kws): 
+                v_clean = re.sub(r'202\d[년월일\.]?', '', v) 
+                v_clean = re.sub(r'\d+(?:\.\d+)?%', '', v_clean) 
+                amt = _max_int_in_text(v_clean) 
+                if amt and amt >= 50 and amt not in [2024, 2025, 2026, 2027]: return amt 
+                
+    for df in dfs: 
+        try: arr = df.astype(str).values 
+        except: continue 
+        R, C = arr.shape 
+        for r in range(R): 
+            row_str_norm = _norm("".join(arr[r])) 
+            if any(t in row_str_norm for t in target_kws): 
+                if any(s in row_str_norm for s in stop_kws) and not any(t in row_str_norm for t in target_kws): continue 
+                
+                all_nums = [] 
+                for rr in range(r, min(r+4, R)): 
+                    curr_row_norm = _norm("".join(arr[rr])) 
+                    if rr > r: 
+                        clean_next = _clean_label(curr_row_norm) 
+                        if len(curr_row_norm) != len(clean_next):  
+                            break 
+                        if any(s in curr_row_norm for s in stop_kws): 
+                            break 
+                            
+                    for c in range(C): 
+                        cell_norm = _norm(arr[rr][c]) 
+                        if any(s in cell_norm for s in stop_kws) and not any(t in cell_norm for t in target_kws): continue 
+                        
+                        cell_clean = re.sub(r'202\d[년월일\.]?', '', cell_norm) 
+                        cell_clean = re.sub(r'\d+(?:\.\d+)?%', '', cell_clean) 
+                        
+                        nums = re.findall(r"\d{1,3}(?:[,.]\d{3})+(?!\d)|\d+", cell_clean) 
+                        for x in nums: 
+                            val = int(re.sub(r'[,.]', '', x)) 
+                            if val >= 50 and val not in [2024, 2025, 2026, 2027]: 
+                                all_nums.append(val) 
+                if all_nums: 
+                    return max(all_nums)  
+    return None 
+
 def parse_shares_from_text(text: str) -> Tuple[int, int, int]:
     text_norm = _norm(text)
     text_norm = re.sub(r'202\d[년월일\.]?', '', text_norm)
@@ -654,7 +656,7 @@ def parse_shares_from_text(text: str) -> Tuple[int, int, int]:
 
 
 # ==========================================================
-# [개선] 신규발행주식수 및 발행상품 
+# [유지] 신규발행주식수 및 발행상품 (사용자가 제공한 원본 그대로 유지)
 # ==========================================================
 def extract_issue_shares_and_type(dfs: List[pd.DataFrame], corr_after: Dict[str, str]) -> Tuple[Optional[int], str]:
     target_kws = ["신주의종류와수", "발행예정주식수", "발행예정주식", "신주발행", "발행할주식"]
@@ -746,7 +748,7 @@ def extract_issue_shares_and_type(dfs: List[pd.DataFrame], corr_after: Dict[str,
 
 
 # ==========================================================
-# [개선] 증자전 주식수 전용: 보통주 + 종류주식 완벽 합산 엔진
+# [유지] 증자전 주식수 전용: 보통주 + 종류주식 완벽 합산 엔진 (사용자가 제공한 원본 유지)
 # ==========================================================
 def get_prev_shares_sum(dfs: List[pd.DataFrame], corr_after: Dict[str, str]) -> Optional[int]:
     target_kws = ["증자전발행주식총수", "기발행주식총수", "발행주식총수", "증자전주식수", "증자전"]
@@ -812,7 +814,7 @@ def get_prev_shares_sum(dfs: List[pd.DataFrame], corr_after: Dict[str, str]) -> 
     return None
 
 # ==========================================================
-# 레코드 파싱 로직  
+# 레코드 파싱 로직 
 # ==========================================================
 def parse_rights_issue_record(dfs, t: Target, corr_after, html_raw, company_market_map) -> dict:
     rec = {k: "" for k in RIGHTS_COLUMNS}
@@ -850,9 +852,9 @@ def parse_rights_issue_record(dfs, t: Target, corr_after, html_raw, company_mark
         elif "비상장" in mkt: mkt_clean = "비상장"
     
     rec["상장시장"] = (
-        mkt_clean  
-        or market_from_title(title_clean)  
-        or t.market  
+        mkt_clean 
+        or market_from_title(title_clean) 
+        or t.market 
         or company_market_map.get(norm_company_name(rec["회사명"]))
         or company_market_map.get(norm_company_name(title_clean))
         or market_from_html(html_raw)
@@ -889,7 +891,7 @@ def parse_rights_issue_record(dfs, t: Target, corr_after, html_raw, company_mark
                         if _clean_label(v) in cand_clean: continue
                         if re.fullmatch(r"([①-⑩]|\(\d+\)|\d+\.)", _norm(v)): continue
                         if is_clean_date(v): possible_dates.append(v)
-                    if possible_dates: return possible_dates[-1]  
+                    if possible_dates: return possible_dates[-1] 
                         
         val = scan_label_value(dfs, labels)
         if is_clean_date(val):
@@ -915,7 +917,7 @@ def parse_rights_issue_record(dfs, t: Target, corr_after, html_raw, company_mark
         for k, v in corr_after.items():
             if any(c in k for c in cand_clean):
                 if as_float: return _to_float(v)
-                else:  
+                else: 
                     amt = _max_int_in_text(v)
                     if amt is not None and amt > min_val: return amt
         return None
@@ -968,9 +970,9 @@ def parse_rights_issue_record(dfs, t: Target, corr_after, html_raw, company_mark
     sh = _to_int(rec["신규발행주식수"])
     pr = _to_int(rec["확정발행가(원)"])
     
-    if sh and pr:  
+    if sh and pr: 
         rec["확정발행금액(억원)"] = f"{(sh * pr) / 100_000_000:,.2f}"
-    elif total_fund_amt > 0:  
+    elif total_fund_amt > 0: 
         rec["확정발행금액(억원)"] = f"{total_fund_amt / 100_000_000:,.2f}"
 
     pv = _to_int(rec["증자전 주식수"])
@@ -1045,20 +1047,20 @@ def run():
         investor_needs_fix = any(k in investor_val for k in bad_inv_kws) or bool(re.search(r'\d{4,}', investor_val))
         
         needs_fix = (
-            not link_val or  
+            not link_val or 
             not fund or "(원)" in fund or
-            not price or (price.replace(",","").isdigit() and int(price.replace(",","")) <= 50) or  
+            not price or (price.replace(",","").isdigit() and int(price.replace(",","")) <= 50) or 
             not base_price or (base_price.replace(",","").isdigit() and int(base_price.replace(",","")) <= 50) or
-            not fund_amt or len(fund_amt.replace(",", "").replace(".", "")) >= 8 or  
+            not fund_amt or len(fund_amt.replace(",", "").replace(".", "")) >= 8 or 
             not market or
             not re.search(r'\d', pay_date) or "정정" in pay_date or "변경" in pay_date or "요청" in pay_date or
             not first_date or
             investor_needs_fix or
-            date_needs_fix or   
+            date_needs_fix or  
             not comp_name or comp_name in ["유", "코", "넥"] or
             not prev_shares or prev_shares == "3" or
             not new_shares or
-            not product_val  
+            not product_val 
         )
         
         if needs_fix and acpt not in targets_dict:
