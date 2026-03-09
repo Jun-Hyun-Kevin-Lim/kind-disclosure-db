@@ -1,8 +1,8 @@
 # ==========================================================
-# #주식연계채권_코드V13.4_Option_Sentence_Fix (옵션 첫 문장 완벽 추출 패치)
-# 1. [핵심패치] Put/Call Option: 줄바꿈으로 인해 제목만 잘려 나오는 버그(예: "조기상환청구권에") 완벽 해결
-# 2. [핵심패치] HTML 구조(표, 셀)를 무시하고 텍스트를 연결하여 "본 사채의 사채권자는..." 같은 완성형 첫 문장부터 깔끔하게 수집
-# 3. 기존 V13.3의 모든 강화 기능(투자자 싹쓸이, Call 비율 정규식, 발행상품명 등) 100% 유지
+# #주식연계채권_코드V13.5_Perfect_Option_Sentence (옵션 첫 문장 완벽 추출 패치)
+# 1. [핵심개선] Put/Call Option: "조기상환청구권(Put Option)에" 처럼 제목만 짤리거나 엉뚱한 문장이 나오는 버그 완벽 해결
+# 2. [핵심개선] 문맥 스코어링 도입: "본 사채의 사채권자는...", "발행회사 또는 발행회사가 지정하는 자는..." 등 진짜 첫 문장부터 추출
+# 3. [유지] V13.3의 모든 기능 (투자자 싹쓸이, Call 비율/YTC 정규식, 발행상품 확장 등) 100% 유지
 # ==========================================================
 import os
 import re
@@ -308,7 +308,7 @@ def find_row_best_float(dfs, must_contain) -> Optional[float]:
     return None
 
 # ==========================================================
-# 5. 핵심 컬럼 전용 추출기
+# 5. 핵심 컬럼 전용 추출기 (발행상품, 투자자 등)
 # ==========================================================
 
 def extract_product_type(dfs: List[pd.DataFrame], corr_after: Dict) -> str:
@@ -527,84 +527,105 @@ def extract_investors(dfs: List[pd.DataFrame], corr_after: Dict[str, str]) -> st
 
 
 # ----------------------------------------------------------------------
-# ★ [V13.4 핵심 패치] Put/Call Option 직독직해 스캐너 (문장 완성형 추출)
-# - 줄바꿈에 속지 않고 문맥을 연결하여 진짜 첫 문장부터 쓸어옵니다.
+# ★ [V13.5 최고 성능 패치] Put/Call Option 직독직해 엔진
+# - 표 헤더 무시, 줄바꿈 무시, 진짜 "주어(사채권자/발행회사)"가 포함된 문맥 덩어리 탐색
 # ----------------------------------------------------------------------
 def extract_option_details(html_raw: str, option_type: str, corr_after: Dict[str, str]) -> str:
     my_kws = ["조기상환청구권", "put option", "풋옵션"] if option_type == 'put' else ["매도청구권", "call option", "콜옵션"]
-    opp_kws = ["매도청구권", "call option", "콜옵션", "【특정인", "미상환 주권", "기타 투자판단", "발행결정 전후", "10. 기타사항", "11. 기타사항", "12. 기타사항", "13. 기타사항", "20. 기타사항", "합병 관련 사항", "청약일"] if option_type == 'put' else ["조기상환청구권", "put option", "풋옵션", "【특정인", "미상환 주권", "기타 투자판단", "발행결정 전후", "10. 기타사항", "11. 기타사항", "12. 기타사항", "13. 기타사항", "20. 기타사항", "합병 관련 사항", "청약일"]
+    opp_kws = ["매도청구권", "call option", "콜옵션"] if option_type == 'put' else ["조기상환청구권", "put option", "풋옵션"]
+    stop_kws = opp_kws + ["【특정인", "미상환 주권", "기타 투자판단", "발행결정 전후", "10. 기타사항", "11. 기타사항", "12. 기타사항", "13. 기타사항", "20. 기타사항", "합병 관련 사항", "청약일", "납입일"]
     
-    # 텍스트를 이쁘게 다듬는 내부 함수
-    def clean_extracted_text(text: str) -> str:
-        if not text: return "없음"
-        text = text.replace('|', ' ') # 구분자로 썼던 특수문자 제거
-        text = re.sub(r'\s+', ' ', text).strip()
-        # 문장 맨 앞에 남아있는 "가. 매도청구권에 관한 사항" 같은 제목 찌꺼기 완벽 날리기
-        text = re.sub(r'^[\s\(\)\[\]\]:\-\.]+(?:에\s*관한\s*사항|관한\s*사항|사항)?\s*', '', text)
-        if not text or len(text) < 5: return "없음"
-        if len(text) > 400: return text[:400] + "..." # 셀이 너무 커지지 않도록 400자 컷
+    # 앞쪽 지저분한 목차 라벨(예: "가. 조기상환청구권에 관한 사항")만 똑똑하게 날리는 함수
+    def clean_title_prefix(text, kws):
+        for kw in kws:
+            pattern = re.compile(r'^([\[【<가-힣0-9\s\.\-]*' + re.escape(kw) + r'(?:\s*\([a-zA-Z\s]+\))?(?:[\s]*(?:에\s*관한\s*사항|관한\s*사항|사항)?\s*\]?)?[\s:\-\.]*)', re.IGNORECASE)
+            match = pattern.match(text)
+            # 만약 문장 맨 앞부분이 키워드 매칭이면서 길이가 짧다면 (진짜 제목이라는 뜻) 삭제
+            if match and len(match.group(1)) < 50:
+                text = text[match.end():].strip()
+                break
         return text
 
-    # 1. 정정 공시(corr_after) 우선 확인
     if corr_after:
         for k, v in corr_after.items():
             if any(_norm(kw).lower() in _norm(k).lower() for kw in my_kws) and len(v) > 10:
-                v_clean = re.sub(r'\s+', ' ', v)
-                for kw in my_kws:
-                    pattern = r'^.*?' + kw + r'(?:[\s\(\)\[\]a-zA-Z]*(?:에\s*관한\s*사항)?\s*\]?)?'
-                    v_clean = re.sub(pattern, '', v_clean, flags=re.IGNORECASE)
-                res = clean_extracted_text(v_clean)
-                if res != "없음": return res
+                v_clean = re.sub(r'\s+', ' ', v).strip()
+                v_clean = clean_title_prefix(v_clean, my_kws)
+                if v_clean: return v_clean[:400] + ("..." if len(v_clean) > 400 else "")
 
-    # 2. 본문 생텍스트 스캔
+    # HTML 태그를 모두 없애되, 시각적 줄바꿈 구역마다 '|||' 구분자를 넣어 하나의 문자열로 연결
     soup = BeautifulSoup(html_raw, 'lxml')
     for tag in soup(['style', 'script']): tag.decompose()
+    for tag in soup.find_all(['br', 'p', 'div', 'tr', 'td', 'th', 'li']):
+        tag.insert_after('|||')
     
-    # [핵심] 줄바꿈(엔터)이나 테이블 셀 구분을 " | " 특수문자로 치환하여 한 줄로 만듦
-    text = soup.get_text(separator=' | ', strip=True)
-    
-    best_idx = -1
-    best_end = -1
-    
-    # 1단계: 완벽한 '목차' 형태를 먼저 찾는다 (예: "[조기상환청구권]", "가. 매도청구권")
-    for kw in my_kws:
-        kw_regex = kw.replace(' ', r'\s*')
-        # 정규식: 구분자(|) 바로 뒤에 오거나, 괄호/숫자로 시작하는 진짜 제목 형태만 찾음
-        pattern = re.compile(r'(?:\|\s*|^)(?:[\[【<]\s*|(?:\d+|[가-힣])\.\s*)?(' + kw_regex + r')(?:[\s\(\)\[\]a-zA-Z]*(?:에\s*관한\s*사항)?\s*\]?)?', re.IGNORECASE)
-        matches = list(pattern.finditer(text))
-        if matches:
-            best_idx = matches[-1].start()
-            best_end = matches[-1].end() # 제목이 끝나는 지점 저장
-            break
+    text = soup.get_text(separator=' ', strip=True)
+    blocks = [b.strip() for b in text.split('|||') if b.strip()]
+
+    candidates = []
+    for i, block in enumerate(blocks):
+        block_lower = block.lower().replace(' ', '')
+        if any(kw.replace(' ', '') in block_lower for kw in my_kws):
             
-    # 2단계: 목차 형태가 없으면 텍스트 전체에서 키워드 단순 검색
-    if best_idx == -1:
-        for kw in my_kws:
-            idx = text.lower().rfind(kw.lower())
-            if idx != -1:
-                best_idx = idx
-                best_end = idx + len(kw)
-                break
+            # 키워드가 포함된 문단부터 시작하여 아래로 최대 15개 문단을 하나의 글로 합침
+            gathered = []
+            for j in range(i, min(len(blocks), i + 15)):
+                check_lower = blocks[j].lower().replace(' ', '')
                 
-    if best_idx == -1:
+                # 다른 섹션 제목(상대방 옵션, 기타사항 등)이 나오면 합치기 중단
+                if j > i:
+                    is_stop = False
+                    for skw in stop_kws:
+                        if skw.replace(' ', '') in check_lower:
+                            # 단순 문장 안의 단어가 아니라, 정말 제목처럼 짧거나 괄호로 시작할 때만 멈춤
+                            if len(blocks[j]) < 40 or blocks[j].startswith('[') or blocks[j].startswith('【') or re.match(r'^([0-9가-힣]\.|제\s*\d+\s*조)', blocks[j]):
+                                is_stop = True
+                                break
+                    if is_stop: break
+                
+                gathered.append(blocks[j])
+            
+            raw_cand = " ".join(gathered)
+            cleaned = clean_title_prefix(raw_cand, my_kws)
+            
+            # [핵심] 엉뚱한 테이블을 거르기 위한 AI 문맥 스코어링 시스템
+            score = 0
+            if len(cleaned) > 20: score += 10
+            if len(cleaned) > 100: score += 10
+            
+            if option_type == 'put':
+                if "사채권자" in cleaned: score += 30
+                if "발행회사에" in cleaned or "발행회사에게" in cleaned or "청구할 수 있다" in cleaned: score += 20
+                if "조기상환" in cleaned: score += 10
+            else:
+                if "발행회사" in cleaned: score += 30
+                if "지정하는 자" in cleaned: score += 20
+                if "매수" in cleaned or "매도청구" in cleaned: score += 20
+                if "콜옵션" in cleaned: score += 10
+            
+            # 표 헤더처럼 생긴 가짜 텍스트 강력 감점 (Screenshot 1번의 지놈앤컴퍼니 현상 방지)
+            if "매매일" in cleaned or "상환율" in cleaned or "from" in cleaned.lower() or "to" in cleaned.lower(): score -= 50
+            if "구분" in cleaned and "청구기간" in cleaned: score -= 50
+
+            candidates.append((score, cleaned))
+
+    if not candidates: return "없음"
+
+    # 점수가 가장 높은 텍스트 블록 선택
+    candidates.sort(key=lambda x: x[0], reverse=True)
+    best_score, best_text = candidates[0]
+
+    # 제대로 된 문장이 아니면 버림
+    if not best_text or len(best_text) < 5 or best_score < 0:
         return "없음"
 
-    # [핵심] 제목 부분은 건너뛰고, 그 다음 글자부터 끝까지 추출
-    content = text[best_end:]
+    best_text = re.sub(r'\s+', ' ', best_text).strip()
     
-    # 3단계: 절단기 (상대방 옵션이나 기타 목차가 나오면 거기서 컷)
-    cut_idx = len(content)
-    for opp in opp_kws:
-        opp_regex = opp.replace(' ', r'\s*')
-        # 상대방 옵션 단어가 문장 중간에 스쳐 지나가는건 무시하고, '목차'로 등장할 때만 자름
-        pattern = re.compile(r'(?:\|\s*|^)(?:[\[【<]\s*|(?:\d+|[가-힣])\.\s*)?(' + opp_regex + r')', re.IGNORECASE)
-        match = pattern.search(content)
-        if match and match.start() < cut_idx:
-            cut_idx = match.start()
-
-    content = content[:cut_idx]
+    # 마지막으로 맨 앞의 특수기호 찌꺼기 한 번 더 정리
+    best_text = re.sub(r'^[\s\(\)\[\]\]:\-\.]+', '', best_text)
     
-    return clean_extracted_text(content)
+    if len(best_text) > 300: best_text = best_text[:300] + "..."
+    return best_text
 
 
 def extract_call_ratio_and_ytc(call_text: str, html_raw: str) -> Tuple[str, str]:
@@ -662,6 +683,7 @@ def extract_call_ratio_and_ytc(call_text: str, html_raw: str) -> Tuple[str, str]
                         break
                         
     return ratio, ytc
+
 
 def extract_period_dates(dfs, corr_after, period_kws) -> Tuple[str, str]:
     if corr_after:
@@ -842,6 +864,8 @@ def run():
         put_opt = row[BOND_COLUMNS.index("Put Option")] if len(row) > BOND_COLUMNS.index("Put Option") else ""
         
         investor_val = row[BOND_COLUMNS.index("투자자")] if len(row) > BOND_COLUMNS.index("투자자") else ""
+        
+        # 누락 복구 조건 발동!
         needs_fix = (not amt or not price or not prod or not put_opt or not investor_val)
         
         if needs_fix and acpt not in targets_dict:
