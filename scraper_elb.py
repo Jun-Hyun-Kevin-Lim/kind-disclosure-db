@@ -1,8 +1,9 @@
 # ==========================================================
-# #주식연계채권_코드V13.5_Perfect_Option_Sentence (옵션 첫 문장 완벽 추출 패치)
-# 1. [핵심개선] Put/Call Option: "조기상환청구권(Put Option)에" 처럼 제목만 짤리거나 엉뚱한 문장이 나오는 버그 완벽 해결
-# 2. [핵심개선] 문맥 스코어링 도입: "본 사채의 사채권자는...", "발행회사 또는 발행회사가 지정하는 자는..." 등 진짜 첫 문장부터 추출
-# 3. [유지] V13.3의 모든 기능 (투자자 싹쓸이, Call 비율/YTC 정규식, 발행상품 확장 등) 100% 유지
+# #주식연계채권_코드V13.6_Perfect_Option_Sentence (옵션 첫 문장 완벽 추출 패치)
+# 1. [핵심개선] Put/Call Option: "1) 조기상환청구권에 관한 사항:" 등 지저분한 머리말 찌꺼기 완벽 제거 루프 탑재
+# 2. [핵심개선] AI 스코어링 고도화: '의무보유', '청구절차', '표 헤더(상환율, 관계)' 등 가짜 문장 강력 감점 적용
+# 3. [핵심개선] 무조건 "본 사채의 사채권자는...", "발행회사는..." 같은 진짜 핵심 첫 문장만 1위로 추출
+# 4. [유지] V13.3의 모든 기능 (투자자 싹쓸이, Call 비율/YTC 정규식, 발행상품 확장 등) 100% 유지
 # ==========================================================
 import os
 import re
@@ -527,33 +528,40 @@ def extract_investors(dfs: List[pd.DataFrame], corr_after: Dict[str, str]) -> st
 
 
 # ----------------------------------------------------------------------
-# ★ [V13.5 최고 성능 패치] Put/Call Option 직독직해 엔진
-# - 표 헤더 무시, 줄바꿈 무시, 진짜 "주어(사채권자/발행회사)"가 포함된 문맥 덩어리 탐색
+# ★ [V13.6 최고 성능 패치] Put/Call Option 직독직해 스캐너 (AI 문맥 스코어링 도입)
+# - 지저분한 머리말 찌꺼기 무한 깎아내기 및 가짜 문장 강력 감점 적용
 # ----------------------------------------------------------------------
 def extract_option_details(html_raw: str, option_type: str, corr_after: Dict[str, str]) -> str:
-    my_kws = ["조기상환청구권", "put option", "풋옵션"] if option_type == 'put' else ["매도청구권", "call option", "콜옵션"]
-    opp_kws = ["매도청구권", "call option", "콜옵션"] if option_type == 'put' else ["조기상환청구권", "put option", "풋옵션"]
+    my_kws = ["조기상환청구권", "put option", "풋옵션"] if option_type == 'put' else ["매도청구권", "call option", "콜옵션", "중도상환청구권"]
+    opp_kws = ["매도청구권", "call option", "콜옵션", "중도상환청구권"] if option_type == 'put' else ["조기상환청구권", "put option", "풋옵션"]
     stop_kws = opp_kws + ["【특정인", "미상환 주권", "기타 투자판단", "발행결정 전후", "10. 기타사항", "11. 기타사항", "12. 기타사항", "13. 기타사항", "20. 기타사항", "합병 관련 사항", "청약일", "납입일"]
     
-    # 앞쪽 지저분한 목차 라벨(예: "가. 조기상환청구권에 관한 사항")만 똑똑하게 날리는 함수
-    def clean_title_prefix(text, kws):
-        for kw in kws:
-            pattern = re.compile(r'^([\[【<가-힣0-9\s\.\-]*' + re.escape(kw) + r'(?:\s*\([a-zA-Z\s]+\))?(?:[\s]*(?:에\s*관한\s*사항|관한\s*사항|사항)?\s*\]?)?[\s:\-\.]*)', re.IGNORECASE)
-            match = pattern.match(text)
-            # 만약 문장 맨 앞부분이 키워드 매칭이면서 길이가 짧다면 (진짜 제목이라는 뜻) 삭제
-            if match and len(match.group(1)) < 50:
-                text = text[match.end():].strip()
-                break
+    # 지저분한 옵션 제목 찌꺼기를 완전히 날려버리는 초정밀 함수
+    def clean_text(text: str) -> str:
+        text = text.replace('|', ' ')
+        text = re.sub(r'\s+', ' ', text).strip()
+        
+        while True:
+            prev = text
+            # 1단계: 1), 가., ① 같은 목차 기호 제거
+            text = re.sub(r'^([\[【<]?\s*(?:[①-⑩]|\d+\.|\d+\)|[가-힣a-zA-Z]\.|[가-힣a-zA-Z]\))\s*[\]】>]?\s*)', '', text).strip()
+            # 2단계: "조기상환청구권(Put Option)에 관한 사항 :" 같은 명칭 + 부수적인 단어 제거
+            pattern = r'^(?:사채의\s*|발행회사의\s*)?(?:조기상환청구권|매도청구권|중도상환청구권|조기상환\s*청구권|매도\s*청구권|콜옵션|풋옵션|Put\s*Option|Call\s*Option)\s*(?:[a-zA-Z\s\(\)]+)?\s*(?:에\s*관한\s*사항|청구권자|행사|부여|비율|한도)?\s*[:\-]?\s*'
+            text = re.sub(pattern, '', text, flags=re.IGNORECASE).strip()
+            
+            # 더 이상 잘려나갈 찌꺼기가 없으면 루프 탈출
+            if text == prev: break
+            
         return text
 
+    # 1. 정정 공시 확인
     if corr_after:
         for k, v in corr_after.items():
             if any(_norm(kw).lower() in _norm(k).lower() for kw in my_kws) and len(v) > 10:
-                v_clean = re.sub(r'\s+', ' ', v).strip()
-                v_clean = clean_title_prefix(v_clean, my_kws)
+                v_clean = clean_text(v)
                 if v_clean: return v_clean[:400] + ("..." if len(v_clean) > 400 else "")
 
-    # HTML 태그를 모두 없애되, 시각적 줄바꿈 구역마다 '|||' 구분자를 넣어 하나의 문자열로 연결
+    # 2. HTML 원문을 줄바꿈 단위로 쪼개기
     soup = BeautifulSoup(html_raw, 'lxml')
     for tag in soup(['style', 'script']): tag.decompose()
     for tag in soup.find_all(['br', 'p', 'div', 'tr', 'td', 'th', 'li']):
@@ -567,63 +575,70 @@ def extract_option_details(html_raw: str, option_type: str, corr_after: Dict[str
         block_lower = block.lower().replace(' ', '')
         if any(kw.replace(' ', '') in block_lower for kw in my_kws):
             
-            # 키워드가 포함된 문단부터 시작하여 아래로 최대 15개 문단을 하나의 글로 합침
+            # 제목을 찾으면 그 아래로 최대 20개 문단을 하나로 합침
             gathered = []
-            for j in range(i, min(len(blocks), i + 15)):
+            for j in range(i, min(len(blocks), i + 20)):
                 check_lower = blocks[j].lower().replace(' ', '')
                 
-                # 다른 섹션 제목(상대방 옵션, 기타사항 등)이 나오면 합치기 중단
+                # 다른 목차나 상대방 옵션이 나오면 중단
                 if j > i:
                     is_stop = False
                     for skw in stop_kws:
                         if skw.replace(' ', '') in check_lower:
-                            # 단순 문장 안의 단어가 아니라, 정말 제목처럼 짧거나 괄호로 시작할 때만 멈춤
+                            # 문장 중간에 스쳐가는 단어가 아닌, 진짜 "제목"일 때만 멈춤
                             if len(blocks[j]) < 40 or blocks[j].startswith('[') or blocks[j].startswith('【') or re.match(r'^([0-9가-힣]\.|제\s*\d+\s*조)', blocks[j]):
                                 is_stop = True
                                 break
                     if is_stop: break
-                
                 gathered.append(blocks[j])
             
             raw_cand = " ".join(gathered)
-            cleaned = clean_title_prefix(raw_cand, my_kws)
+            cleaned = clean_text(raw_cand)
             
-            # [핵심] 엉뚱한 테이블을 거르기 위한 AI 문맥 스코어링 시스템
+            # --- AI 문맥 스코어링 시스템 ---
             score = 0
-            if len(cleaned) > 20: score += 10
+            if len(cleaned) > 30: score += 10
             if len(cleaned) > 100: score += 10
+            
+            # 문장형태(다. 한다. 있다.) 우대
+            if "다." in cleaned or "한다" in cleaned or "있다" in cleaned: score += 20
             
             if option_type == 'put':
                 if "사채권자" in cleaned: score += 30
                 if "발행회사에" in cleaned or "발행회사에게" in cleaned or "청구할 수 있다" in cleaned: score += 20
                 if "조기상환" in cleaned: score += 10
+                
+                # [강력 감점] 청구절차, 지급장소 등을 잘못 잡는 현상 방지
+                if "청구장소" in cleaned or "지급장소" in cleaned or "청구절차" in cleaned: score -= 30
+                # [강력 감점] 콜옵션의 의무보유 조항에 낚이는 현상 방지 (인벤티지랩 오류 해결)
+                if "의무보유" in cleaned or "매도청구" in cleaned or "매수인" in cleaned: score -= 50
+                
             else:
                 if "발행회사" in cleaned: score += 30
                 if "지정하는 자" in cleaned: score += 20
                 if "매수" in cleaned or "매도청구" in cleaned: score += 20
-                if "콜옵션" in cleaned: score += 10
+                
+                # [강력 감점] 요약 리스트(성명 및 관계 등) 표 형태 방지 (코오롱생명과학 오류 해결)
+                if "성명 및 관계" in cleaned or "취득규모" in cleaned or "제3자의 성명" in cleaned: score -= 50
+                # [강력 감점] 풋옵션에 낚이는 현상 방지
+                if "조기상환" in cleaned or "의무보유" in cleaned: score -= 30
             
-            # 표 헤더처럼 생긴 가짜 텍스트 강력 감점 (Screenshot 1번의 지놈앤컴퍼니 현상 방지)
+            # [공통 강력 감점] 완전한 표 형식(매매일, 상환율 등) 거르기 (대양금속 오류 해결)
             if "매매일" in cleaned or "상환율" in cleaned or "from" in cleaned.lower() or "to" in cleaned.lower(): score -= 50
-            if "구분" in cleaned and "청구기간" in cleaned: score -= 50
+            if cleaned.count(':') > 3: score -= 30
 
             candidates.append((score, cleaned))
 
     if not candidates: return "없음"
-
-    # 점수가 가장 높은 텍스트 블록 선택
+    
+    # 점수가 가장 높은 '진짜 텍스트' 선택
     candidates.sort(key=lambda x: x[0], reverse=True)
     best_score, best_text = candidates[0]
 
-    # 제대로 된 문장이 아니면 버림
+    # 제대로 된 문장이 아니거나 감점을 너무 많이 받았으면 과감히 버림
     if not best_text or len(best_text) < 5 or best_score < 0:
         return "없음"
 
-    best_text = re.sub(r'\s+', ' ', best_text).strip()
-    
-    # 마지막으로 맨 앞의 특수기호 찌꺼기 한 번 더 정리
-    best_text = re.sub(r'^[\s\(\)\[\]\]:\-\.]+', '', best_text)
-    
     if len(best_text) > 300: best_text = best_text[:300] + "..."
     return best_text
 
