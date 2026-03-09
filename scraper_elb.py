@@ -1,10 +1,11 @@
 # ==========================================================
-# #주식연계채권_코드V13.2_PureText_Option_Master (투자자 완전정복 및 누락복구 패치)
-# 1. [완벽개조] Put/Call Option: 표 구조(DataFrame)를 무시하고 전체 텍스트에서 '제목'을 찾은 뒤 그 '밑의 내용'만 싹쓸이하는 순수 텍스트 절단기 탑재
-# 2. [완벽개조] Put/Call Option: 내용 앞에 제목이 다시 붙어 나오는 교차 오염 버그 0%
-# 3. [유지] V11.9 전환청구기간(날짜) 블록 캡처 유지 (시작/종료일 겹침 방지)
-# 4. [강화] 투자자(Investors): 신탁업자(증권사) 괄호 노이즈 완벽 제거 및 펀드+운용사 싹쓸이 기능 탑재
-# 5. [패치] 이미 저장된 시트 행에서 '투자자'가 빈칸일 경우 다시 수집하도록 복구 로직(needs_fix) 추가
+# #주식연계채권_코드V13.3_Ultimate_Master (모든 정확도 개선 통합판)
+# 1. [완벽개조] Put/Call Option: 표 구조(DataFrame)를 무시하고 텍스트 기반 직독직해 (교차오염 방지 및 절단기 지능 향상)
+# 2. [강화] Call 비율 & YTC: 엉뚱한 비율(%)을 가져오지 않도록 금융 문맥 기반 정규식 고도화 및 억지 매칭(Fallback) 삭제
+# 3. [강화] 발행상품: 긴 수식어(무기명식 이권부 무보증 사모 전환사채 등)가 잘리지 않도록 패턴 확장
+# 4. [강화] 투자자(Investors): 신탁업자 괄호 노이즈 제거, 펀드+운용사 표 스캔 싹쓸이 탑재
+# 5. [패치] 누락 복구: 이미 저장된 시트 행에서 핵심 컬럼('투자자' 등)이 빈칸일 경우 재수집(needs_fix)
+# 6. [유지] V11.9 전환청구기간(날짜) 블록 캡처 유지 (시작/종료일 겹침 방지)
 # ==========================================================
 import os
 import re
@@ -310,7 +311,7 @@ def find_row_best_float(dfs, must_contain) -> Optional[float]:
     return None
 
 # ==========================================================
-# 5. 핵심 4대 컬럼 전용 추출기
+# 5. 핵심 컬럼 전용 추출기 (발행상품, 옵션 등 대폭 강화)
 # ==========================================================
 
 def extract_product_type(dfs: List[pd.DataFrame], corr_after: Dict) -> str:
@@ -322,18 +323,24 @@ def extract_product_type(dfs: List[pd.DataFrame], corr_after: Dict) -> str:
         t = re.sub(r'\b종류\b', '', t) 
         t = t.replace('발행결정', '').strip()
         
-        match = re.search(r'(전환사채|교환사채|신주인수권부사채|사채)', t)
-        if not match: return "" 
-        t = t[:match.end()].strip() 
-        
-        pattern = r'((?:제\s*\d+\s*회차?|회차\s*\d+|제?\d+회차?)?\s*(?:제\s*\d+\s*회차?)?\s*(?:(?:무기명식?|기명식?|이권부|무이권부|보증|무보증|사모|공모|비분리형?|분리형?)\s*)*(?:전환사채|교환사채|신주인수권부사채))'
+        # [강화] 수식어가 길게 붙은 공식 명칭까지 한 번에 포착 (무기명식 이권부 무보증 등)
+        pattern = r'((?:제\s*\d+\s*회차?)?[\s\w,()]*(?:무기명식|기명식|이권부|무보증|보증|사모|공모|비분리형|분리형|표면|만기)[\s\w,()]*?(?:전환사채|교환사채|신주인수권부사채|사채))'
         matches = re.findall(pattern, t)
+        
+        if not matches:
+            # 보수적 매칭 (수식어 없는 경우)
+            match = re.search(r'((?:제\s*\d+\s*회차?)?\s*(?:전환사채|교환사채|신주인수권부사채))', t)
+            if match: return _single_line(match.group(1))
+            return ""
+
         for m in matches:
             res = m.strip()
             res = re.sub(r'^회차\s*(\d+)', r'제\1회차', res)
-            if 5 <= len(res) <= 40:
+            if 5 <= len(res) <= 60:
                 s_idx = res.find("사채")
                 if s_idx != -1: res = res[:s_idx+2].strip()
+                # 앞쪽 노이즈 제거
+                res = re.sub(r'^.*?((?:제\d+회)?\s*(?:무기명|기명))', r'\1', res)
                 return _single_line(res)
         return ""
 
@@ -429,13 +436,10 @@ def extract_fund_usage(dfs: List[pd.DataFrame], corr_after: Dict) -> str:
     return _single_line(val)
 
 
-# ----------------------------------------------------------------------
-# [V13.2 궁극의 강화판] 투자자 추출기 (신탁업자 노이즈 제거 및 표 스캔 강화)
-# ----------------------------------------------------------------------
+# [강화] 투자자 추출기 (신탁업자 꼬리표 제거 및 표 스캔 확장)
 def extract_investors(dfs: List[pd.DataFrame], corr_after: Dict[str, str]) -> str:
     investors = []
     
-    # "명" 같은 1글자 단어를 빼고 명확한 공시 용어 위주로 필터링을 세분화했습니다. (오작동 방지)
     blacklist = [
         "관계", "배정", "비고", "합계", "소계", "해당사항", "내역", "금액", "주식수", 
         "단위", "이사회", "총계", "주소", "근거", "선정경위", "거래내역", "목적", 
@@ -445,12 +449,12 @@ def extract_investors(dfs: List[pd.DataFrame], corr_after: Dict[str, str]) -> st
     def clean_investor_name(sn):
         if not sn or str(sn).lower() == 'nan': return ""
         s = str(sn).replace('\n', ' ').replace('\r', '').strip()
-        # 미래에셋증권(신탁업자 지위에서) 같은 꼬리표 완벽 제거
+        # 괄호 등 노이즈 제거
         s = re.sub(r'\([^)]*신탁업자[^)]*\)', '', s)
         s = re.sub(r'\([^)]*본건펀드[^)]*\)', '', s)
         s = re.sub(r'\([^)]*전문투자자[^)]*\)', '', s)
         s = re.sub(r'\([^)]*손익차등[^)]*\)', '', s)
-        s = re.sub(r'주\s*\d+\)', '', s) # 주1), 주2) 제거
+        s = re.sub(r'주\s*\d+\)', '', s)
         return re.sub(r'\s+', ' ', s).strip()
 
     def is_valid_investor_name(sn):
@@ -465,7 +469,7 @@ def extract_investors(dfs: List[pd.DataFrame], corr_after: Dict[str, str]) -> st
 
     target_col_kws = ["대상자명", "대상사명", "성명", "법인명", "인수인", "투자기구", "투자업자", "발행대상", "투자자"]
 
-    # 1. 표 내부 집중 스캔 (가장 정확)
+    # 1. 표 내부 스캔
     for df in reversed(dfs):
         arr = df.astype(str).values
         R, C = arr.shape
@@ -476,7 +480,6 @@ def extract_investors(dfs: List[pd.DataFrame], corr_after: Dict[str, str]) -> st
             for c in range(C):
                 cell_v = _norm(arr[r][c])
                 if any(kw in cell_v for kw in target_col_kws):
-                    # 최대주주, 대표이사 이름은 제외
                     if "최대주주" in cell_v or "대표이사" in cell_v:
                         continue
                     found_cols.append(c)
@@ -488,21 +491,18 @@ def extract_investors(dfs: List[pd.DataFrame], corr_after: Dict[str, str]) -> st
             for rr in range(start_row, R):
                 cell_data = str(arr[rr][col_idx])
                 valid_found = False
-                
-                # 한 칸에 여러 펀드가 적힌 경우 쪼개서 검사
                 for line in cell_data.split('\n'):
                     c_line = clean_investor_name(line)
                     if is_valid_investor_name(c_line):
                         if c_line not in investors: investors.append(c_line)
                         valid_found = True
                 
-                # 쪼갠 결과가 유효하지 않으면 텍스트가 줄바꿈된 걸로 간주하고 하나로 이어붙여서 검사
                 if not valid_found:
                     c_whole = clean_investor_name(cell_data.replace('\n', ' '))
                     if is_valid_investor_name(c_whole) and c_whole not in investors:
                         investors.append(c_whole)
 
-    # 2. 정정사항 (corr_after) 스캔
+    # 2. 정정사항 스캔
     if not investors and corr_after:
         for k, v in corr_after.items():
             if any(_norm(kw) in _norm(k) for kw in ["발행대상자", "배정대상자", "투자자", "인수인", "대상자"]):
@@ -511,7 +511,7 @@ def extract_investors(dfs: List[pd.DataFrame], corr_after: Dict[str, str]) -> st
                     if is_valid_investor_name(c_name) and c_name not in investors:
                         investors.append(c_name)
 
-    # 3. 단일 값 스캔 (Fallback)
+    # 3. 단일 값 스캔
     if not investors:
         val = scan_label_value_preferring_correction(dfs, ["발행대상자", "배정대상자", "투자자", "성명(법인명)", "인수인"], corr_after)
         if val:
@@ -520,7 +520,7 @@ def extract_investors(dfs: List[pd.DataFrame], corr_after: Dict[str, str]) -> st
                 if is_valid_investor_name(c_name) and c_name not in investors:
                     investors.append(c_name)
 
-    # 4. 강제 키워드 스캔 (마지막 수단)
+    # 4. 강제 키워드 스캔
     if not investors:
         for df in dfs:
             arr = df.astype(str).values
@@ -531,7 +531,6 @@ def extract_investors(dfs: List[pd.DataFrame], corr_after: Dict[str, str]) -> st
                         if is_valid_investor_name(cell_val) and cell_val not in investors:
                             investors.append(cell_val)
 
-    # 중복 제거 및 반환 (최대 15개)
     final_investors = []
     for inv in investors:
         if inv and inv not in final_investors:
@@ -540,12 +539,10 @@ def extract_investors(dfs: List[pd.DataFrame], corr_after: Dict[str, str]) -> st
     return _single_line(", ".join(final_investors[:15]))
 
 
-# ----------------------------------------------------------------------
-# [V13.0] Put/Call Option 직독직해 스캐너
-# ----------------------------------------------------------------------
+# [강화] Put/Call Option 직독직해 스캐너 (절단기 지능 향상)
 def extract_option_details(html_raw: str, option_type: str, corr_after: Dict[str, str]) -> str:
     my_kws = ["조기상환청구권", "put option", "풋옵션"] if option_type == 'put' else ["매도청구권", "call option", "콜옵션"]
-    opp_kws = ["매도청구권", "call option", "콜옵션", "【특정인", "미상환 주권", "기타 투자판단", "발행결정 전후", "10. 기타사항", "11. 기타사항", "12. 기타사항", "13. 기타사항", "20. 기타사항", "기타사항"] if option_type == 'put' else ["조기상환청구권", "put option", "풋옵션", "【특정인", "미상환 주권", "기타 투자판단", "발행결정 전후", "10. 기타사항", "11. 기타사항", "12. 기타사항", "13. 기타사항", "20. 기타사항", "기타사항"]
+    opp_kws = ["매도청구권", "call option", "콜옵션", "【특정인", "미상환 주권", "기타 투자판단", "발행결정 전후", "10. 기타사항", "11. 기타사항", "12. 기타사항", "13. 기타사항", "20. 기타사항", "기타사항", "합병 관련 사항"] if option_type == 'put' else ["조기상환청구권", "put option", "풋옵션", "【특정인", "미상환 주권", "기타 투자판단", "발행결정 전후", "10. 기타사항", "11. 기타사항", "12. 기타사항", "13. 기타사항", "20. 기타사항", "기타사항", "합병 관련 사항"]
     
     if corr_after:
         for k, v in corr_after.items():
@@ -572,6 +569,7 @@ def extract_option_details(html_raw: str, option_type: str, corr_after: Dict[str
     for i, line in enumerate(lines):
         line_clean = re.sub(r'\s+', '', line).lower()
         if any(re.sub(r'\s+', '', kw).lower() in line_clean for kw in my_kws):
+            # 교차 오염 방지
             if any(re.sub(r'\s+', '', opp).lower() in line_clean for opp in ["매도청구권", "calloption", "콜옵션"] if option_type == 'put'):
                 continue
             if any(re.sub(r'\s+', '', opp).lower() in line_clean for opp in ["조기상환청구권", "putoption", "풋옵션"] if option_type == 'call'):
@@ -580,7 +578,7 @@ def extract_option_details(html_raw: str, option_type: str, corr_after: Dict[str
             score = 1
             if "사항" in line: score += 2
             if line.strip().startswith("[") or line.strip().startswith("【") or re.match(r'^[가-힣0-9]\.', line.strip()): 
-                score += 1
+                score += 2
             target_indices.append((i, score))
             
     if not target_indices:
@@ -597,10 +595,12 @@ def extract_option_details(html_raw: str, option_type: str, corr_after: Dict[str
         line_clean = re.sub(r'\s+', '', line).lower()
         is_stop = False
         
+        # 상대방 옵션 등 다른 섹션이 나오면 중단하되, '제목' 형태일 때만 반응하도록 지능 향상
         for kw in opp_kws:
             if re.sub(r'\s+', '', kw).lower() in line_clean:
-                is_stop = True
-                break
+                if len(line) < 40 or line.strip()[0] in ['[', '【', '<', '-'] or re.match(r'^([0-9가-힣]\.|제\s*\d+\s*조)', line.strip()):
+                    is_stop = True
+                    break
         
         if is_stop:
             break
@@ -621,59 +621,62 @@ def extract_option_details(html_raw: str, option_type: str, corr_after: Dict[str
     res = " ".join(collected_lines)
     return _single_line(res)
 
+# [강화] Call 비율 및 YTC (정규식 고도화 및 오작동 Fallback 제거)
 def extract_call_ratio_and_ytc(call_text: str, html_raw: str) -> Tuple[str, str]:
     ratio, ytc = "", ""
     call_text_clean = re.sub(r'\s+', ' ', str(call_text or ""))
 
     r_patterns = [
-        r'(?:권면총액|발행(?:사채)?총액|발행가액|발행규모|지분율)[^\d]{0,10}?(?:의|중|대비)\s*(\d{1,3}(?:\.\d+)?)\s*(?:%|퍼센트)',
-        r'(?:매도청구권|Call Option)[^\d]{0,20}?(?:비율|한도|부여|행사)[^\d]{0,10}?(\d{1,3}(?:\.\d+)?)\s*(?:%|퍼센트)',
-        r'(\d{1,3}(?:\.\d+)?)\s*(?:%|퍼센트)\s*(?:를|을)?\s*초과하여\s*행사할\s*수\s*없',
-        r'100분의\s*(\d{1,3}(?:\.\d+)?)'
+        r'(?:권면총액|발행총액|발행가액|발행규모|전자등록총액)[^\d]{0,20}?(?:의|중|대비)\s*(\d{1,3}(?:\.\d+)?)\s*(?:%|퍼센트)',
+        r'(?:콜옵션|매도청구권).*?(?:비율|한도|초과하여).*?(\d{1,3}(?:\.\d+)?)\s*(?:%|퍼센트)',
+        r'(\d{1,3}(?:\.\d+)?)\s*(?:%|퍼센트)\s*(?:를|을)\s*초과(?:하여)?',
+        r'(?:100|백)분의\s*(\d{1,3}(?:\.\d+)?)'
     ]
 
     for p in r_patterns:
         m = re.search(p, call_text_clean, re.IGNORECASE)
         if m:
             val = float(m.group(1))
-            if 5 <= val <= 100: ratio = f"{val:g}%"; break
+            if 5 <= val <= 100: 
+                ratio = f"{val:g}%"
+                break
 
     y_patterns = [
-        r'(?:수익률|이율|적용이율|할증률|복리)[^\d]{0,15}?(?:연|연복리|복리)?\s*(\d{1,2}(?:\.\d+)?)\s*(?:%|퍼센트)',
+        r'(?:수익률|할증률|연복리|복리|이율)[^\d]{0,15}?(?:연|연복리|복리)?\s*(\d{1,2}(?:\.\d+)?)\s*(?:%|퍼센트)',
         r'(?:연|연복리|복리)\s*(\d{1,2}(?:\.\d+)?)\s*(?:%|퍼센트)[^\d]{0,15}?(?:의\s*수익|이율|가산)',
-        r'(?:%|퍼센트)[^\d]{0,15}?(?:수익률|이율|복리|연)\s*(\d{1,2}(?:\.\d+)?)'
+        r'(?:보장수익률|연환산수익률).*?(\d{1,2}(?:\.\d+)?)\s*(?:%|퍼센트)'
     ]
 
     for p in y_patterns:
         m = re.search(p, call_text_clean, re.IGNORECASE)
         if m:
             val = float(m.group(1))
-            if 0 <= val <= 20: ytc = f"{val:g}%"; break
+            if 0 <= val <= 30: 
+                ytc = f"{val:g}%"
+                break
 
-    if not ratio or not ytc:
-        all_pcts = [float(v) for v in re.findall(r'(\d{1,3}(?:\.\d+)?)\s*(?:%|퍼센트)', call_text_clean) if float(v) > 0]
-        if not ratio and all_pcts:
-            rands = [v for v in all_pcts if 10 <= v <= 100 and v != float(ytc.replace('%', '') if ytc else -1)]
-            if rands: ratio = f"{max(rands):g}%"
-        if not ytc and all_pcts:
-            yands = [v for v in all_pcts if 0 <= v <= 20 and v != float(ratio.replace('%', '') if ratio else -1)]
-            if yands: ytc = f"{yands[0]:g}%"
-
+    # 텍스트에서 못 찾은 경우 HTML 원본 재탐색
     if not ratio or not ytc:
         soup = BeautifulSoup(html_raw, 'lxml')
         text = soup.get_text(separator=' ', strip=True)
         call_idx = text.lower().find("매도청구권")
         if call_idx == -1: call_idx = text.lower().find("call option")
+        
         if call_idx != -1:
             window = text[call_idx:call_idx+1500]
             if not ratio:
                 for p in r_patterns:
                     m = re.search(p, window, re.IGNORECASE)
-                    if m and 5 <= float(m.group(1)) <= 100: ratio = f"{float(m.group(1)):g}%"; break
+                    if m and 5 <= float(m.group(1)) <= 100: 
+                        ratio = f"{float(m.group(1)):g}%"
+                        break
             if not ytc:
                 for p in y_patterns:
                     m = re.search(p, window, re.IGNORECASE)
-                    if m and 0 <= float(m.group(1)) <= 20: ytc = f"{float(m.group(1)):g}%"; break
+                    if m and 0 <= float(m.group(1)) <= 30: 
+                        ytc = f"{float(m.group(1)):g}%"
+                        break
+                        
     return ratio, ytc
 
 # [유지] 전환청구기간 블록 캡처기
@@ -855,7 +858,7 @@ def run():
         prod = row[BOND_COLUMNS.index("발행상품")] if len(row) > BOND_COLUMNS.index("발행상품") else ""
         put_opt = row[BOND_COLUMNS.index("Put Option")] if len(row) > BOND_COLUMNS.index("Put Option") else ""
         
-        # ★ 핵심 패치: 빈칸 복구 조건에 '투자자'가 비어있을 때(not investor_val)도 다시 수집하도록 추가했습니다.
+        # ★ 누락 복구 조건 패치
         investor_val = row[BOND_COLUMNS.index("투자자")] if len(row) > BOND_COLUMNS.index("투자자") else ""
         needs_fix = (not amt or not price or not prod or not put_opt or not investor_val)
         
