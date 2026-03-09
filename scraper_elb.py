@@ -1,11 +1,8 @@
 # ==========================================================
-# #주식연계채권_코드V13.3_Ultimate_Master (모든 정확도 개선 통합판)
-# 1. [완벽개조] Put/Call Option: 표 구조(DataFrame)를 무시하고 텍스트 기반 직독직해 (교차오염 방지 및 절단기 지능 향상)
-# 2. [강화] Call 비율 & YTC: 엉뚱한 비율(%)을 가져오지 않도록 금융 문맥 기반 정규식 고도화 및 억지 매칭(Fallback) 삭제
-# 3. [강화] 발행상품: 긴 수식어(무기명식 이권부 무보증 사모 전환사채 등)가 잘리지 않도록 패턴 확장
-# 4. [강화] 투자자(Investors): 신탁업자 괄호 노이즈 제거, 펀드+운용사 표 스캔 싹쓸이 탑재
-# 5. [패치] 누락 복구: 이미 저장된 시트 행에서 핵심 컬럼('투자자' 등)이 빈칸일 경우 재수집(needs_fix)
-# 6. [유지] V11.9 전환청구기간(날짜) 블록 캡처 유지 (시작/종료일 겹침 방지)
+# #주식연계채권_코드V13.4_Option_Sentence_Fix (옵션 첫 문장 완벽 추출 패치)
+# 1. [핵심패치] Put/Call Option: 줄바꿈으로 인해 제목만 잘려 나오는 버그(예: "조기상환청구권에") 완벽 해결
+# 2. [핵심패치] HTML 구조(표, 셀)를 무시하고 텍스트를 연결하여 "본 사채의 사채권자는..." 같은 완성형 첫 문장부터 깔끔하게 수집
+# 3. 기존 V13.3의 모든 강화 기능(투자자 싹쓸이, Call 비율 정규식, 발행상품명 등) 100% 유지
 # ==========================================================
 import os
 import re
@@ -311,7 +308,7 @@ def find_row_best_float(dfs, must_contain) -> Optional[float]:
     return None
 
 # ==========================================================
-# 5. 핵심 컬럼 전용 추출기 (발행상품, 옵션 등 대폭 강화)
+# 5. 핵심 컬럼 전용 추출기
 # ==========================================================
 
 def extract_product_type(dfs: List[pd.DataFrame], corr_after: Dict) -> str:
@@ -323,12 +320,10 @@ def extract_product_type(dfs: List[pd.DataFrame], corr_after: Dict) -> str:
         t = re.sub(r'\b종류\b', '', t) 
         t = t.replace('발행결정', '').strip()
         
-        # [강화] 수식어가 길게 붙은 공식 명칭까지 한 번에 포착 (무기명식 이권부 무보증 등)
         pattern = r'((?:제\s*\d+\s*회차?)?[\s\w,()]*(?:무기명식|기명식|이권부|무보증|보증|사모|공모|비분리형|분리형|표면|만기)[\s\w,()]*?(?:전환사채|교환사채|신주인수권부사채|사채))'
         matches = re.findall(pattern, t)
         
         if not matches:
-            # 보수적 매칭 (수식어 없는 경우)
             match = re.search(r'((?:제\s*\d+\s*회차?)?\s*(?:전환사채|교환사채|신주인수권부사채))', t)
             if match: return _single_line(match.group(1))
             return ""
@@ -339,7 +334,6 @@ def extract_product_type(dfs: List[pd.DataFrame], corr_after: Dict) -> str:
             if 5 <= len(res) <= 60:
                 s_idx = res.find("사채")
                 if s_idx != -1: res = res[:s_idx+2].strip()
-                # 앞쪽 노이즈 제거
                 res = re.sub(r'^.*?((?:제\d+회)?\s*(?:무기명|기명))', r'\1', res)
                 return _single_line(res)
         return ""
@@ -436,7 +430,6 @@ def extract_fund_usage(dfs: List[pd.DataFrame], corr_after: Dict) -> str:
     return _single_line(val)
 
 
-# [강화] 투자자 추출기 (신탁업자 꼬리표 제거 및 표 스캔 확장)
 def extract_investors(dfs: List[pd.DataFrame], corr_after: Dict[str, str]) -> str:
     investors = []
     
@@ -449,7 +442,6 @@ def extract_investors(dfs: List[pd.DataFrame], corr_after: Dict[str, str]) -> st
     def clean_investor_name(sn):
         if not sn or str(sn).lower() == 'nan': return ""
         s = str(sn).replace('\n', ' ').replace('\r', '').strip()
-        # 괄호 등 노이즈 제거
         s = re.sub(r'\([^)]*신탁업자[^)]*\)', '', s)
         s = re.sub(r'\([^)]*본건펀드[^)]*\)', '', s)
         s = re.sub(r'\([^)]*전문투자자[^)]*\)', '', s)
@@ -469,7 +461,6 @@ def extract_investors(dfs: List[pd.DataFrame], corr_after: Dict[str, str]) -> st
 
     target_col_kws = ["대상자명", "대상사명", "성명", "법인명", "인수인", "투자기구", "투자업자", "발행대상", "투자자"]
 
-    # 1. 표 내부 스캔
     for df in reversed(dfs):
         arr = df.astype(str).values
         R, C = arr.shape
@@ -480,8 +471,7 @@ def extract_investors(dfs: List[pd.DataFrame], corr_after: Dict[str, str]) -> st
             for c in range(C):
                 cell_v = _norm(arr[r][c])
                 if any(kw in cell_v for kw in target_col_kws):
-                    if "최대주주" in cell_v or "대표이사" in cell_v:
-                        continue
+                    if "최대주주" in cell_v or "대표이사" in cell_v: continue
                     found_cols.append(c)
             if found_cols:
                 start_row = r + 1
@@ -502,7 +492,6 @@ def extract_investors(dfs: List[pd.DataFrame], corr_after: Dict[str, str]) -> st
                     if is_valid_investor_name(c_whole) and c_whole not in investors:
                         investors.append(c_whole)
 
-    # 2. 정정사항 스캔
     if not investors and corr_after:
         for k, v in corr_after.items():
             if any(_norm(kw) in _norm(k) for kw in ["발행대상자", "배정대상자", "투자자", "인수인", "대상자"]):
@@ -511,7 +500,6 @@ def extract_investors(dfs: List[pd.DataFrame], corr_after: Dict[str, str]) -> st
                     if is_valid_investor_name(c_name) and c_name not in investors:
                         investors.append(c_name)
 
-    # 3. 단일 값 스캔
     if not investors:
         val = scan_label_value_preferring_correction(dfs, ["발행대상자", "배정대상자", "투자자", "성명(법인명)", "인수인"], corr_after)
         if val:
@@ -520,7 +508,6 @@ def extract_investors(dfs: List[pd.DataFrame], corr_after: Dict[str, str]) -> st
                 if is_valid_investor_name(c_name) and c_name not in investors:
                     investors.append(c_name)
 
-    # 4. 강제 키워드 스캔
     if not investors:
         for df in dfs:
             arr = df.astype(str).values
@@ -539,89 +526,87 @@ def extract_investors(dfs: List[pd.DataFrame], corr_after: Dict[str, str]) -> st
     return _single_line(", ".join(final_investors[:15]))
 
 
-# [강화] Put/Call Option 직독직해 스캐너 (절단기 지능 향상)
+# ----------------------------------------------------------------------
+# ★ [V13.4 핵심 패치] Put/Call Option 직독직해 스캐너 (문장 완성형 추출)
+# - 줄바꿈에 속지 않고 문맥을 연결하여 진짜 첫 문장부터 쓸어옵니다.
+# ----------------------------------------------------------------------
 def extract_option_details(html_raw: str, option_type: str, corr_after: Dict[str, str]) -> str:
     my_kws = ["조기상환청구권", "put option", "풋옵션"] if option_type == 'put' else ["매도청구권", "call option", "콜옵션"]
-    opp_kws = ["매도청구권", "call option", "콜옵션", "【특정인", "미상환 주권", "기타 투자판단", "발행결정 전후", "10. 기타사항", "11. 기타사항", "12. 기타사항", "13. 기타사항", "20. 기타사항", "기타사항", "합병 관련 사항"] if option_type == 'put' else ["조기상환청구권", "put option", "풋옵션", "【특정인", "미상환 주권", "기타 투자판단", "발행결정 전후", "10. 기타사항", "11. 기타사항", "12. 기타사항", "13. 기타사항", "20. 기타사항", "기타사항", "합병 관련 사항"]
+    opp_kws = ["매도청구권", "call option", "콜옵션", "【특정인", "미상환 주권", "기타 투자판단", "발행결정 전후", "10. 기타사항", "11. 기타사항", "12. 기타사항", "13. 기타사항", "20. 기타사항", "합병 관련 사항", "청약일"] if option_type == 'put' else ["조기상환청구권", "put option", "풋옵션", "【특정인", "미상환 주권", "기타 투자판단", "발행결정 전후", "10. 기타사항", "11. 기타사항", "12. 기타사항", "13. 기타사항", "20. 기타사항", "합병 관련 사항", "청약일"]
     
+    # 텍스트를 이쁘게 다듬는 내부 함수
+    def clean_extracted_text(text: str) -> str:
+        if not text: return "없음"
+        text = text.replace('|', ' ') # 구분자로 썼던 특수문자 제거
+        text = re.sub(r'\s+', ' ', text).strip()
+        # 문장 맨 앞에 남아있는 "가. 매도청구권에 관한 사항" 같은 제목 찌꺼기 완벽 날리기
+        text = re.sub(r'^[\s\(\)\[\]\]:\-\.]+(?:에\s*관한\s*사항|관한\s*사항|사항)?\s*', '', text)
+        if not text or len(text) < 5: return "없음"
+        if len(text) > 400: return text[:400] + "..." # 셀이 너무 커지지 않도록 400자 컷
+        return text
+
+    # 1. 정정 공시(corr_after) 우선 확인
     if corr_after:
         for k, v in corr_after.items():
             if any(_norm(kw).lower() in _norm(k).lower() for kw in my_kws) and len(v) > 10:
-                val = v
+                v_clean = re.sub(r'\s+', ' ', v)
                 for kw in my_kws:
                     pattern = r'^.*?' + kw + r'(?:[\s\(\)\[\]a-zA-Z]*(?:에\s*관한\s*사항)?\s*\]?)?'
-                    val = re.sub(pattern, '', val, flags=re.IGNORECASE)
-                val = re.sub(r'^[:\-\]\]\s]+', '', val.strip())
-                return _single_line(val)
+                    v_clean = re.sub(pattern, '', v_clean, flags=re.IGNORECASE)
+                res = clean_extracted_text(v_clean)
+                if res != "없음": return res
 
+    # 2. 본문 생텍스트 스캔
     soup = BeautifulSoup(html_raw, 'lxml')
     for tag in soup(['style', 'script']): tag.decompose()
-    for tag in soup.find_all(['br', 'p', 'div', 'tr', 'td', 'th', 'li']):
-        tag.insert_after('\n')
-        
-    text = soup.get_text(separator='\n')
-    text = re.sub(r'\n[ \t]+', '\n', text)
-    text = re.sub(r'\n{2,}', '\n', text)
     
-    lines = text.split('\n')
-    target_indices = []
+    # [핵심] 줄바꿈(엔터)이나 테이블 셀 구분을 " | " 특수문자로 치환하여 한 줄로 만듦
+    text = soup.get_text(separator=' | ', strip=True)
     
-    for i, line in enumerate(lines):
-        line_clean = re.sub(r'\s+', '', line).lower()
-        if any(re.sub(r'\s+', '', kw).lower() in line_clean for kw in my_kws):
-            # 교차 오염 방지
-            if any(re.sub(r'\s+', '', opp).lower() in line_clean for opp in ["매도청구권", "calloption", "콜옵션"] if option_type == 'put'):
-                continue
-            if any(re.sub(r'\s+', '', opp).lower() in line_clean for opp in ["조기상환청구권", "putoption", "풋옵션"] if option_type == 'call'):
-                continue
-                
-            score = 1
-            if "사항" in line: score += 2
-            if line.strip().startswith("[") or line.strip().startswith("【") or re.match(r'^[가-힣0-9]\.', line.strip()): 
-                score += 2
-            target_indices.append((i, score))
-            
-    if not target_indices:
-        return ""
-        
-    target_indices.sort(key=lambda x: (x[1], x[0]))
-    best_start_idx = target_indices[-1][0]
+    best_idx = -1
+    best_end = -1
     
-    collected_lines = []
-    for i in range(best_start_idx + 1, len(lines)):
-        line = lines[i].strip()
-        if not line: continue
-        
-        line_clean = re.sub(r'\s+', '', line).lower()
-        is_stop = False
-        
-        # 상대방 옵션 등 다른 섹션이 나오면 중단하되, '제목' 형태일 때만 반응하도록 지능 향상
-        for kw in opp_kws:
-            if re.sub(r'\s+', '', kw).lower() in line_clean:
-                if len(line) < 40 or line.strip()[0] in ['[', '【', '<', '-'] or re.match(r'^([0-9가-힣]\.|제\s*\d+\s*조)', line.strip()):
-                    is_stop = True
-                    break
-        
-        if is_stop:
+    # 1단계: 완벽한 '목차' 형태를 먼저 찾는다 (예: "[조기상환청구권]", "가. 매도청구권")
+    for kw in my_kws:
+        kw_regex = kw.replace(' ', r'\s*')
+        # 정규식: 구분자(|) 바로 뒤에 오거나, 괄호/숫자로 시작하는 진짜 제목 형태만 찾음
+        pattern = re.compile(r'(?:\|\s*|^)(?:[\[【<]\s*|(?:\d+|[가-힣])\.\s*)?(' + kw_regex + r')(?:[\s\(\)\[\]a-zA-Z]*(?:에\s*관한\s*사항)?\s*\]?)?', re.IGNORECASE)
+        matches = list(pattern.finditer(text))
+        if matches:
+            best_idx = matches[-1].start()
+            best_end = matches[-1].end() # 제목이 끝나는 지점 저장
             break
             
-        collected_lines.append(line)
-        
-    header_line = lines[best_start_idx].strip()
-    header_line_cleaned = header_line
-    for kw in my_kws:
-        pattern = r'^.*?' + kw + r'(?:[\s\(\)\[\]a-zA-Z]*(?:에\s*관한\s*사항)?\s*\]?)?'
-        header_line_cleaned = re.sub(pattern, '', header_line_cleaned, flags=re.IGNORECASE)
-    
-    header_line_cleaned = re.sub(r'^[:\-\]\]\s]+', '', header_line_cleaned)
-    
-    if header_line_cleaned and len(header_line_cleaned) > 5:
-        collected_lines.insert(0, header_line_cleaned)
-        
-    res = " ".join(collected_lines)
-    return _single_line(res)
+    # 2단계: 목차 형태가 없으면 텍스트 전체에서 키워드 단순 검색
+    if best_idx == -1:
+        for kw in my_kws:
+            idx = text.lower().rfind(kw.lower())
+            if idx != -1:
+                best_idx = idx
+                best_end = idx + len(kw)
+                break
+                
+    if best_idx == -1:
+        return "없음"
 
-# [강화] Call 비율 및 YTC (정규식 고도화 및 오작동 Fallback 제거)
+    # [핵심] 제목 부분은 건너뛰고, 그 다음 글자부터 끝까지 추출
+    content = text[best_end:]
+    
+    # 3단계: 절단기 (상대방 옵션이나 기타 목차가 나오면 거기서 컷)
+    cut_idx = len(content)
+    for opp in opp_kws:
+        opp_regex = opp.replace(' ', r'\s*')
+        # 상대방 옵션 단어가 문장 중간에 스쳐 지나가는건 무시하고, '목차'로 등장할 때만 자름
+        pattern = re.compile(r'(?:\|\s*|^)(?:[\[【<]\s*|(?:\d+|[가-힣])\.\s*)?(' + opp_regex + r')', re.IGNORECASE)
+        match = pattern.search(content)
+        if match and match.start() < cut_idx:
+            cut_idx = match.start()
+
+    content = content[:cut_idx]
+    
+    return clean_extracted_text(content)
+
+
 def extract_call_ratio_and_ytc(call_text: str, html_raw: str) -> Tuple[str, str]:
     ratio, ytc = "", ""
     call_text_clean = re.sub(r'\s+', ' ', str(call_text or ""))
@@ -655,7 +640,6 @@ def extract_call_ratio_and_ytc(call_text: str, html_raw: str) -> Tuple[str, str]
                 ytc = f"{val:g}%"
                 break
 
-    # 텍스트에서 못 찾은 경우 HTML 원본 재탐색
     if not ratio or not ytc:
         soup = BeautifulSoup(html_raw, 'lxml')
         text = soup.get_text(separator=' ', strip=True)
@@ -679,7 +663,6 @@ def extract_call_ratio_and_ytc(call_text: str, html_raw: str) -> Tuple[str, str]
                         
     return ratio, ytc
 
-# [유지] 전환청구기간 블록 캡처기
 def extract_period_dates(dfs, corr_after, period_kws) -> Tuple[str, str]:
     if corr_after:
         for k, v in corr_after.items():
@@ -858,7 +841,6 @@ def run():
         prod = row[BOND_COLUMNS.index("발행상품")] if len(row) > BOND_COLUMNS.index("발행상품") else ""
         put_opt = row[BOND_COLUMNS.index("Put Option")] if len(row) > BOND_COLUMNS.index("Put Option") else ""
         
-        # ★ 누락 복구 조건 패치
         investor_val = row[BOND_COLUMNS.index("투자자")] if len(row) > BOND_COLUMNS.index("투자자") else ""
         needs_fix = (not amt or not price or not prod or not put_opt or not investor_val)
         
