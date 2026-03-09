@@ -3,7 +3,9 @@
 # - [유지] V5.8의 모든 철벽 로직(날짜, 투자자, 보고서명) 100% 유지
 # - [개선] 상장시장, 기준주가 전용 정밀 타격 엔진 탑재
 # - [개선] 신규발행주식수 및 증자전주식수 "보통주식 + 종류주식(기타)" 완벽 분리 합산 엔진 탑재
-# - [최종개선] "발행상품" 컬럼 개선: 텍스트가 아닌 실제 수량(Amt) 기반으로 추적하여 "보통주식" / "우선주식" 정확히 양분
+# - [개선] "발행상품" 컬럼 개선: 텍스트가 아닌 실제 수량(Amt) 기반으로 추적하여 "보통주식" / "우선주식" 정확히 양분
+# - [최종완벽수정] 병합 셀로 인해 보통주/기타주가 여러 줄로 찢어진 경우(압타머사이언스 등) 스캔 중단 버그 완벽 해결
+# - [최종완벽수정] 기준주가/발행가액이 3~4줄 아래 위치한 경우(인벤티지랩, 지니너스 등) 탐색 범위 확장하여 정확히 픽업
 # ==========================================================
 import os
 import re
@@ -511,6 +513,10 @@ def extract_investors(dfs: List[pd.DataFrame], corr_after: Dict[str, str]) -> st
     return ""
 
 
+# ==========================================================
+# [최종완벽수정] 기준주가 및 발행가액 정밀 타격 엔진
+# 범위를 r+4까지 확장하여 분리된 보통주/기타주 가격을 전부 긁어옴
+# ==========================================================
 def get_base_price_by_exact_section(dfs: List[pd.DataFrame], corr_after: Dict[str, str]) -> Optional[int]:
     target_kws = ["기준주가", "기준발행가액"]
     stop_kws = ["자금조달", "증자방식", "할인율", "할증률", "증자전", "납입일"]
@@ -531,21 +537,29 @@ def get_base_price_by_exact_section(dfs: List[pd.DataFrame], corr_after: Dict[st
             if any(t in row_str_norm for t in target_kws) and not any(s in row_str_norm for s in stop_kws):
                 if "신주" in row_str_norm and "기준" not in row_str_norm: continue
                 
-                for rr in range(r, min(r+2, R)):
-                    row_nums = []
+                all_nums = []
+                # 가격이 3~4번째 줄에 나뉘어 있을 수 있으므로 범위를 r+4로 넓힘
+                for rr in range(r, min(r+4, R)):
+                    curr_row_norm = _norm("".join(arr[rr]))
+                    if rr > r:
+                        if any(s in curr_row_norm for s in stop_kws + ["신주발행가", "확정발행가"]): break
+                        clean_next = _clean_label(curr_row_norm)
+                        if len(curr_row_norm) != len(clean_next): 
+                            if any(k in curr_row_norm for k in ["할인", "할증", "발행", "납입"]): break
+                            
                     for c in range(C):
                         cell_norm = _norm(arr[rr][c])
                         if any(s in cell_norm for s in stop_kws): continue
                         amt = _max_int_in_text(arr[rr][c])
                         if amt and amt >= 50:
-                            row_nums.append(amt)
-                    if row_nums:
-                        return max(row_nums)
+                            all_nums.append(amt)
+                if all_nums:
+                    return max(all_nums) # 찾은 가격 중 가장 큰(정확한) 값을 반환
     return None
 
 def get_price_by_exact_section(dfs: List[pd.DataFrame], corr_after: Dict[str, str]) -> Optional[int]:
     target_kws = ["신주발행가액", "예정발행가액", "확정발행가액", "발행가액"]
-    stop_kws = ["자금조달", "증자방식", "기준주가", "할인율", "증자전", "발행주식"]
+    stop_kws = ["자금조달", "증자방식", "기준주가", "할인율", "증자전", "발행주식", "납입일"]
     
     if corr_after:
         for k, v in corr_after.items():
@@ -561,21 +575,29 @@ def get_price_by_exact_section(dfs: List[pd.DataFrame], corr_after: Dict[str, st
         for r in range(R):
             row_str_norm = _norm("".join(arr[r]))
             if any(t in row_str_norm for t in target_kws) and not any(s in row_str_norm for s in stop_kws):
-                for rr in range(r, min(r+2, R)):
-                    row_nums = []
+                all_nums = []
+                for rr in range(r, min(r+4, R)):
+                    curr_row_norm = _norm("".join(arr[rr]))
+                    if rr > r:
+                        if any(s in curr_row_norm for s in stop_kws + ["기준주가"]): break
+                        clean_next = _clean_label(curr_row_norm)
+                        if len(curr_row_norm) != len(clean_next): 
+                            if any(k in curr_row_norm for k in ["기준", "할인", "할증", "납입"]): break
+                            
                     for c in range(C):
                         cell_norm = _norm(arr[rr][c])
                         if any(s in cell_norm for s in stop_kws): continue
                         amt = _max_int_in_text(arr[rr][c])
                         if amt and amt >= 50:
-                            row_nums.append(amt)
-                    if row_nums:
-                        return max(row_nums)
+                            all_nums.append(amt)
+                if all_nums:
+                    return max(all_nums)
     return None
 
+
 # ==========================================================
-# [개선] 보통주 + 기타주 완벽 분할 합산 및 추출 엔진
-# 반환값: (합산 주식수, 보통주식 수, 우선/기타주식 수)
+# [최종완벽수정] 보통주 + 기타주 완벽 분할 합산 및 추출 엔진
+# - 병합 셀 문제로 "증자전"과 "보통주"가 다른 줄에 있어도 뚫고 합산함
 # ==========================================================
 def get_shares_info_by_exact_section(dfs: List[pd.DataFrame], corr_after: Dict[str, str], section_keywords: List[str], stop_keywords: List[str]) -> Tuple[Optional[int], int, int]:
     if corr_after:
@@ -617,10 +639,13 @@ def get_shares_info_by_exact_section(dfs: List[pd.DataFrame], corr_after: Dict[s
                     if rr > r:
                         if any(s in curr_row_norm for s in stop_keywords + ["액면가", "자금조달", "증자방식", "발행가", "기준주가", "납입일", "신주인수권", "우선배정"]):
                             break
-                        clean_next = _clean_label(curr_row_norm)
-                        if len(curr_row_norm) != len(clean_next): 
-                            if any(k in curr_row_norm for k in ["액면", "자금", "가액", "총수", "증자", "발행목적", "목적", "방식"]):
-                                break
+                            
+                        # [오류수정] 병합셀로 인해 타겟 키워드(예: 증자전)가 반복되는 줄은 안전지대이므로 Break하지 않음
+                        if not any(t in curr_row_norm for t in section_keywords):
+                            clean_next = _clean_label(curr_row_norm)
+                            if len(curr_row_norm) != len(clean_next): 
+                                if any(k in curr_row_norm for k in ["액면", "자금", "가액", "총수", "증자", "발행목적", "목적", "방식"]):
+                                    break
 
                     for c in range(C):
                         cell_str_raw = _norm(arr[rr][c])
@@ -642,7 +667,6 @@ def get_shares_info_by_exact_section(dfs: List[pd.DataFrame], corr_after: Dict[s
                         has_oth = any(k in cell_str for k in ["기타", "종류", "우선", "상환전환"])
                         has_tot = "합계" in cell_str or "총계" in cell_str
                         
-                        # 같은 셀 안에 보통주, 우선주가 혼재할 때 정규식 분할 추출
                         if has_com and has_oth and len(v_nums) >= 2:
                             m_com = re.search(r'보통주.*?[^\d]*((?:\d{1,3}[,.]?)+\d+)', cell_str)
                             if m_com:
@@ -681,7 +705,6 @@ def extract_issue_shares_and_type(dfs: List[pd.DataFrame], corr_after: Dict[str,
     if res and res[0] is not None:
         total_amt, common_amt, other_amt = res
         
-        # 실제 찾아낸 수량을 바탕으로 주식의 종류를 100% 정확하게 네이밍
         if other_amt > 0 and common_amt == 0:
             stock_type = "우선주식"
         elif common_amt > 0 and other_amt == 0:
@@ -812,6 +835,7 @@ def parse_rights_issue_record(dfs, t: Target, corr_after, html_raw, company_mark
                     if amt is not None and amt > min_val: return amt
         return None
 
+    # 증자전 주식수
     res_prev = get_shares_info_by_exact_section(
         dfs, corr_after, 
         ["증자전발행주식총수", "기발행주식총수", "발행주식총수", "증자전주식수"], 
@@ -828,6 +852,7 @@ def parse_rights_issue_record(dfs, t: Target, corr_after, html_raw, company_mark
 
     if prev_shares: rec["증자전 주식수"] = f"{prev_shares:,}"
 
+    # 확정발행가 (범위확장 엔진)
     price = get_price_by_exact_section(dfs, corr_after)
     
     if not price:
@@ -840,6 +865,7 @@ def parse_rights_issue_record(dfs, t: Target, corr_after, html_raw, company_mark
         
     if price: rec["확정발행가(원)"] = f"{price:,}"
 
+    # 기준주가 (범위확장 엔진)
     base_price = get_base_price_by_exact_section(dfs, corr_after)
     if not base_price:
         base_price = get_corr_num(["기준주가", "기준발행가액"], min_val=50)
