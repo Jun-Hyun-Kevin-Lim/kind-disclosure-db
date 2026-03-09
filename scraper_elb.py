@@ -1,9 +1,10 @@
 # ==========================================================
-# #주식연계채권_코드V13.7_Ultimate_Anchor_Window (옵션 문장 완벽 추출판)
-# 1. [혁명적개선] Put/Call Option: '앵커 슬라이딩 윈도우' 기법 도입. 
-#    -> "본 사채의 사채권자는", "발행회사 또는" 등 진짜 주어의 위치를 찾아 그곳부터 칼같이 절단. "PUT OPTION]" 같은 찌꺼기 0%.
-# 2. [스코어링 극대화] 표 헤더(매매일, 상환율, FROM, TO), 날짜, 의무보유 조항 등 가짜 문장 완벽 필터링(-200점 페널티)
-# 3. [유지] V13.3의 모든 기능 (투자자 싹쓸이, Call 비율/YTC 정규식, 누락복구 패치 등) 100% 유지
+# #주식연계채권_코드V13.8_Ultimate_Anchor_Master (옵션 문장 완벽 추출판)
+# 1. [혁명적개선] Put/Call Option: 정규식 앵커(Anchor) 기법 도입. 
+#    -> "본 사채의 사채권자는", "발행회사 또는..." 등 진짜 주어 위치를 찾아 칼같이 절단. "[PUT OPTION]" 찌꺼기 0%.
+# 2. [스코어링 극대화] 표 헤더(매매일, 상환율, FROM, TO), 의무보유 조항 등 가짜 문장 완벽 사살(-300점)
+# 3. [다중껍질제거] 앵커가 없는 문장이라도 "1) 조기상환청구권에 관한 사항 :" 패턴을 3중으로 벗겨냄
+# 4. [유지] 기존의 모든 기능 (투자자 싹쓸이, Call 비율/YTC, 발행상품 등) 100% 유지
 # ==========================================================
 import os
 import re
@@ -528,108 +529,98 @@ def extract_investors(dfs: List[pd.DataFrame], corr_after: Dict[str, str]) -> st
 
 
 # ----------------------------------------------------------------------
-# ★ [V13.7 혁명적 패치] 앵커(Anchor) 슬라이딩 윈도우 직독직해 스캐너
+# ★ [V13.8 종결판] Put/Call Option 직독직해 엔진 (정규식 앵커 + 3중 껍질 벗기기)
 # ----------------------------------------------------------------------
 def extract_option_details(html_raw: str, option_type: str, corr_after: Dict[str, str]) -> str:
     my_kws = ["조기상환청구권", "put option", "풋옵션"] if option_type == 'put' else ["매도청구권", "call option", "콜옵션", "중도상환청구권"]
     opp_kws = ["매도청구권", "call option", "콜옵션", "중도상환청구권"] if option_type == 'put' else ["조기상환청구권", "put option", "풋옵션"]
     
-    # 1. 정정공시 텍스트와 HTML 본문을 하나의 거대한 텍스트 코퍼스로 융합 (줄바꿈/엔터 모두 공백으로 치환)
-    text_corpus = ""
+    # 1. 텍스트 코퍼스 생성 (줄바꿈 모두 제거)
+    corpus = ""
     if corr_after:
         for k, v in corr_after.items():
             if any(_norm(kw).lower() in _norm(k).lower() for kw in my_kws) and len(v) > 10:
-                text_corpus += " " + v
-                
+                corpus += " " + v
+
     soup = BeautifulSoup(html_raw, 'lxml')
     for tag in soup(['style', 'script']): tag.decompose()
-    text_corpus += " " + soup.get_text(separator=' ', strip=True)
-    text_corpus = re.sub(r'\s+', ' ', text_corpus) # 연속 공백 완벽 제거
-    text_lower = text_corpus.lower()
+    corpus += " " + soup.get_text(separator=' ', strip=True)
+    corpus = re.sub(r'\s+', ' ', corpus)
 
-    # 2. 진짜 주어 역할을 하는 앵커(Anchor) 리스트 정의
-    put_anchors = ["본 사채의 사채권자는", "본사채의 사채권자는", "사채권자는", "인수인은", "본 사채의 인수인은", "투자자는", "본 전환사채의 사채권자는", "본 사채의 사채권자 및"]
-    call_anchors = ["발행회사 또는 발행회사가", "발행회사는", "본 사채의 발행회사는", "회사는", "발행회사 및 발행회사가", "본 전환사채는 만기 전", "본 사채는 만기 전", "제3자의 성명 :", "발행회사 또는 발행회사가 지정하는", "발행회사가 지정하는"]
-
-    # 3. 키워드가 등장하는 곳 주변(윈도우) 스캔 및 채점
+    # 2. 키워드 주변부(Window) 스캔 및 채점
     candidates = []
     for kw in my_kws:
-        start_idx = 0
-        while True:
-            idx = text_lower.find(kw.lower(), start_idx)
-            if idx == -1: break
+        for match in re.finditer(kw, corpus, re.IGNORECASE):
+            idx = match.start()
+            window = corpus[max(0, idx - 50) : idx + 1000]
             
-            # 키워드 주변 텍스트(윈도우) 추출
-            window = text_corpus[max(0, idx - 20):min(len(text_corpus), idx + 1000)]
             score = 0
-            
             if option_type == 'put':
-                if any(a in window for a in put_anchors): score += 50
-                if "청구할 수 있다" in window or "조기상환을 청구" in window: score += 30
-                if "의무보유" in window: score -= 100 # Call 옵션 조항에 낚임 방지
+                if re.search(r'사채권자|인수인|투자자', window): score += 50
+                if re.search(r'청구할\s*수\s*있다|조기상환을\s*청구', window): score += 50
+                if "의무보유" in window: score -= 200 # 의무보유 조항 낚임 강력 방지
+                if "콜옵션" in window: score -= 50
             else:
-                if any(a in window for a in call_anchors): score += 50
-                if "매수할 수" in window or "매도청구" in window: score += 30
-                if "조기상환청구" in window: score -= 100 # Put 옵션 조항에 낚임 방지
+                if re.search(r'발행회사|매수|매도청구', window): score += 50
+                if re.search(r'매수할\s*수\s*있다|매도를\s*청구', window): score += 50
+                if "의무보유" in window and "사채권자" in window: score -= 200 # Put 조항 낚임 강력 방지
 
-            # [강력 감점] 표 헤더, 요약 리스트, 날짜 등 가짜 문장 완벽 필터링
-            if "매매일" in window and "상환율" in window: score -= 200
-            if "from" in window.lower() and "to" in window.lower(): score -= 200
-            if "성명 및 관계" in window: score -= 100
-            if "전자등록금액의 100" in window and "년" in window and "월" in window: score -= 50
+            # 표 헤더, 요약 테이블 등 완벽 컷아웃
+            if "매매일" in window and "상환율" in window: score -= 300
+            if "from" in window.lower() and "to" in window.lower(): score -= 300
+            if "성명 및 관계" in window: score -= 300
 
-            candidates.append((score, window, idx))
-            start_idx = idx + len(kw)
+            candidates.append((score, window))
 
     if not candidates: return "없음"
 
-    # 4. 1등 윈도우 선택 후 앵커 위치부터 칼같이 절단!
+    # 가장 점수가 높은 텍스트 윈도우 선택
     candidates.sort(key=lambda x: x[0], reverse=True)
-    best_score, best_window, _ = candidates[0]
+    best_score, best_window = candidates[0]
 
     if best_score < 0: return "없음"
 
-    anchors = put_anchors if option_type == 'put' else call_anchors
-    start_cut = -1
-
-    for anchor in anchors:
-        a_idx = best_window.find(anchor)
-        # 앵커가 키워드 근처(300자 이내)에 있을 때만 유효함
-        if a_idx != -1 and a_idx < 300:
-            if start_cut == -1 or a_idx < start_cut:
-                start_cut = a_idx
-
-    # [핵심] 앵커(주어)를 찾았다면 그곳부터 무조건 시작! (앞에 있는 모든 제목 찌꺼기 무시)
-    if start_cut != -1:
-        result = best_window[start_cut:]
+    # 3. [핵심] 정규식 앵커(Anchor)를 통해 진짜 "주어"가 시작하는 위치 찾기
+    if option_type == 'put':
+        anchor_regex = r'(본\s*사채의\s*사채권자는|본\s*사채의\s*인수인은|사채권자는|인수인은|투자자는|본\s*전환사채의\s*사채권자는)'
     else:
-        # 앵커를 못 찾았을 때만 제목 찌꺼기를 정규식으로 지움
-        kw_rel_idx = -1
-        for kw in my_kws:
-            idx = best_window.lower().find(kw.lower())
-            if idx != -1 and (kw_rel_idx == -1 or idx < kw_rel_idx):
-                kw_rel_idx = idx
-        if kw_rel_idx == -1: kw_rel_idx = 20
-        
-        result = best_window[kw_rel_idx:]
-        pattern = r'^(?:조기상환청구권|매도청구권|중도상환청구권|조기상환\s*청구권|매도\s*청구권|콜옵션|풋옵션|Put\s*Option|Call\s*Option|PUT\s*OPTION|CALL\s*OPTION)[\]\)\s]*?(?:에\s*관한\s*사항|청구권자|행사|부여|비율|한도)?\s*[:\-]?\s*(?:\(\d+\)|\d+\.|\d+\))?\s*'
-        result = re.sub(pattern, '', result, flags=re.IGNORECASE).strip()
-        result = re.sub(r'^([①-⑩]|\d+\.|\d+\)|[가-힣a-zA-Z]\.|[가-힣a-zA-Z]\))\s*', '', result).strip()
+        # "발행회사 또는 발행회사가 지정하는 자(이하...)는" 등 다양한 패턴 완벽 대응
+        anchor_regex = r'(발행회사\s*또는\s*발행회사가\s*지정하는\s*자(?:\([^)]*\))?(?:는|가)?|발행회사(?:는|가)|회사는\s*만기\s*전|본\s*사채는\s*만기\s*전|제\s*3\s*자의\s*성명)'
 
-    # 5. 다른 목차가 나오면 거기서 추출 종료
-    stop_patterns = opp_kws + ["10. 기타사항", "11. 기타사항", "12. 기타사항", "13. 기타사항", "20. 기타사항", "합병 관련 사항", "청약일", "납입일", "기타 투자판단", "발행결정 전후", "【특정인", "[특정인", "미상환 주권", "사채권자의 본 사채 의무보유"]
+    match = re.search(anchor_regex, best_window)
+    
+    # 만약 주어를 찾았다면 그 앞의 모든 찌꺼기("[PUT OPTION]" 등)를 버리고 주어부터 시작!
+    if match and match.start() < 150:
+        result = best_window[match.start():]
+    else:
+        # 주어가 없는 짧은 문장이면, 다중 껍질 벗기기 루프로 찌꺼기 완벽 제거
+        result = best_window
+        for _ in range(3): # 3겹까지 벗겨냄
+            # ①, 가., 1) 등 제거
+            result = re.sub(r'^([\[【<\(]?\s*[①-⑩\d가-힣a-zA-Z][\.\)\]】>]\s*)+', '', result)
+            # "조기상환청구권(Put Option)에 관한 사항 :" 등 제목 껍질 제거
+            prefix_pattern = r'^(?:본\s*사채의\s*|발행회사의\s*)?(?:조기상환청구권|매도청구권|중도상환청구권|콜옵션|풋옵션|Put\s*Option|Call\s*Option|PUT\s*OPTION|CALL\s*OPTION)[^가-힣]*?(?:에\s*관한\s*사항|청구권자|행사|부여|비율|한도)?\s*[:\]\-\>]*\s*'
+            result = re.sub(prefix_pattern, '', result, flags=re.IGNORECASE)
+            result = re.sub(r'^[:\-\]\s]+', '', result)
+
+    # 4. 다른 목차가 등장하면 그 앞에서 컷
+    stop_kws = opp_kws + ["10. 기타사항", "11. 기타사항", "12. 기타사항", "13. 기타사항", "20. 기타사항", "합병 관련 사항", "청약일", "납입일", "기타 투자판단", "발행결정 전후", "【특정인", "[특정인", "미상환 주권", "사채권자의 본 사채 의무보유", "의무보유"]
 
     cut_idx = len(result)
-    for stop_kw in stop_patterns:
+    for stop_kw in stop_kws:
         s_idx = result.lower().find(stop_kw.lower())
-        if s_idx != -1 and s_idx > 20:
-            if s_idx < cut_idx: cut_idx = s_idx
+        if s_idx > 20 and s_idx < cut_idx:
+            cut_idx = s_idx
 
     result = result[:cut_idx].strip()
-    result = re.sub(r'^[\s\(\)\[\]\]:\-\.]+', '', result)
     result = re.sub(r'\s+', ' ', result).strip()
 
     if not result or len(result) < 5: return "없음"
+
+    # 단순 날짜만 덜렁 남은 쓰레기 데이터 방지
+    if re.fullmatch(r'\d{4}년\s*\d{1,2}월\s*\d{1,2}일.*', result) and len(result) < 30:
+        return "없음"
+
     return result[:300] + ("..." if len(result) > 300 else "")
 
 
