@@ -2,10 +2,11 @@
 # #유상증자_코드V5.9_Ultimate (확정발행금액 정확도 100% 무결성판) 
 # - [유지] V5.8의 모든 철벽 로직(날짜, 투자자, 보고서명) 100% 유지 
 # - [개선] 상장시장, 기준주가 전용 정밀 타격 엔진 탑재 
+# - [개선] 신규발행주식수 및 증자전주식수 "보통주식 + 종류주식(기타)" 완벽 분리 합산 엔진 탑재 
 # - [최종개선] "발행상품" 컬럼 개선: 텍스트가 아닌 실제 수량(Amt) 기반으로 추적하여 "보통주식" / "우선주식" 정확히 양분 
 # - [긴급개선] 신규발행주식수 코드 100% 유지 및 "증자전 주식수" 전용 합산 엔진 탑재 (압타머사이언스, 코오롱티슈진 완벽 해결)
 # - [완벽해결] 인벤티지랩, 지니너스 기준주가/발행가액 오류 해결 (연도 2026, 할인율 7.0% 등 가짜 숫자 완벽 차단 필터 적용)
-# - [최종복구] 신규발행주식수 오류 복구: 증자전 주식수에서 검증된 완벽한 스캔/합산 방식을 신규발행주식수에도 100% 동일하게 이식 (정정공시 포함)
+# - [최종동기화] 신규발행주식수 엔진을 증자전 주식수(get_prev_shares_sum)와 100% 동일한 로직(정정후 처리 및 블록 정규식)으로 일치화
 # ========================================================== 
 import os 
 import re 
@@ -610,26 +611,18 @@ def get_price_by_exact_section(dfs: List[pd.DataFrame], corr_after: Dict[str, st
     return None 
 
 # ==========================================================
-# [최종복구] 신규발행주식수 + 발행상품 전용 완벽 스나이핑 엔진
-# 증자전 주식수에서 성공한 로직(max 활용 및 병합셀 타격)을 100% 동일하게 이식
+# [최종동기화] 신규발행주식수 및 발행상품 완벽 스나이핑 엔진
+# 증자전 주식수(get_prev_shares_sum)에서 검증된 정규식/다중행 스캔 로직 100% 이식
 # ==========================================================
-def extract_issue_shares_and_type(dfs: List[pd.DataFrame], corr_after: Dict[str, str]) -> Tuple[Optional[int], str]: 
-    target_kws = ["신주의종류와수", "신주의종류", "선주의종류와수", "선주의종류", "발행예정주식수", "발행예정주식", "신주발행", "발행할주식"] 
-    stop_kws = ["증자전", "기발행", "총수", "발행가", "액면가", "자금조달", "증자방식", "일정", "목적"] 
-    
-    stock_type = "보통주식" 
-    best_amt = 0 
-    
-    # 1. 정정공시 텍스트 먼저 검사
+def get_shares_info_by_exact_section(dfs: List[pd.DataFrame], corr_after: Dict[str, str], section_keywords: List[str], stop_keywords: List[str]) -> Tuple[Optional[int], int, int]: 
     if corr_after: 
         for k, v in corr_after.items(): 
             k_norm = _norm(k) 
-            if any(t in k_norm for t in target_kws): 
-                if not any(s in k_norm for s in stop_kws): 
+            if any(t in k_norm for t in section_keywords): 
+                if not any(s in k_norm for s in stop_keywords): 
                     v_norm = _norm(v) 
                     v_norm = re.sub(r'202\d[년월일\.]?', '', v_norm) 
                     cv, ov, tv = 0, 0, 0 
-                    
                     m_com = re.findall(r'보통[^0-9]*?((?:\d{1,3}[,.]?)+\d{3,})', v_norm) 
                     if m_com: cv = max([int(re.sub(r'[,.]', '', x)) for x in m_com]) 
                     m_oth = re.findall(r'(?:기타|종류|우선|상환전환)[^0-9]*?((?:\d{1,3}[,.]?)+\d{3,})', v_norm) 
@@ -638,20 +631,10 @@ def extract_issue_shares_and_type(dfs: List[pd.DataFrame], corr_after: Dict[str,
                     if m_tot: tv = max([int(re.sub(r'[,.]', '', x)) for x in m_tot]) 
                     
                     calc = cv + ov 
-                    if tv > 0 and tv >= calc: best_amt = tv 
-                    elif calc > 0: best_amt = calc 
-                    elif cv > 0: best_amt = cv 
-                    elif ov > 0: best_amt = ov 
-                    
-                    if best_amt > 0: 
-                        if ov > 0 and cv == 0: stock_type = "우선주식" 
-                        elif cv > 0 and ov == 0: stock_type = "보통주식" 
-                        elif cv > 0 and ov > 0: stock_type = "보통주식, 우선주식" 
-                        elif "우선" in v_norm or "종류" in v_norm or "기타" in v_norm: 
-                            stock_type = "보통주식, 우선주식" if "보통" in v_norm else "우선주식" 
-                        return best_amt, stock_type 
+                    if tv > 0 and tv >= calc: return tv, (cv if cv > 0 else tv), ov 
+                    if calc > 0: return calc, cv, ov 
+                    if cv > 0: return cv, cv, 0 
 
-    # 2. 본문 표에서 목표 구역 찾기
     for df in dfs: 
         try: arr = df.astype(str).values 
         except: continue 
@@ -659,35 +642,32 @@ def extract_issue_shares_and_type(dfs: List[pd.DataFrame], corr_after: Dict[str,
         for r in range(R): 
             row_str_norm = _norm("".join(arr[r])) 
             
-            # 압타머사이언스처럼 두 줄로 나뉘어 있어도 찾도록 아랫줄과 합쳐서 검사
             combined_target = row_str_norm 
             if r + 1 < R: 
                 combined_target += _norm("".join(arr[r+1])) 
                 
-            if any(t in combined_target for t in target_kws): 
-                # 다른 구역의 키워드가 있으면 스킵
-                if any(s in row_str_norm for s in stop_kws) and not any(t in row_str_norm for t in target_kws): 
+            if any(t in combined_target for t in section_keywords): 
+                if any(s in row_str_norm for s in stop_keywords) and not any(t in row_str_norm for t in section_keywords): 
                     continue 
                 
                 block_text = "" 
                 search_start = max(0, r - 1) 
                 
-                # 타겟 발견 시 7줄 아래까지의 글자를 거대한 하나의 문장으로 묶어버림
                 for rr in range(search_start, min(r + 7, R)): 
                     curr_row_norm = _norm("".join(arr[rr])) 
                     
-                    if rr < r and any(s in curr_row_norm for s in stop_kws + ["액면", "자금", "방식"]): 
+                    if rr < r and any(s in curr_row_norm for s in stop_keywords + ["액면", "자금", "방식"]): 
                         continue 
                         
                     if rr > r + 1: 
                         clean_next = _clean_label(curr_row_norm) 
                         if len(curr_row_norm) != len(clean_next):  
-                            if any(k in curr_row_norm for k in ["액면", "자금", "가액", "증자", "목적", "방식", "총수", "예정"]): 
+                            if any(k in curr_row_norm for k in ["액면", "자금", "가액", "증자", "목적", "방식", "신주", "예정"]): 
                                 break 
                     
                     for c in range(C): 
                         cell_str = _norm(arr[rr][c]) 
-                        if any(s in cell_str for s in stop_kws) and not any(t in cell_str for t in target_kws): 
+                        if any(s in cell_str for s in stop_keywords) and not any(t in cell_str for t in section_keywords): 
                             continue 
                         block_text += " " + cell_str 
                 
@@ -703,30 +683,36 @@ def extract_issue_shares_and_type(dfs: List[pd.DataFrame], corr_after: Dict[str,
                 if m_tot: tv = max([int(re.sub(r'[,.]', '', x)) for x in m_tot]) 
                 
                 calc_tot = cv + ov 
-                if tv > 0 and tv >= calc_tot: best_amt = tv 
-                elif calc_tot > 0: best_amt = calc_tot 
-                elif cv > 0: best_amt = cv 
-                elif ov > 0: best_amt = ov 
-                
-                # 라벨(보통 등) 없이 숫자만 적혀있을 때의 안전망
-                if best_amt == 0: 
-                    text_for_nums = block_text 
-                    for t in target_kws: text_for_nums = text_for_nums.replace(t, "") 
-                    text_for_nums = re.sub(r'^([①-⑩]|\(\d+\)|\d+\.)+', '', text_for_nums) 
-                    nums_str = re.findall(r"\d{1,3}(?:[,.]\d{3})+(?!\d)|\d{4,}", text_for_nums) 
-                    v_nums = [int(re.sub(r'[,.]', '', x)) for x in nums_str] 
-                    if v_nums: 
-                        best_amt = max(v_nums) 
-
-                if best_amt > 0: 
-                    if ov > 0 and cv == 0: stock_type = "우선주식" 
-                    elif cv > 0 and ov == 0: stock_type = "보통주식" 
-                    elif cv > 0 and ov > 0: stock_type = "보통주식, 우선주식" 
-                    elif "우선" in block_text or "종류" in block_text or "기타" in block_text: 
-                        stock_type = "보통주식, 우선주식" if "보통" in block_text else "우선주식" 
-                    return best_amt, stock_type 
+                if tv > 0 and tv >= calc_tot: 
+                    return tv, (cv if cv > 0 else tv), ov 
+                if calc_tot > 0: 
+                    return calc_tot, cv, ov 
+                if cv > 0: 
+                    return cv, cv, 0 
                     
-    val = scan_label_value(dfs, ["신주의 종류와 수", "신주의 종류", "발행예정주식", "발행예정주식수"]) 
+    return None, 0, 0
+
+def extract_issue_shares_and_type(dfs: List[pd.DataFrame], corr_after: Dict[str, str]) -> Tuple[Optional[int], str]: 
+    target_kws = ["신주의종류와수", "발행예정주식", "신주발행", "발행할주식"] 
+    stop_kws = ["증자전", "기발행", "총수", "발행가", "액면가", "자금조달", "증자방식", "일정"] 
+    
+    res = get_shares_info_by_exact_section(dfs, corr_after, target_kws, stop_kws) 
+    
+    if res and res[0] is not None: 
+        total_amt, common_amt, other_amt = res 
+        
+        if other_amt > 0 and common_amt == 0: 
+            stock_type = "우선주식" 
+        elif common_amt > 0 and other_amt == 0: 
+            stock_type = "보통주식" 
+        elif common_amt > 0 and other_amt > 0: 
+            stock_type = "보통주식, 우선주식" 
+        else: 
+            stock_type = "보통주식" 
+            
+        return total_amt, stock_type 
+
+    val = scan_label_value(dfs, ["신주의 종류와 수", "발행예정주식", "발행예정주식수"]) 
     amt = _max_int_in_text(val) 
     if amt and amt > 100: 
         stock_type = "우선주식" if any(x in _norm(val) for x in ["우선", "기타", "종류"]) else "보통주식" 
@@ -734,6 +720,9 @@ def extract_issue_shares_and_type(dfs: List[pd.DataFrame], corr_after: Dict[str,
         
     return None, "보통주식" 
 
+# ==========================================================
+# [개선] 증자전 주식수 전용: 보통주 + 종류주식 완벽 합산 엔진
+# ==========================================================
 def get_prev_shares_sum(dfs: List[pd.DataFrame], corr_after: Dict[str, str]) -> Optional[int]: 
     target_kws = ["증자전발행주식총수", "기발행주식총수", "발행주식총수", "증자전주식수", "증자전"] 
     stop_kws = ["신주의종류", "발행예정", "자금조달", "증자방식", "신주발행", "액면가", "발행가", "목적", "일정"] 
@@ -936,6 +925,7 @@ def parse_rights_issue_record(dfs, t: Target, corr_after, html_raw, company_mark
     if prev_shares: rec["증자전 주식수"] = f"{prev_shares:,}" 
 
     price = get_price_by_exact_section(dfs, corr_after) 
+    
     if not price: 
         price = get_corr_num(["신주 발행가액", "신주발행가액", "예정발행가액", "확정발행가액", "발행가액", "1주당 확정발행가액"], min_val=50) 
     if not price: 
