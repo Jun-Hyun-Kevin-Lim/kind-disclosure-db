@@ -5,7 +5,7 @@
 # - [개선] 신규발행주식수 및 증자전주식수 "보통주식 + 종류주식(기타)" 완벽 분리 합산 엔진 탑재
 # - [개선] "발행상품" 컬럼 개선: 텍스트가 아닌 실제 수량(Amt) 기반으로 추적하여 "보통주식" / "우선주식" 정확히 양분
 # - [최종완벽수정] 병합 셀로 인해 보통주/기타주가 여러 줄로 찢어진 경우(압타머사이언스 등) 스캔 중단 버그 완벽 해결
-# - [최종완벽수정] 기준주가/발행가액이 3~4줄 아래 위치한 경우(인벤티지랩, 지니너스 등) 탐색 범위 확장하여 정확히 픽업
+# - [최종완벽수정] 기준주가/발행가액에서 할인율(70)이나 연도(2026)를 가격으로 오인하는 버그 원천 차단
 # ==========================================================
 import os
 import re
@@ -515,18 +515,22 @@ def extract_investors(dfs: List[pd.DataFrame], corr_after: Dict[str, str]) -> st
 
 # ==========================================================
 # [최종완벽수정] 기준주가 및 발행가액 정밀 타격 엔진
-# 범위를 r+4까지 확장하여 분리된 보통주/기타주 가격을 전부 긁어옴
+# - 할인율(%나 그 숫자)과 날짜를 완벽 차단하고 범위 넓힘
 # ==========================================================
 def get_base_price_by_exact_section(dfs: List[pd.DataFrame], corr_after: Dict[str, str]) -> Optional[int]:
     target_kws = ["기준주가", "기준발행가액"]
-    stop_kws = ["자금조달", "증자방식", "할인율", "할증률", "증자전", "납입일"]
+    stop_kws = ["자금조달", "증자방식", "증자전", "납입일"]
     
     if corr_after:
         for k, v in corr_after.items():
             k_norm = _norm(k)
             if any(t in k_norm for t in target_kws) and not any(s in k_norm for s in stop_kws):
-                amt = _max_int_in_text(v)
-                if amt and amt >= 50: return amt
+                if "신주" in k_norm and "기준" not in k_norm: continue
+                # 날짜 및 퍼센트 오염 제거
+                v_clean = re.sub(r'202\d년?|202\d\.\d{1,2}\.\d{1,2}', '', v)
+                v_clean = re.sub(r'\d+(?:\.\d+)?%', '', v_clean)
+                amt = _max_int_in_text(v_clean)
+                if amt and amt >= 50 and amt not in [2024, 2025, 2026, 2027]: return amt
                 
     for df in dfs:
         try: arr = df.astype(str).values
@@ -538,35 +542,39 @@ def get_base_price_by_exact_section(dfs: List[pd.DataFrame], corr_after: Dict[st
                 if "신주" in row_str_norm and "기준" not in row_str_norm: continue
                 
                 all_nums = []
-                # 가격이 3~4번째 줄에 나뉘어 있을 수 있으므로 범위를 r+4로 넓힘
                 for rr in range(r, min(r+4, R)):
                     curr_row_norm = _norm("".join(arr[rr]))
                     if rr > r:
-                        if any(s in curr_row_norm for s in stop_kws + ["신주발행가", "확정발행가"]): break
                         clean_next = _clean_label(curr_row_norm)
                         if len(curr_row_norm) != len(clean_next): 
-                            if any(k in curr_row_norm for k in ["할인", "할증", "발행", "납입"]): break
+                            if any(k in curr_row_norm for k in ["납입", "목적", "방식", "총수", "증자", "일정"]): break
                             
                     for c in range(C):
                         cell_norm = _norm(arr[rr][c])
-                        if any(s in cell_norm for s in stop_kws): continue
-                        amt = _max_int_in_text(arr[rr][c])
-                        if amt and amt >= 50:
-                            all_nums.append(amt)
+                        cell_norm = re.sub(r'202\d[년월일]?|202\d\.\d{1,2}\.\d{1,2}', '', cell_norm)
+                        cell_norm = re.sub(r'\d+(?:\.\d+)?%', '', cell_norm)
+                        
+                        nums = re.findall(r"\d{1,3}(?:[,.]\d{3})+(?!\d)|\d+", cell_norm)
+                        for x in nums:
+                            val = int(re.sub(r'[,.]', '', x))
+                            if val >= 50 and val not in [2024, 2025, 2026, 2027]:
+                                all_nums.append(val)
                 if all_nums:
-                    return max(all_nums) # 찾은 가격 중 가장 큰(정확한) 값을 반환
+                    return max(all_nums)
     return None
 
 def get_price_by_exact_section(dfs: List[pd.DataFrame], corr_after: Dict[str, str]) -> Optional[int]:
     target_kws = ["신주발행가액", "예정발행가액", "확정발행가액", "발행가액"]
-    stop_kws = ["자금조달", "증자방식", "기준주가", "할인율", "증자전", "발행주식", "납입일"]
+    stop_kws = ["자금조달", "증자방식", "증자전", "납입일"]
     
     if corr_after:
         for k, v in corr_after.items():
             k_norm = _norm(k)
             if any(t in k_norm for t in target_kws) and not any(s in k_norm for s in stop_kws):
-                amt = _max_int_in_text(v)
-                if amt and amt >= 50: return amt
+                v_clean = re.sub(r'202\d년?|202\d\.\d{1,2}\.\d{1,2}', '', v)
+                v_clean = re.sub(r'\d+(?:\.\d+)?%', '', v_clean)
+                amt = _max_int_in_text(v_clean)
+                if amt and amt >= 50 and amt not in [2024, 2025, 2026, 2027]: return amt
                 
     for df in dfs:
         try: arr = df.astype(str).values
@@ -579,44 +587,56 @@ def get_price_by_exact_section(dfs: List[pd.DataFrame], corr_after: Dict[str, st
                 for rr in range(r, min(r+4, R)):
                     curr_row_norm = _norm("".join(arr[rr]))
                     if rr > r:
-                        if any(s in curr_row_norm for s in stop_kws + ["기준주가"]): break
                         clean_next = _clean_label(curr_row_norm)
                         if len(curr_row_norm) != len(clean_next): 
-                            if any(k in curr_row_norm for k in ["기준", "할인", "할증", "납입"]): break
+                            if any(k in curr_row_norm for k in ["납입", "목적", "방식", "총수", "증자", "일정"]): break
                             
                     for c in range(C):
                         cell_norm = _norm(arr[rr][c])
-                        if any(s in cell_norm for s in stop_kws): continue
-                        amt = _max_int_in_text(arr[rr][c])
-                        if amt and amt >= 50:
-                            all_nums.append(amt)
+                        cell_norm = re.sub(r'202\d[년월일]?|202\d\.\d{1,2}\.\d{1,2}', '', cell_norm)
+                        cell_norm = re.sub(r'\d+(?:\.\d+)?%', '', cell_norm)
+                        
+                        nums = re.findall(r"\d{1,3}(?:[,.]\d{3})+(?!\d)|\d+", cell_norm)
+                        for x in nums:
+                            val = int(re.sub(r'[,.]', '', x))
+                            if val >= 50 and val not in [2024, 2025, 2026, 2027]:
+                                all_nums.append(val)
                 if all_nums:
                     return max(all_nums)
     return None
 
+# ==========================================================
+# [최종완벽수정] 보통주 + 기타주 완벽 분할 합산 스나이퍼
+# ==========================================================
+def get_val_from_regex(pattern, text):
+    m = re.search(pattern, text)
+    if m:
+        val_str = re.sub(r'[,.]', '', m.group(1))
+        if val_str.isdigit() and int(val_str) > 100:
+            return int(val_str)
+    return 0
 
-# ==========================================================
-# [최종완벽수정] 보통주 + 기타주 완벽 분할 합산 및 추출 엔진
-# - 병합 셀 문제로 "증자전"과 "보통주"가 다른 줄에 있어도 뚫고 합산함
-# ==========================================================
 def get_shares_info_by_exact_section(dfs: List[pd.DataFrame], corr_after: Dict[str, str], section_keywords: List[str], stop_keywords: List[str]) -> Tuple[Optional[int], int, int]:
     if corr_after:
         for k, v in corr_after.items():
             k_norm = _norm(k)
             if any(t in k_norm for t in section_keywords):
                 if not any(s in k_norm for s in stop_keywords):
-                    c_val, o_val = 0, 0
-                    for line in str(v).split('\n'):
-                        amt = _max_int_in_text(line)
-                        if amt and amt > 100:
-                            if any(x in _norm(line) for x in ["기타주", "종류주", "우선주", "상환전환"]):
-                                o_val = max(o_val, amt)
-                            elif "보통주" in _norm(line):
-                                c_val = max(c_val, amt)
-                            else:
-                                c_val = max(c_val, amt) 
-                    if c_val + o_val > 0:
-                        return c_val + o_val, c_val, o_val
+                    v_norm = _norm(v)
+                    cv = get_val_from_regex(r'보통[^0-9]*([\d,.]+)', v_norm)
+                    ov = get_val_from_regex(r'(?:기타|종류|우선|상환전환)[^0-9]*([\d,.]+)', v_norm)
+                    tv = get_val_from_regex(r'(?:합계|총계|총수|계)[^0-9]*([\d,.]+)', v_norm)
+                    
+                    if cv == 0 and ov == 0 and tv == 0:
+                        nums_str = re.findall(r"\d{1,3}(?:[,.]\d{3})+(?!\d)|\d{4,}", v_norm)
+                        v_nums = [int(re.sub(r'[,.]', '', x)) for x in nums_str]
+                        if v_nums: cv = max(v_nums)
+                        
+                    calc = cv + ov
+                    if tv > 0 and tv >= calc:
+                        return tv, cv if cv > 0 else tv, ov
+                    if calc > 0:
+                        return calc, cv, ov
                         
     for df in dfs:
         try: arr = df.astype(str).values
@@ -625,7 +645,12 @@ def get_shares_info_by_exact_section(dfs: List[pd.DataFrame], corr_after: Dict[s
         for r in range(R):
             row_str_norm = _norm("".join(arr[r]))
             
-            if any(t in row_str_norm for t in section_keywords):
+            # 병합 셀 대비: 아랫줄 텍스트까지 합쳐서 타겟이 있는지 확인
+            combined_target = row_str_norm
+            if r + 1 < R:
+                combined_target += _norm("".join(arr[r+1]))
+                
+            if any(t in combined_target for t in section_keywords):
                 common_val, other_val, total_val = 0, 0, 0
                 search_start = max(0, r - 1)
                 
@@ -636,60 +661,33 @@ def get_shares_info_by_exact_section(dfs: List[pd.DataFrame], corr_after: Dict[s
                         if any(s in curr_row_norm for s in stop_keywords + ["액면가", "자금조달", "증자방식"]):
                             continue
                             
-                    if rr > r:
-                        if any(s in curr_row_norm for s in stop_keywords + ["액면가", "자금조달", "증자방식", "발행가", "기준주가", "납입일", "신주인수권", "우선배정"]):
-                            break
+                    if rr > r + 1:
+                        clean_next = _clean_label(curr_row_norm)
+                        if len(curr_row_norm) != len(clean_next): 
+                            if any(k in curr_row_norm for k in ["액면", "자금", "가액", "총수", "증자", "발행목적", "목적", "방식"]):
+                                break
+                                
+                    cv = get_val_from_regex(r'보통[^0-9]*([\d,.]+)', curr_row_norm)
+                    ov = get_val_from_regex(r'(?:기타|종류|우선|상환전환)[^0-9]*([\d,.]+)', curr_row_norm)
+                    tv = get_val_from_regex(r'(?:합계|총계|총수|계)[^0-9]*([\d,.]+)', curr_row_norm)
+                    
+                    if cv > 0: common_val = max(common_val, cv)
+                    if ov > 0: other_val = max(other_val, ov)
+                    if tv > 0: total_val = max(total_val, tv)
+                    
+                    # 글자 라벨이 안 붙은 그냥 숫자일 경우
+                    if cv == 0 and ov == 0 and tv == 0:
+                        nums_str = re.findall(r"\d{1,3}(?:[,.]\d{3})+(?!\d)|\d{4,}", curr_row_norm)
+                        v_nums = [int(re.sub(r'[,.]', '', x)) for x in nums_str]
+                        if v_nums:
+                            row_max = max(v_nums)
+                            common_val = max(common_val, row_max)
                             
-                        # [오류수정] 병합셀로 인해 타겟 키워드(예: 증자전)가 반복되는 줄은 안전지대이므로 Break하지 않음
-                        if not any(t in curr_row_norm for t in section_keywords):
-                            clean_next = _clean_label(curr_row_norm)
-                            if len(curr_row_norm) != len(clean_next): 
-                                if any(k in curr_row_norm for k in ["액면", "자금", "가액", "총수", "증자", "발행목적", "목적", "방식"]):
-                                    break
-
-                    for c in range(C):
-                        cell_str_raw = _norm(arr[rr][c])
-                        
-                        if any(s in cell_str_raw for s in stop_keywords):
-                            continue
-                            
-                        cell_str = cell_str_raw
-                        for t in section_keywords:
-                            cell_str = cell_str.replace(t, "")
-                        cell_str = re.sub(r'^([①-⑩]|\(\d+\)|\d+\.)+', '', cell_str) 
-                        
-                        nums_str = re.findall(r"\d{1,3}(?:[,.]\d{3})+(?!\d)|\d+", cell_str)
-                        v_nums = [int(re.sub(r'[,.]', '', x)) for x in nums_str if int(re.sub(r'[,.]', '', x)) > 100]
-                        
-                        if not v_nums: continue
-                            
-                        has_com = "보통" in cell_str
-                        has_oth = any(k in cell_str for k in ["기타", "종류", "우선", "상환전환"])
-                        has_tot = "합계" in cell_str or "총계" in cell_str
-                        
-                        if has_com and has_oth and len(v_nums) >= 2:
-                            m_com = re.search(r'보통주.*?[^\d]*((?:\d{1,3}[,.]?)+\d+)', cell_str)
-                            if m_com:
-                                cv = int(re.sub(r'[,.]', '', m_com.group(1)))
-                                if cv > 100: common_val = max(common_val, cv)
-                            m_oth = re.search(r'(?:기타|종류|우선|상환전환).*?[^\d]*((?:\d{1,3}[,.]?)+\d+)', cell_str)
-                            if m_oth:
-                                ov = int(re.sub(r'[,.]', '', m_oth.group(1)))
-                                if ov > 100: other_val = max(other_val, ov)
-                        elif has_tot:
-                            total_val = max(total_val, max(v_nums))
-                        elif has_oth:
-                            other_val = max(other_val, max(v_nums))
-                        elif has_com:
-                            common_val = max(common_val, max(v_nums))
-                        else:
-                            common_val = max(common_val, max(v_nums))
-                            
-                calculated_total = common_val + other_val
-                if total_val > 0 and total_val >= calculated_total:
-                    return total_val, common_val, other_val
-                if calculated_total > 0:
-                    return calculated_total, common_val, other_val
+                calc_tot = common_val + other_val
+                if total_val > 0 and total_val >= calc_tot:
+                    return total_val, common_val if common_val > 0 else total_val, other_val
+                if calc_tot > 0:
+                    return calc_tot, common_val, other_val
                             
     return None, 0, 0
 
@@ -835,7 +833,7 @@ def parse_rights_issue_record(dfs, t: Target, corr_after, html_raw, company_mark
                     if amt is not None and amt > min_val: return amt
         return None
 
-    # 증자전 주식수
+    # [핵심 개선] 증자전 주식수도 보통주와 기타주를 합산하는 엔진을 동일하게 적용
     res_prev = get_shares_info_by_exact_section(
         dfs, corr_after, 
         ["증자전발행주식총수", "기발행주식총수", "발행주식총수", "증자전주식수"], 
@@ -852,7 +850,6 @@ def parse_rights_issue_record(dfs, t: Target, corr_after, html_raw, company_mark
 
     if prev_shares: rec["증자전 주식수"] = f"{prev_shares:,}"
 
-    # 확정발행가 (범위확장 엔진)
     price = get_price_by_exact_section(dfs, corr_after)
     
     if not price:
@@ -865,7 +862,6 @@ def parse_rights_issue_record(dfs, t: Target, corr_after, html_raw, company_mark
         
     if price: rec["확정발행가(원)"] = f"{price:,}"
 
-    # 기준주가 (범위확장 엔진)
     base_price = get_base_price_by_exact_section(dfs, corr_after)
     if not base_price:
         base_price = get_corr_num(["기준주가", "기준발행가액"], min_val=50)
